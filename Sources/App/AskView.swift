@@ -496,6 +496,18 @@ private struct TurnView: View {
             }
             .card(padding: 18)
 
+            if turn.status == .searching {
+                // Where the sources will appear once they're found.
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Sources").font(.headline).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        ForEach(0..<3, id: \.self) { _ in SkeletonBlock(height: 54, corner: 12) }
+                    }
+                }
+                .accessibilityHidden(true)
+                .transition(.opacity)
+            }
+
             ForEach(turn.noted) { memory in
                 HStack(spacing: 8) {
                     Image(systemName: "brain").foregroundStyle(Color.accentColor)
@@ -531,6 +543,7 @@ private struct TurnView: View {
                                 SourceCard(source: source, book: library.book(source.ref.bookID))
                             }
                             .buttonStyle(.plain)
+                            .hoverLift(1.02)
                             .help("Open \(SourceCard.title(source.ref.title))")
                             .accessibilityLabel("Source \(source.id): \(SourceCard.title(source.ref.title)), \(source.bookTitle)")
                         }
@@ -607,15 +620,17 @@ private struct TurnView: View {
                 Text(library.isLoading && library.toOpen > 0
                      ? "Opening your library (\(library.opened) of \(library.toOpen))… your answer comes right after."
                      : "Searching your library…")
-            } icon: { ProgressView().controlSize(.small) }
+            } icon: { Image(systemName: "magnifyingglass") }
                 .foregroundStyle(.secondary)
+            AnswerSkeleton()
         case .stopped:
             Label("Stopped by you. The answer is incomplete.", systemImage: "stop.circle")
                 .foregroundStyle(.secondary)
         case .answering where turn.answer.isEmpty:
             Label { Text("Reading \(turn.sources.count) source\(turn.sources.count == 1 ? "" : "s")…") }
-                icon: { ProgressView().controlSize(.small) }
+                icon: { Image(systemName: "text.book.closed") }
                 .foregroundStyle(.secondary)
+            AnswerSkeleton()
         default:
             EmptyView()
         }
@@ -778,5 +793,17 @@ struct FlowLayout: Layout {
             rows[rows.count - 1].height = max(rows[rows.count - 1].height, size.height)
         }
         return rows
+    }
+}
+
+/// Placeholder lines where the answer will be, while Ask searches and reads.
+private struct AnswerSkeleton: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            SkeletonBlock(height: 13, corner: 5)
+            SkeletonBlock(height: 13, corner: 5)
+            SkeletonBlock(width: 220, height: 13, corner: 5)
+        }
+        .accessibilityHidden(true)
     }
 }

@@ -42,6 +42,14 @@ extension MediaCatalog {
         Array(Set(items.filter { filter == .all || category($0, info[$0.progressKey]) == filter }.compactMap { info[$0.progressKey]?.genre }))
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
+    /// How many items carry each genre, for the tiles (one pass, not one per tile).
+    static func genreCounts(_ items: [MediaItem], info: [String: MediaInfo], filter: MediaFilter) -> [String: Int] {
+        var counts: [String: Int] = [:]
+        for item in items where filter == .all || category(item, info[item.progressKey]) == filter {
+            if let genre = info[item.progressKey]?.genre { counts[genre, default: 0] += 1 }
+        }
+        return counts
+    }
     static func select(_ items: [MediaItem], info: [String: MediaInfo], progress: [String: MediaProgress],
                        filter: MediaFilter = .all, genre: String? = nil, query: String = "", sort: MediaSort = .title,
                        unfinished: Bool = false) -> [MediaItem] {

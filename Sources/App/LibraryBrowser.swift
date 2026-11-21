@@ -85,7 +85,7 @@ struct LibraryBrowser: View {
                             NavigationLink(value: LibraryRoute.area(area)) {
                                 SubjectAreaCard(area: area, detail: library.books.isEmpty
                                                 ? (downloads.summary?.isRunning == true ? "Downloading…" : "Nothing saved yet") : nil)
-                            }.buttonStyle(.plain)
+                            }.buttonStyle(.plain).hoverLift(1.02)
                         }
                     }
                     if let copying {
@@ -332,7 +332,18 @@ private struct SubjectTopicView: View {
             }
             Section("Guides & references") {
                 if searching {
-                    ProgressView("Searching your saved articles…").padding(.vertical, 20)
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(0..<4, id: \.self) { _ in
+                            VStack(alignment: .leading, spacing: 6) {
+                                SkeletonBlock(width: 240, height: 14, corner: 5)
+                                SkeletonBlock(height: 11, corner: 4)
+                                SkeletonBlock(width: 320, height: 11, corner: 4)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 12)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Searching your saved articles")
                 } else if articles.isEmpty {
                     ContentUnavailableView {
                         Label("No saved guides found", systemImage: "doc.text.magnifyingglass")
@@ -410,6 +421,24 @@ struct ArchiveListView: View {
                 EmptyLibraryCard()
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
+            }
+            if library.books.isEmpty && library.isLoading {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(0..<4, id: \.self) { _ in
+                        HStack(spacing: 12) {
+                            SkeletonBlock(width: 40, height: 52, corner: 6)
+                            VStack(alignment: .leading, spacing: 6) {
+                                SkeletonBlock(width: 220, height: 14, corner: 5)
+                                SkeletonBlock(width: 140, height: 11, corner: 4)
+                            }
+                        }
+                    }
+                }
+                .padding(.vertical, 8)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Opening your library")
+                .listRowBackground(Color.clear)
+                .listRowSeparator(.hidden)
             }
             if presentFormats.count > 1 {
                 FormatChips(selection: $format, formats: presentFormats)

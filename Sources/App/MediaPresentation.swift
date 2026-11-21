@@ -26,6 +26,9 @@ struct MediaArtwork: View {
     let item: MediaItem
     let info: MediaInfo?
     @State private var image: CGImage?
+    /// True while the picture is being read, so the poster gradient shimmers until it fades in.
+    @State private var decoding = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// A chosen or folder cover wins over the automatic video still or embedded art.
     private var path: String? { item.cover?.path ?? info?.thumb }
     /// Changes when a cover file is replaced in place, so the new picture loads.
@@ -37,9 +40,12 @@ struct MediaArtwork: View {
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                LinearGradient(colors: MediaTheme.posterColors(item.title), startPoint: .topLeading, endPoint: .bottomTrailing)
+                let poster = LinearGradient(colors: MediaTheme.posterColors(item.title), startPoint: .topLeading, endPoint: .bottomTrailing)
+                if decoding { poster.shimmer() } else { poster }
                 if let image {
                     Image(decorative: image, scale: 1).resizable().scaledToFill().frame(width: geo.size.width, height: geo.size.height).clipped()
+                        .contentShape(Rectangle())
+                        .transition(.opacity)
                 } else {
                     VStack(alignment: .leading, spacing: 10) {
                         Image(systemName: item.kind == .video ? "play.rectangle" : item.kind == .book ? "book.closed" : MediaCatalog.category(item, info) == .music ? "music.note" : "headphones")
@@ -51,16 +57,20 @@ struct MediaArtwork: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 }
             }.frame(width: geo.size.width, height: geo.size.height).clipped()
+            // clipped() only trims what's drawn. A cover scaled to fill (a tall book cover across a wide banner) still
+            // takes clicks far outside its frame, which made the Books genre tiles above the banner unclickable.
+            .contentShape(Rectangle())
         }
         .task(id: reloadKey) {
             image = nil
-            guard let path else { return }
+            guard let path else { decoding = false; return }
+            decoding = true
             let result = await Task.detached(priority: .utility) { () -> CGImage? in
                 guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
                 return CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 960, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
             }.value
             guard !Task.isCancelled else { return }
-            image = result
+            withAnimation(Motion.gentle(reduceMotion)) { image = result; decoding = false }
         }
         .accessibilityHidden(true)
     }
@@ -97,8 +107,6 @@ struct MediaCard: View {
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(hovering ? MediaTheme.accent : .white.opacity(0.12), lineWidth: hovering ? 2 : 0.5))
-                .shadow(color: .black.opacity(hovering ? 0.4 : 0), radius: 10, y: 5)
-                .scaleEffect(hovering && !reduceMotion ? 1.025 : 1)
             Text(MediaCatalog.title(item, info)).font(.callout.weight(.semibold)).lineLimit(2)
             if category == .music || category == .audiobooks {
                 Text(MediaCatalog.creator(info)).font(.caption).foregroundStyle(MediaTheme.muted).lineLimit(1)
@@ -108,8 +116,9 @@ struct MediaCard: View {
         .foregroundStyle(MediaTheme.ink)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .contentShape(Rectangle())
+        .hoverLift()
         .onHover { hovering = $0 }
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: hovering)
+        .animation(reduceMotion ? nil : Motion.quick, value: hovering)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityText)
         .accessibilityHint("Open details and playback options")
@@ -141,11 +150,12 @@ struct MediaShelfRow: View {
             }.padding(.horizontal, 24)
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .top, spacing: 18) {
-                    ForEach(shelf.items) { item in
+                    ForEach(Array(shelf.items.enumerated()), id: \.element.id) { index, item in
                         Button { open(item) } label: {
                             MediaCard(item: item, info: media.info[item.progressKey], progress: media.progress[item.progressKey])
                                 .frame(width: item.kind == .video ? 272 : MediaCatalog.category(item, media.info[item.progressKey]) == .music ? 180 : 152)
                         }.buttonStyle(.plain).mediaCardMenu(item)
+                            .appearFade(delay: min(Double(index), 6) * 0.04)
                     }
                 }.scrollTargetLayout().padding(.horizontal, 24).padding(.vertical, 4)
             }.scrollTargetBehavior(.viewAligned)
@@ -186,6 +196,7 @@ struct MediaFeaturedBanner: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 18))
+        .contentShape(RoundedRectangle(cornerRadius: 18))   // clicks stop at the banner's edge, like its picture
     }
     @ViewBuilder private func actions(_ resuming: Bool) -> some View {
         Button { play(false) } label: { Label(item.kind == .book ? "Read" : resuming ? "Resume" : "Play", systemImage: item.kind == .book ? "book.fill" : "play.fill") }.buttonStyle(.borderedProminent)

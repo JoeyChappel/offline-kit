@@ -140,7 +140,7 @@ struct GetResourcesView: View {
                             ForEach(SubjectArea.allCases) { item in
                                 Button { area = item } label: {
                                     SubjectAreaCard(area: item, detail: selectedCount(item))
-                                }.buttonStyle(.plain)
+                                }.buttonStyle(.plain).hoverLift(1.02)
                             }
                         }
                         Button { showingEncyclopedia = true } label: {
@@ -154,7 +154,7 @@ struct GetResourcesView: View {
                                 Spacer()
                                 Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
                             }.card(padding: 18).contentShape(Rectangle())
-                        }.buttonStyle(.plain)
+                        }.buttonStyle(.plain).hoverLift(1.01)
                         ModelPackCard(destination: destination?.folder)
                     }
                     Text("Content comes from the Kiwix online library. Licenses vary by archive. Wikipedia and many Q&A archives use CC BY-SA. Check each archive for its license.")
@@ -169,7 +169,16 @@ struct GetResourcesView: View {
                     }
                     .card()
                 } else {
-                    ProgressView("Loading the download list…").frame(maxWidth: .infinity).padding(40)
+                    // Shaped like the area grid that appears once the list arrives.
+                    VStack(alignment: .leading, spacing: 14) {
+                        SkeletonBlock(width: 130, height: 16, corner: 5)
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 12)], spacing: 12) {
+                            ForEach(0..<6, id: \.self) { _ in SkeletonBlock(height: 84, corner: 16) }
+                        }
+                        SkeletonBlock(height: 72, corner: 16)
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Loading the download list")
                 }
             }
             .padding(.horizontal, 24)

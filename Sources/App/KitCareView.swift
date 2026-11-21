@@ -34,7 +34,15 @@ struct KitCareView: View {
                         RecommendedCard(rescan: rescan).id("recommended")
                         SpaceCard(spaces: report.spaces).id("space")
                     } else {
-                        ProgressView("Checking your kit…").frame(maxWidth: .infinity).padding(40)
+                        // Shaped like the summary and the first cards.
+                        VStack(alignment: .leading, spacing: 16) {
+                            SkeletonBlock(height: 96, corner: 16)
+                            SkeletonBlock(height: 150, corner: 16)
+                            SkeletonBlock(height: 110, corner: 16)
+                            SkeletonBlock(height: 110, corner: 16)
+                        }
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Checking your kit")
                     }
                 }
                 .padding(.horizontal, 24)

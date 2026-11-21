@@ -25,6 +25,14 @@ struct OrganizeSheet: View {
         return suggestion.proposed[key]?.source != .aiGuess
     }
     @State private var note: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Where "accept AI guesses too" is waiting for the person to confirm: one section, or everything.
+    private enum AcceptScope: Identifiable {
+        case section(CatalogKind), everything
+        var id: String { switch self { case .section(let k): k.rawValue; case .everything: "all" } }
+        var kind: CatalogKind? { if case .section(let k) = self { k } else { nil } }
+    }
+    @State private var confirmAccept: AcceptScope?
 
     private var waiting: [CatalogSuggestion] {
         catalog.suggestions.values.filter { organizer.scope == nil || $0.kind == organizer.scope }
@@ -45,24 +53,44 @@ struct OrganizeSheet: View {
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
+                        let sections = CatalogKind.allCases.filter { kind in waiting.contains { $0.kind == kind } }
+                        if sections.count > 1, organizer.scope == nil {
+                            HStack {
+                                Text("\(sections.count) sections are waiting").font(.subheadline).foregroundStyle(.secondary)
+                                Spacer()
+                                Button("Accept Everything…", systemImage: "checkmark.circle") { confirmAccept = .everything }
+                                    .help("Applies every suggestion in every section, AI guesses included. You will be asked to confirm, and Undo takes it all back.")
+                                    .accessibilityHint("Applies all suggestions, including AI guesses, after you confirm.")
+                            }
+                            .padding(.horizontal, 24).padding(.vertical, 10)
+                            Divider()
+                        }
                         ForEach(CatalogKind.allCases) { kind in
                             let list = waiting.filter { $0.kind == kind }
                             if !list.isEmpty {
                                 HStack {
                                     Text("\(kind.section) · \(list.count)").font(.headline)
                                     Spacer()
-                                    Button("Approve All in \(kind.section)") { approveAll(kind) }
-                                        .help("Applies details from your files and your offline library. AI guesses stay here until you approve each item.")
+                                    Menu("Approve All in \(kind.section)") {
+                                        Button("Approve Details From Files and Library") { approveAll(kind) }
+                                        Button("Accept AI Guesses Too…") { confirmAccept = .section(kind) }
+                                    } primaryAction: { approveAll(kind) }
+                                        .fixedSize()
+                                        .help("The main button applies details from your files and your offline library, and leaves AI guesses here for you to check item by item. The menu also offers to accept AI guesses too.")
                                 }
                                 .padding(.horizontal, 24).padding(.vertical, 10)
                                 .background(.bar)
                                 ForEach(list) { suggestion in
-                                    card(suggestion).padding(.horizontal, 24).padding(.vertical, 6)
-                                    Divider().padding(.leading, 24)
+                                    VStack(spacing: 0) {
+                                        card(suggestion).padding(.horizontal, 24).padding(.vertical, 6)
+                                        Divider().padding(.leading, 24)
+                                    }
+                                    .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
                                 }
                             }
                         }
                     }
+                    .animation(Motion.gentle(reduceMotion), value: waiting.map(\.key))
                 }
             }
             Divider()
@@ -76,6 +104,13 @@ struct OrganizeSheet: View {
                 }
                 Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
             }.padding(16)
+        }
+        .confirmationDialog(acceptTitle, isPresented: Binding(get: { confirmAccept != nil }, set: { if !$0 { confirmAccept = nil } }), titleVisibility: .visible, presenting: confirmAccept) { scope in
+            Button("Accept All, Guesses Included") { acceptEverything(scope) }
+            Button("Cancel", role: .cancel) {}
+        } message: { scope in
+            let counts = catalog.guessCounts(kind: scope.kind)
+            Text("\(counts.items) \(counts.items == 1 ? "item" : "items") will take \(counts.fields) AI \(counts.fields == 1 ? "guess" : "guesses"), which can be wrong for less-known titles. Details you typed yourself are never replaced, and an AI age rating on its own is never used. Undo Last Organize takes the whole batch back.")
         }
         // Fits the smallest window (520 points tall): the review list scrolls.
         .frame(minWidth: 680, idealWidth: 900, minHeight: 420, idealHeight: 760)
@@ -167,7 +202,7 @@ struct OrganizeSheet: View {
                     Button("Save & Approve") { saveEdits(suggestion) }.buttonStyle(.borderedProminent)
                 } else {
                     let ticked = shown(suggestion).filter { isUsed(suggestion, $0) }
-                    Button("Skip") { catalog.skip(suggestion.key); note = nil }
+                    Button("Skip") { withAnimation(Motion.gentle(reduceMotion)) { catalog.skip(suggestion.key) }; note = nil }
                     Button("Edit") { startEditing(suggestion) }
                     Button(ticked.count == shown(suggestion).count ? "Approve" : "Approve \(ticked.count) of \(shown(suggestion).count)") {
                         approve(suggestion.key, only: Set(ticked))
@@ -238,14 +273,27 @@ struct OrganizeSheet: View {
     }
 
     private func approve(_ key: String, only: Set<CatalogDetails.Key>) {
-        catalog.approve(key, only: only)
+        withAnimation(Motion.gentle(reduceMotion)) { catalog.approve(key, only: only) }
         choices[key] = nil
         note = nil
         media.applyCatalog(library: library)
     }
 
+    private var acceptTitle: String {
+        switch confirmAccept {
+        case .section(let kind): "Accept everything in \(kind.section)?"
+        default: "Accept everything?"
+        }
+    }
+
+    private func acceptEverything(_ scope: AcceptScope) {
+        withAnimation(Motion.gentle(reduceMotion)) { _ = catalog.approveAll(kind: scope.kind, includingGuesses: true) }
+        note = "Everything was accepted, AI guesses included. Undo Last Organize takes it all back."
+        media.applyCatalog(library: library)
+    }
+
     private func approveAll(_ kind: CatalogKind) {
-        let waiting = catalog.approveAll(kind: kind)
+        let waiting = withAnimation(Motion.gentle(reduceMotion)) { catalog.approveAll(kind: kind) }
         note = waiting == 0 ? nil
             : "Details from your files and library were applied. \(waiting) \(waiting == 1 ? "item has" : "items have") AI guesses left to check: approve \(waiting == 1 ? "it" : "each one") below if they look right."
         media.applyCatalog(library: library)

@@ -9,7 +9,7 @@ private enum GameShelf: Hashable {
         case .publisher(let name): "From \(name)"
         case .all: "All games"
         case .favorites: "Favorites"
-        case .saved: "Saved progress"
+        case .saved: "Continue playing"
         case .system(let system): system.name
         case .game(let game): game.title
         }
@@ -19,6 +19,7 @@ private enum GameShelf: Hashable {
 struct GamesView: View {
     @Environment(Library.self) private var library
     @Environment(GameLibrary.self) private var games
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var importing = false
     @State private var importingFolder = false
     @State private var importError: String?
@@ -26,11 +27,16 @@ struct GamesView: View {
     @State private var importReport: String?
     @State private var query = ""
     @State private var path: [GameShelf] = []
+    /// False until the first scan of the Games folders has finished, so the shelves show placeholders, not an empty page.
+    @State private var scanned = false
+    @State private var showingControls = false
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
     #else
     @State private var playing: GameRef?
     #endif
+
+    private var isLoading: Bool { !scanned && games.games.isEmpty }
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -40,72 +46,30 @@ struct GamesView: View {
                                subtitle: "Your favorites, ready for a quiet moment. Everything plays on this device.")
                     FlowLayout(spacing: 8) {
                         Pill(text: "Works offline", symbol: "checkmark.shield", tint: .accentColor)
-                        Pill(text: "\(games.games.count) games", symbol: "gamecontroller")
+                        if !games.games.isEmpty { Pill(text: "\(games.games.count) \(games.games.count == 1 ? "game" : "games")", symbol: "gamecontroller") }
                         #if os(macOS)
                         Pill(text: "Keyboard or controller", symbol: "keyboard")
                         #else
                         Pill(text: "Touch or controller", symbol: "hand.tap")
                         #endif
                     }
-                    if games.games.isEmpty && query.isEmpty { emptyCard; findGames }
-                    if !query.isEmpty {
+                    if isLoading {
+                        loadingShelves
+                    } else if games.games.isEmpty && query.isEmpty {
+                        firstGamePanel
+                    } else if !query.isEmpty {
                         GameShelfGrid(games: matchingGames, favorites: games.favorites)
                         if matchingGames.isEmpty { ContentUnavailableView.search(text: query) }
                     } else {
-                        if !recentGames.isEmpty {
-                            VStack(alignment: .leading, spacing: 12) {
-                                HStack { Text("Jump back in").font(.title3.bold()); Spacer() }
-                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 12)], spacing: 12) {
-                                    ForEach(recentGames) { game in
-                                        Button { play(game, game.canResume) } label: {
-                                            RecentGameCard(game: game, date: games.lastPlayed[game.id])
-                                        }.buttonStyle(.plain)
-                                        .accessibilityLabel("\(game.canResume ? "Resume" : "Play") \(game.title), \(game.system.name)")
-                                    }
-                                }
-                            }
-                        }
-                        HStack(spacing: 12) {
-                            collection("Favorites", count: games.favorites.count, symbol: "heart.fill", route: .favorites)
-                            collection("Saved progress", count: games.games.filter(\.canResume).count, symbol: "bookmark.fill", route: .saved)
-                        }
-                        // Only systems that have games: eight "No games yet" cards would bury the shelf.
-                        let systems = GameSystem.allCases.filter { system in games.games.contains { $0.system == system } }
-                        if !systems.isEmpty {
-                            VStack(alignment: .leading, spacing: 12) {
-                                HStack {
-                                    Text("Browse by system").font(.title3.bold())
-                                    Spacer()
-                                    NavigationLink("All games", value: GameShelf.all).font(.callout)
-                                }
-                                LazyVGrid(columns: [GridItem(.adaptive(minimum: 320), spacing: 12)], spacing: 12) {
-                                    ForEach(systems) { system in
-                                        NavigationLink(value: GameShelf.system(system)) {
-                                            GameSystemCard(system: system, count: games.games.filter { $0.system == system }.count)
-                                        }.buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                        }
-                        // From approved Organize with AI details (Kit Catalog.json in the library).
-                        groupSection("Browse by genre", field: .genre) { GameShelf.genre($0) }
-                        groupSection("By publisher", field: .creator) { GameShelf.publisher($0) }
-                        if !games.games.isEmpty {
-                            VStack(alignment: .leading, spacing: 12) {
-                                HStack {
-                                    Text("On your shelf").font(.title3.bold())
-                                    Spacer()
-                                    NavigationLink("View all", value: GameShelf.all).font(.callout)
-                                }
-                                GameShelfGrid(games: Array(games.games.prefix(8)), favorites: games.favorites)
-                            }
-                        }
+                        shelves
                     }
-                    help
-                    if !games.games.isEmpty { findGames }
                 }
                 .padding(24)
                 .frame(maxWidth: 1000, alignment: .leading).frame(maxWidth: .infinity)
+                .animation(Motion.gentle(reduceMotion), value: games.games.count)
+                .animation(Motion.gentle(reduceMotion), value: games.favorites.count)
+                .animation(Motion.gentle(reduceMotion), value: games.lastPlayed.count)
+                .animation(Motion.gentle(reduceMotion), value: scanned)
             }
             .background(Design.canvas)
             .navigationTitle("Play")
@@ -132,7 +96,7 @@ struct GamesView: View {
                 }
             }
         }
-        .task(id: library.folders.map(\.path).joined(separator: "|")) { await games.reload(library: library); KitCatalog.shared.reload(library) }
+        .task(id: library.folders.map(\.path).joined(separator: "|")) { await games.reload(library: library); KitCatalog.shared.reload(library); scanned = true }
         #if DEBUG
         // Test hook: -importGames "/a.nes|/b.gb" adds each file in its own task, close together, as Add Game Files… does.
         .task {
@@ -206,6 +170,204 @@ struct GamesView: View {
         #endif
     }
 
+    // MARK: Shelves
+
+    private var shelves: some View {
+        let all = games.games
+        let continuing = all.filter(\.canResume)
+            .map { ($0, $0.resumeStateURL.flatMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate } ?? .distantPast) }
+            .sorted { $0.1 > $1.1 }
+        let favorites = all.filter { games.favorites.contains($0.id) }.sorted(by: byTitle)
+        let recent = all.filter { games.lastPlayed[$0.id] != nil }
+            .sorted { (games.lastPlayed[$0.id] ?? .distantPast) > (games.lastPlayed[$1.id] ?? .distantPast) }
+        let bySystem = Dictionary(grouping: all, by: \.system)
+        let systems = GameSystem.allCases.filter { bySystem[$0] != nil }
+        var order = 0
+        func next() -> Double { defer { order += 1 }; return Double(min(order, 6)) * 0.06 }
+        return VStack(alignment: .leading, spacing: 30) {
+            if !continuing.isEmpty {
+                shelf("Continue playing", symbol: "play.circle.fill", count: continuing.count, route: .saved) {
+                    ForEach(continuing.prefix(10), id: \.0.id) { game, date in
+                        Button { play(game, true) } label: { ContinueCard(game: game, date: date) }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Resume \(game.title), \(game.system.name), saved \(date.formatted(.relative(presentation: .named)))")
+                    }
+                }.appearFade(delay: next())
+            }
+            addGamesBar.appearFade(delay: next())
+            if !favorites.isEmpty {
+                shelf("Favorites", symbol: "heart.fill", count: favorites.count, route: .favorites) { tiles(favorites) }
+                    .appearFade(delay: next())
+            }
+            if !recent.isEmpty {
+                shelf("Recently played", symbol: "clock", count: nil, route: nil) { tiles(Array(recent.prefix(10))) }
+                    .appearFade(delay: next())
+            }
+            ForEach(systems) { system in
+                let list = (bySystem[system] ?? []).sorted(by: byTitle)
+                shelf(system.name, symbol: system.artSymbol, count: list.count, route: .system(system), tint: system.tint) { tiles(list) }
+                    .appearFade(delay: next())
+            }
+            // From approved Organize with AI details (Kit Catalog.json in the library).
+            groupSection("Browse by genre", field: .genre) { GameShelf.genre($0) }
+            groupSection("By publisher", field: .creator) { GameShelf.publisher($0) }
+            findGames
+            HStack { Spacer(); controlsButton; Spacer() }
+        }
+    }
+
+    private func byTitle(_ a: Game, _ b: Game) -> Bool { a.title.localizedStandardCompare(b.title) == .orderedAscending }
+
+    private func tiles(_ list: [Game]) -> some View {
+        ForEach(list.prefix(14)) { game in
+            GameTileLink(game: game, favorite: games.favorites.contains(game.id)).frame(width: 172)
+        }
+    }
+
+    /// A titled row that scrolls sideways, with a link to the full list.
+    private func shelf<Content: View>(_ title: String, symbol: String, count: Int?, route: GameShelf?, tint: Color = .accentColor,
+                                      @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: symbol).font(.callout).foregroundStyle(tint).accessibilityHidden(true)
+                Text(title).font(.title3.bold()).accessibilityAddTraits(.isHeader)
+                if let count { Text("\(count)").font(.callout).foregroundStyle(.secondary) }
+                Spacer()
+                if let route { NavigationLink("See all", value: route).font(.callout) }
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: 14) { content() }.padding(.vertical, 6)
+            }
+            .scrollClipDisabled()
+        }
+    }
+
+    private var loadingShelves: some View {
+        VStack(alignment: .leading, spacing: 30) {
+            ForEach(0..<2, id: \.self) { _ in
+                VStack(alignment: .leading, spacing: 12) {
+                    SkeletonBlock(width: 160, height: 18, corner: 5)
+                    SkeletonShelf(count: 4, cardWidth: 172, cardHeight: 124, corner: 14)
+                }
+            }
+        }
+    }
+
+    // MARK: Adding games
+
+    private func importDropped(_ urls: [URL]) {
+        Task { importReport = await games.importGames(urls, library: library).message }
+    }
+
+    /// The first thing a new library shows: where games go, what plays, where to find some, and the controls.
+    private var firstGamePanel: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            GameDropZone(onDrop: importDropped) {
+                VStack(spacing: 14) {
+                    Image(systemName: "gamecontroller.fill").font(.system(size: 38)).foregroundStyle(Color.accentColor).accessibilityHidden(true)
+                    Text("Add your first game").font(.system(.title2, design: .rounded, weight: .semibold))
+                    Text("Drop game files here, or choose them yourself. They are copied into your library and play offline.")
+                        .foregroundStyle(.secondary).multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
+                    FlowLayout(spacing: 10) {
+                        Button("Choose Files…", systemImage: "doc.badge.plus") { importing = true }
+                            .buttonStyle(.borderedProminent).controlSize(.large)
+                        Button("Choose ScummVM Folder…", systemImage: "folder.badge.plus") { importingFolder = true }
+                            .buttonStyle(.bordered).controlSize(.large)
+                    }
+                }
+                .frame(maxWidth: .infinity).padding(.vertical, 34).padding(.horizontal, 24)
+            }
+            .appearFade()
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("What plays here").font(.title3.bold()).accessibilityAddTraits(.isHeader)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 270), spacing: 10)], alignment: .leading, spacing: 10) {
+                    ForEach(GameSystem.playable) { system in
+                        HStack(spacing: 12) {
+                            Image(systemName: system.artSymbol).font(.body.weight(.semibold)).foregroundStyle(.white)
+                                .frame(width: 38, height: 38)
+                                .background(LinearGradient(colors: [system.tint, system.tint.opacity(0.7)], startPoint: .topLeading, endPoint: .bottomTrailing),
+                                            in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(system.name).font(.callout.weight(.semibold))
+                                Text(system.addHint).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .accessibilityElement(children: .combine)
+                    }
+                }
+            }
+            .card(padding: 18)
+            .appearFade(delay: 0.06)
+
+            findGames.appearFade(delay: 0.12)
+
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Controls", systemImage: "keyboard").font(.headline)
+                ControlsHelp(showFolder: showGamesFolder)
+            }
+            .card(padding: 18)
+            .appearFade(delay: 0.18)
+        }
+    }
+
+    /// With games on the shelf: a small drop target and button, with controls and the full list close by.
+    private var addGamesBar: some View {
+        GameDropZone(onDrop: importDropped, corner: 14) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) { addBarText; Spacer(minLength: 8); addBarButtons }
+                VStack(alignment: .leading, spacing: 12) { addBarText; addBarButtons }
+            }
+            .padding(.horizontal, 16).padding(.vertical, 12)
+        }
+    }
+
+    private var addBarText: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "square.and.arrow.down").font(.title3).foregroundStyle(Color.accentColor).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Add games").font(.headline)
+                Text("Drop game files here, or choose them.").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var addBarButtons: some View {
+        HStack(spacing: 8) {
+            Menu("Choose Files…", systemImage: "plus") {
+                Button("Add Game Files…", systemImage: "doc.badge.plus") { importing = true }
+                Button("Add ScummVM Game Folder…", systemImage: "folder.badge.plus") { importingFolder = true }
+            } primaryAction: { importing = true }
+            .menuStyle(.button).buttonStyle(.borderedProminent).fixedSize()
+            controlsButton
+            NavigationLink(value: GameShelf.all) { Label("All games", systemImage: "square.grid.2x2") }.buttonStyle(.bordered)
+        }
+    }
+
+    private var controlsButton: some View {
+        Button("Controls", systemImage: "keyboard") { showingControls = true }
+            .buttonStyle(.bordered)
+            .popover(isPresented: $showingControls, arrowEdge: .bottom) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Controls").font(.headline)
+                        ControlsHelp(showFolder: showGamesFolder)
+                    }.padding(18)
+                }
+                .frame(minWidth: 320, idealWidth: 400, maxWidth: 440, minHeight: 200, idealHeight: 420, maxHeight: 520)
+            }
+    }
+
+    private func showGamesFolder() {
+        #if os(macOS)
+        let folder = GameLibrary.importFolder
+        do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true); NSWorkspace.shared.open(folder) }
+        catch { importError = error.localizedDescription }
+        #endif
+    }
+
     /// Genre or publisher groups with their game counts, biggest first. Empty until games are organized.
     @ViewBuilder private func groupSection(_ title: String, field: CatalogDetails.Key, route: @escaping (String) -> GameShelf) -> some View {
         let names = Dictionary(grouping: games.games.compactMap { KitCatalog.shared.value(KitCatalog.gameKey($0), field) }, by: { $0 })
@@ -227,11 +389,6 @@ struct GamesView: View {
         games.games.filter { ($0.title + " " + $0.system.name).localizedCaseInsensitiveContains(query) }
     }
 
-    private var recentGames: [Game] {
-        Array(games.games.filter { games.lastPlayed[$0.id] != nil }
-            .sorted { (games.lastPlayed[$0.id] ?? .distantPast) > (games.lastPlayed[$1.id] ?? .distantPast) }.prefix(3))
-    }
-
     /// The game counts as played once it has really started (GameSession posts .gameDidStart).
     private func play(_ game: Game, _ resume: Bool) {
         let ref = GameRef(path: game.url.path, resume: resume)
@@ -242,111 +399,119 @@ struct GamesView: View {
         #endif
     }
 
-    private func collection(_ title: String, count: Int, symbol: String, route: GameShelf) -> some View {
-        NavigationLink(value: route) {
-            HStack(spacing: 10) {
-                Image(systemName: symbol).foregroundStyle(Color.accentColor)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(title).font(.headline).foregroundStyle(.primary)
-                    Text("\(count) \(count == 1 ? "game" : "games")").font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 0)
-                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
-            }.card(padding: 16)
-        }.buttonStyle(.plain)
-    }
-
     private var findGames: some View {
         FindMoreCard(title: "Where to find games",
                      intro: "People still make new games for these systems and share many of them free, and some classic DOS and adventure games are now free too. Download a game file (.gb, .gbc, .gba, .nes, .pce, or a DOS game’s .zip), or a ScummVM game’s folder, then add it with Add Games. A download zipped around one game file is unzipped for you.",
                      links: FindMore.games,
                      footnote: "Use homemade games like these, or games you own. Copies of store-bought games shared online are illegal, so Offline Kit doesn’t link to them. These links open in your browser and need internet.")
     }
-
-    private var emptyCard: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Make room for a little fun.").font(.system(.title2, design: .rounded, weight: .semibold))
-            Text("Offline Kit plays Game Boy, Game Boy Color, Game Boy Advance, NES and PC Engine game files (.gb, .gbc, .gba, .nes, .pce), DOS games (.zip or .dosz) and ScummVM adventure games (a game’s folder). Use game files you copied from cartridges you own, or free games from the links below. Games and saves stay with your library.")
-                .foregroundStyle(.secondary)
-            Button("Add your first game", systemImage: "plus.circle.fill") { importing = true }
-                .buttonStyle(.borderedProminent).controlSize(.large)
-        }.card(padding: 22)
-    }
-
-    private var help: some View {
-        DisclosureGroup("Adding games & using controls") {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Add .gb, .gbc, .gba, .nes or .pce files with Add Games. Your place is saved beside each game, so it can travel with your drive.")
-                Text("DOS games: add the game’s .zip (it needs a program inside) or a .dosz file. Zips placed by hand go in the Games/DOS folder. If a game has several programs, DOSBox Pure asks which to start.")
-                Text("ScummVM adventure games: choose Add ScummVM Game Folder and pick the folder holding the game’s files, or put the folder inside Games/ScummVM. ScummVM works out which game it is.")
-                Text("Play game files copied from cartridges you own, or games their makers share freely. See Where to find games for free homemade ones.")
-                #if os(macOS)
-                Text("Arrow keys move. X and Z are A and B. Return starts; Space selects. Controllers work too.")
-                Text("DOS and ScummVM games take the keyboard and mouse directly. If a DOS game says it needs a joystick, choose Joystick on its page.")
-                Text("In ScummVM, save and load from the game’s menu: the Game Menu button, or fn-F5 on a Mac laptop.")
-                Button("Show Games Folder", systemImage: "folder") {
-                    let folder = GameLibrary.importFolder
-                    do { try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true); NSWorkspace.shared.open(folder) }
-                    catch { importError = error.localizedDescription }
-                }
-                #else
-                Text("Use the on-screen controls or connect a game controller. Save your place from the player’s menu.")
-                Text("In DOS and ScummVM games, the picture works like a touchpad: tap to click. In ScummVM, touch and hold to right-click.")
-                #endif
-            }.font(.callout).foregroundStyle(.secondary).padding(.top, 12)
-        }.card(padding: 18)
-    }
 }
 
-private struct GameSystemCard: View {
-    let system: GameSystem
-    let count: Int
-    @State private var hovering = false
+// MARK: - Adding and controls
 
-    var body: some View {
-        HStack(spacing: 18) {
-            CartridgeBadge(system: system).frame(width: 60, height: 68)
-            VStack(alignment: .leading, spacing: 6) {
-                Text(system.name).font(.headline).foregroundStyle(.primary)
-                Text(count == 0 ? "No games yet" : "\(count) \(count == 1 ? "game" : "games") ready to play")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: 0)
-            Image(systemName: "chevron.right").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-        }
-        .card(padding: 20)
-        .overlay(RoundedRectangle(cornerRadius: Design.corner).strokeBorder(hovering ? system.tint.opacity(0.5) : .clear))
-        .onHover { hovering = $0 }
-    }
-}
+extension GameSystem {
+    /// Atari 2600 games aren't played any more, so they aren't offered.
+    fileprivate static var playable: [GameSystem] { allCases.filter { $0 != .atari2600 } }
 
-private struct CartridgeBadge: View {
-    let system: GameSystem
-    var body: some View {
-        VStack(spacing: 5) {
-            HStack(spacing: 3) {
-                ForEach(0..<5, id: \.self) { _ in Capsule().fill(system.tint.opacity(0.28)).frame(width: 4, height: 8) }
-            }
-            Image(systemName: symbol).font(.title3).foregroundStyle(system.tint)
-            Text(shortName).font(.caption2.weight(.heavy)).foregroundStyle(system.tint)
+    /// What to add for this system.
+    fileprivate var addHint: String {
+        switch self {
+        case .gameBoy: ".gb files"
+        case .gameBoyColor: ".gbc files"
+        case .gameBoyAdvance: ".gba files"
+        case .nes: ".nes files"
+        case .atari2600: ""
+        case .pcEngine: ".pce files"
+        case .dos: "A game’s .zip or .dosz file"
+        case .scummvm: "A game’s folder"
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(system.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-        .accessibilityHidden(true)
     }
-    private var symbol: String {
-        switch system {
-        case .nes, .atari2600, .pcEngine: "tv"
+
+    fileprivate var artSymbol: String {
+        switch self {
+        case .gameBoy: "dpad.fill"
+        case .gameBoyColor: "paintpalette.fill"
+        case .gameBoyAdvance: "bolt.fill"
+        case .nes: "tv.fill"
+        case .atari2600: "gamecontroller.fill"
+        case .pcEngine: "memorychip.fill"
         case .dos: "desktopcomputer"
-        case .scummvm: "cursorarrow.click.2"
-        case .gameBoy, .gameBoyColor, .gameBoyAdvance: "gamecontroller.fill"
+        case .scummvm: "map.fill"
         }
     }
-    private var shortName: String {
-        switch system {
-        case .gameBoy: "GB"; case .gameBoyColor: "COLOR"; case .gameBoyAdvance: "ADVANCE"; case .nes: "NES"
-        case .atari2600: "2600"; case .pcEngine: "PCE"; case .dos: "DOS"; case .scummvm: "SCUMM"
+
+    fileprivate var artShortName: String {
+        switch self {
+        case .gameBoy: "GAME BOY"; case .gameBoyColor: "GB COLOR"; case .gameBoyAdvance: "GB ADVANCE"; case .nes: "NES"
+        case .atari2600: "ATARI"; case .pcEngine: "PC ENGINE"; case .dos: "DOS"; case .scummvm: "SCUMMVM"
         }
+    }
+}
+
+/// A dashed area that takes dropped game files. The window's own drop target asks where files go; this one adds games.
+private struct GameDropZone<Content: View>: View {
+    let onDrop: ([URL]) -> Void
+    var corner: CGFloat = 18
+    @ViewBuilder var content: Content
+    @State private var targeted = false
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: corner, style: .continuous)
+        content
+            .background(Color.accentColor.opacity(targeted ? 0.14 : 0.05), in: shape)
+            .overlay(shape.strokeBorder(targeted ? Color.accentColor : Color.accentColor.opacity(0.35),
+                                        style: StrokeStyle(lineWidth: targeted ? 2.5 : 1.5, dash: [8, 6])))
+            .animation(Motion.quick, value: targeted)
+            .onDrop(of: [.fileURL], isTargeted: $targeted) { providers in
+                Task { @MainActor in
+                    var urls: [URL] = []
+                    for provider in providers { if let url = await provider.droppedFileURL() { urls.append(url) } }
+                    if !urls.isEmpty { onDrop(urls) }
+                }
+                return true
+            }
+    }
+}
+
+private extension NSItemProvider {
+    func droppedFileURL() async -> URL? {
+        await withCheckedContinuation { continuation in
+            _ = loadObject(ofClass: URL.self) { url, _ in continuation.resume(returning: url) }
+        }
+    }
+}
+
+/// Keyboard, controller and saving tips, as plain lines.
+private struct ControlsHelp: View {
+    let showFolder: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            #if os(macOS)
+            line("keyboard", "Keyboard", "Arrow keys move. X and Z are A and B. Return starts and Space selects.")
+            line("gamecontroller", "Controller", "Most game controllers work as soon as they are connected.")
+            line("desktopcomputer", "DOS and ScummVM", "These take the keyboard and mouse directly. If a DOS game says it needs a joystick, choose Joystick on its page. In ScummVM, save and load from the game’s menu: the Game Menu button, or fn-F5 on a Mac laptop.")
+            #else
+            line("hand.tap", "Touch", "Use the on-screen controls. Save your place from the player’s menu.")
+            line("gamecontroller", "Controller", "Connect a game controller and it works right away.")
+            line("desktopcomputer", "DOS and ScummVM", "The picture works like a touchpad: tap to click. In ScummVM, touch and hold to right-click.")
+            #endif
+            line("externaldrive", "Saves", "Your place is saved beside each game, so it can travel with your drive.")
+            #if os(macOS)
+            Button("Show Games Folder", systemImage: "folder", action: showFolder)
+            #endif
+        }
+    }
+
+    private func line(_ symbol: String, _ title: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol).foregroundStyle(Color.accentColor).frame(width: 22).accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.callout.weight(.semibold))
+                Text(text).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -417,38 +582,41 @@ private struct GameCollectionView: View {
 }
 
 private struct GameShelfGrid: View {
-    @Environment(GameLibrary.self) private var library
     let games: [Game]
     let favorites: Set<String>
     var body: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 155), spacing: 16)], alignment: .leading, spacing: 18) {
-            ForEach(games) { game in
-                NavigationLink(value: GameShelf.game(game)) { GameTile(game: game, favorite: favorites.contains(game.id)) }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button(favorites.contains(game.id) ? "Remove from Favorites" : "Add to Favorites", systemImage: "heart") {
-                            library.toggleFavorite(game)
-                        }
-                        ShowInFinderButton(url: game.url)
-                        SendToPhoneButton(game: game)
-                    }
-            }
+            ForEach(games) { game in GameTileLink(game: game, favorite: favorites.contains(game.id)) }
         }
     }
 }
 
+/// A tile that opens the game's page, with its right-click menu.
+private struct GameTileLink: View {
+    @Environment(GameLibrary.self) private var library
+    let game: Game
+    let favorite: Bool
+    var body: some View {
+        NavigationLink(value: GameShelf.game(game)) { GameTile(game: game, favorite: favorite) }
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button(favorite ? "Remove from Favorites" : "Add to Favorites", systemImage: "heart") { library.toggleFavorite(game) }
+                ShowInFinderButton(url: game.url)
+                SendToPhoneButton(game: game)
+            }
+    }
+}
+
+/// The game's saved picture when it has one, else its system's colors and symbol with the title set on it.
 private struct GameArtwork: View {
     let game: Game
     var body: some View {
         ZStack {
-            game.system.tint.opacity(0.12)
             if let thumbnail {
+                game.system.tint.opacity(0.12)
                 thumbnail.resizable().interpolation(.none).aspectRatio(contentMode: .fit)
             } else {
-                VStack(spacing: 9) {
-                    CartridgeBadge(system: game.system).frame(width: 70, height: 80)
-                    Text(game.system.name).font(.caption.weight(.medium)).foregroundStyle(.secondary)
-                }.padding(18)
+                SystemArt(game: game)
             }
         }
         .aspectRatio(1.4, contentMode: .fit)
@@ -461,6 +629,41 @@ private struct GameArtwork: View {
         #else
         UIImage(contentsOfFile: game.thumbnailURL.path).map { Image(uiImage: $0) }
         #endif
+    }
+}
+
+/// Stand-in cover: each system has its own color and symbol, and the title sits on it like a label.
+private struct SystemArt: View {
+    let game: Game
+    var body: some View {
+        let tint = game.system.tint
+        GeometryReader { geo in
+            let w = geo.size.width
+            ZStack(alignment: .bottomLeading) {
+                LinearGradient(colors: [tint.opacity(0.95), tint.mix(with: .black, by: 0.45)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                Image(systemName: game.system.artSymbol)
+                    .font(.system(size: w * 0.5, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.16))
+                    .rotationEffect(.degrees(-10))
+                    .offset(x: w * 0.52, y: -geo.size.height * 0.12)
+                LinearGradient(colors: [.clear, .black.opacity(0.4)], startPoint: .center, endPoint: .bottom)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(game.system.artShortName)
+                        .font(.system(size: max(8, w * 0.055), weight: .heavy)).tracking(1)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .background(.black.opacity(0.22), in: Capsule())
+                    Spacer(minLength: 4)
+                    Text(game.title)
+                        .font(.system(size: max(12, min(26, w * 0.11)), weight: .bold, design: .rounded))
+                        .foregroundStyle(.white).lineLimit(3).minimumScaleFactor(0.7)
+                        .multilineTextAlignment(.leading).shadow(color: .black.opacity(0.35), radius: 2, y: 1)
+                }
+                .padding(w * 0.07)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+            .clipped()
+        }
     }
 }
 
@@ -480,29 +683,41 @@ private struct GameTile: View {
             Text(game.title).font(.headline).foregroundStyle(.primary).lineLimit(2).multilineTextAlignment(.leading)
             Text(game.canResume ? "\(game.system.name) · Saved place" : game.system.name)
                 .font(.caption).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
         }
         .padding(10)
         .background(Design.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(hovering ? Color.accentColor.opacity(0.6) : Design.border, lineWidth: 0.5))
+        .hoverLift()
         .onHover { hovering = $0 }
         .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(game.title), \(game.system.name)\(game.canResume ? ", saved place" : "")\(favorite ? ", favorite" : "")")
     }
 }
 
-private struct RecentGameCard: View {
+/// A game with a saved place: its picture, and how long ago it was left.
+private struct ContinueCard: View {
     let game: Game
-    let date: Date?
+    let date: Date
+    @State private var hovering = false
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             GameArtwork(game: game)
-            Text(game.title).font(.headline).foregroundStyle(.primary).lineLimit(2).multilineTextAlignment(.leading)
-            HStack {
-                Label(game.canResume ? "Resume" : "Play again", systemImage: game.canResume ? "play.fill" : "arrow.clockwise")
-                    .font(.callout.weight(.semibold)).foregroundStyle(Color.accentColor)
-                Spacer()
-                if let date { Text(date, style: .relative).font(.caption).foregroundStyle(.secondary) }
+            Text(game.title).font(.headline).foregroundStyle(.primary).lineLimit(1)
+            HStack(spacing: 6) {
+                Label("Resume", systemImage: "play.fill").font(.callout.weight(.semibold)).foregroundStyle(Color.accentColor)
+                Spacer(minLength: 4)
+                if date != .distantPast {
+                    Text(date.formatted(.relative(presentation: .named))).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
             }
-        }.card(padding: 14)
+        }
+        .padding(12)
+        .frame(width: 252)
+        .background(Design.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(hovering ? Color.accentColor.opacity(0.6) : Design.border, lineWidth: 0.5))
+        .hoverLift()
+        .onHover { hovering = $0 }
     }
 }
 

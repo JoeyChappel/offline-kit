@@ -13,7 +13,7 @@ stage = args.stage.resolve()
 app = stage/'Offline Kit.app'
 guide = stage/'Start Here.pdf'
 background = root/'Tools/Release/Artwork/forest-install.png'
-for file in [app, guide, background]:
+for file in [app, guide, background, app/'Contents/Resources/AppIcon.icns']:
     if not file.exists():
         parser.error(f'Missing packaging input: {file}')
 args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -22,6 +22,8 @@ build_dmg(str(args.output.resolve()), args.volume_name, settings={
     'filesystem': 'HFS+',
     'files': [str(app), str(guide)],
     'symlinks': {'Applications': '/Applications'},
+    # The mounted disk shows the app's own icon on the desktop and in the Finder sidebar.
+    'icon': str(app/'Contents/Resources/AppIcon.icns'),
     'background': str(background),
     # 560 points of artwork plus the 32-point title bar.
     'window_rect': ((180, 140), (720, 592)),

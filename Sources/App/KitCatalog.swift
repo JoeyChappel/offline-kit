@@ -217,17 +217,27 @@ final class KitCatalog {
         if let owner = owners[key] { save(owner) }
     }
 
-    /// Applies only what's grounded: details from the files and from library articles. AI guesses stay waiting
-    /// for a look, item by item. Returns how many suggestions still have guesses waiting.
+    /// Applies what's grounded (details from the files and from library articles). With `includingGuesses`, the
+    /// model's own guesses are applied too and nothing is left waiting. Either way a field a person set
+    /// themselves is kept, and an AI age rating on its own is never used (a wrong guess could put a mature title
+    /// in front of a child once kid mode exists, so it has to come from the file, an article or a person).
+    /// One checkpoint covers the whole batch, so a single Undo takes it all back.
+    /// Returns how many suggestions still have guesses waiting (always 0 when guesses are included).
     @discardableResult
-    func approveAll(kind: CatalogKind?) -> Int {
+    func approveAll(kind: CatalogKind?, includingGuesses: Bool = false) -> Int {
         let keys = suggestions.values.filter { kind == nil || $0.kind == kind }.map(\.key)
         guard !keys.isEmpty else { return 0 }
-        checkpoint(keys, label: "Approve All")
+        checkpoint(keys, label: includingGuesses ? "Accept All" : "Approve All")
         let touched = Set(keys.compactMap { owners[$0] })
         var waiting = 0
         for key in keys {
             guard let suggestion = suggestions[key] else { continue }
+            if includingGuesses {
+                // `apply` skips user-set fields and anything `applies` rules out (an AI age rating).
+                apply(key, suggestion.proposed, fields: CatalogDetails.Key.allCases)
+                suggestions[key] = nil
+                continue
+            }
             let grounded = CatalogDetails.Key.allCases.filter { suggestion.proposed[$0].map { $0.source != .aiGuess } ?? false }
             apply(key, suggestion.proposed, fields: grounded)
             var rest = suggestion.proposed
@@ -238,6 +248,21 @@ final class KitCatalog {
         }
         touched.forEach(save)
         return waiting
+    }
+
+    /// What "Accept AI Guesses Too" would take from the model's own knowledge: the items and fields that would
+    /// actually change (not fields a person set, and not an AI age rating).
+    func guessCounts(kind: CatalogKind?) -> (items: Int, fields: Int) {
+        var items = 0, fields = 0
+        for suggestion in suggestions.values where kind == nil || suggestion.kind == kind {
+            let current = details[suggestion.key]
+            let n = CatalogDetails.Key.allCases.filter { key in
+                guard let value = suggestion.proposed[key], value.source == .aiGuess, Self.applies(key, value) else { return false }
+                return current?[key]?.source != .user
+            }.count
+            if n > 0 { items += 1; fields += n }
+        }
+        return (items, fields)
     }
 
     private func apply(_ key: String, _ proposed: CatalogDetails, fields: [CatalogDetails.Key]) {

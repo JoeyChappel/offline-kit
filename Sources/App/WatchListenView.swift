@@ -26,7 +26,9 @@ struct WatchListenView: View {
     @State private var finding = false
     @State private var organizing = false
     @State private var unavailableMessage: String?
+    @State private var dropTargeted = false
     @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     #if os(macOS)
     /// The window's drop sheet; + sends its picks there too.
     @Environment(DropImporter.self) private var dropImporter: DropImporter?
@@ -221,6 +223,10 @@ struct WatchListenView: View {
         filter == .all ? media.items.isEmpty : !media.items.contains { MediaCatalog.category($0, media.info[$0.progressKey]) == filter }
     }
 
+    /// Nothing of this kind yet and nothing being searched for: the collection card is the whole screen.
+    private var showingWelcome: Bool { sectionIsEmpty && query.isEmpty && genre == nil }
+    private var firstScan: Bool { media.scanning || !media.hasScanned }
+
     private var home: some View {
         ScrollViewReader { proxy in
         ScrollView {
@@ -234,7 +240,10 @@ struct WatchListenView: View {
                     HStack { Button("All shelves", systemImage: "chevron.left") { self.collection = nil }; Spacer() }.padding(.horizontal, 24)
                     Text(collection.title).font(.title.bold()).padding(.horizontal, 24)
                 }
-                if filter == .music && musicBrowse == .artists && artist == nil {
+                if showingWelcome {
+                    // Still reading the folders (a big library on a drive takes a moment): placeholders, not "nothing here".
+                    if firstScan { loadingSkeleton }
+                } else if filter == .music && musicBrowse == .artists && artist == nil {
                     artists
                 } else if filter == .music && musicBrowse == .songs {
                     songList
@@ -252,82 +261,146 @@ struct WatchListenView: View {
                         MediaShelfRow(shelf: shelf, open: { selected = $0 }, seeAll: { collection = shelf })
                     }
                 }
-                if sectionIsEmpty && query.isEmpty && genre == nil && (media.scanning || !media.hasScanned) {
-                    // Still reading the folders (a big library on a drive takes a moment): say so, not "nothing here".
-                    HStack(spacing: 10) {
-                        ProgressView().controlSize(.small)
-                        Text("Looking through your media…").foregroundStyle(MediaTheme.ink.opacity(0.75))
-                    }
-                    .frame(maxWidth: .infinity).padding(.vertical, 40)
-                } else if sectionIsEmpty && query.isEmpty && genre == nil {
-                    Group {
-                        if filter == .all { emptyCard } else { sectionWelcome(proxy) }
-                    }.padding(.horizontal, 24)
-                } else if filtered.isEmpty && (!query.isEmpty || genre != nil) {
+                if !showingWelcome && filtered.isEmpty && (!query.isEmpty || genre != nil) {
                     ContentUnavailableView.search(text: query.isEmpty ? genre ?? "" : query).padding()
-                } else if filtered.isEmpty && unfinished {
+                } else if !showingWelcome && filtered.isEmpty && unfinished {
                     ContentUnavailableView("Nothing unfinished", systemImage: "checkmark.circle",
                                            description: Text("Everything here is either finished or not started yet.")).padding()
                 }
-                DisclosureGroup("Add to your collection", isExpanded: $more) {
-                    VStack(alignment: .leading, spacing: 22) {
-                        if filter == .all || filter == .video || filter == .books { StarterPackCard() }
-                        if filter == .all || filter == .audiobooks { librivoxCard }
-                        #if os(macOS)
-                        findMyMediaCard
-                        #endif
-                        findMore
-                    }.padding(.top, 16)
-                }
-                .padding(20).background(MediaTheme.surface, in: RoundedRectangle(cornerRadius: 16)).padding(.horizontal, 24)
-                .id("more")
+                if !(showingWelcome && firstScan) { collectionCard(proxy, prominent: showingWelcome) }
             }
             .padding(.bottom, 32)
+            .animation(Motion.gentle(reduceMotion), value: genre)
+            .animation(Motion.gentle(reduceMotion), value: filter)
+            .animation(Motion.gentle(reduceMotion), value: musicBrowse)
+            .animation(Motion.gentle(reduceMotion), value: collection?.id)
+            .animation(Motion.gentle(reduceMotion), value: artist)
+            .animation(Motion.gentle(reduceMotion), value: showingWelcome)
         }
         .refreshable { await media.reload(library: library) }
         }
     }
 
-    /// "No movies yet": what this section holds and the ways to add some.
-    private func sectionWelcome(_ proxy: ScrollViewProxy) -> some View {
-        let (symbol, heading, body, add, free): (String, String, String, String, String) = switch filter {
-        case .audiobooks: ("headphones", "No audiobooks yet",
-                           "Add your own audiobooks, or get free classics read by volunteers. They stay on this device and play without internet.",
-                           "Add Audiobooks", "Get Free Audiobooks")
-        case .music: ("music.note", "No music yet",
-                      "Add songs and albums you already have, or find free music to keep. They stay on this device and play without internet.",
-                      "Add Music", "Find Free Music")
-        case .books: ("book", "No books yet",
-                      "Add EPUB or PDF books, or get free classics. They stay on this device and open without internet.",
-                      "Add Books", "Get Free Books")
-        default: ("film", "No movies yet",
-                  "Add your own movies and home videos, or get free films to keep. They stay on this device and play without internet.",
-                  "Add Videos", "Get Free Films")
+    /// Placeholders in the shape of the screen while the folders are first read: a banner, a title and a shelf.
+    private var loadingSkeleton: some View {
+        let card: (width: CGFloat, height: CGFloat, count: Int) = switch filter {
+        case .video: (272, 153, 4)
+        case .music: (180, 180, 5)
+        default: (152, 228, 5)
         }
-        return VStack(spacing: 16) {
-            Image(systemName: symbol).font(.system(size: 48)).foregroundStyle(MediaTheme.accent).accessibilityHidden(true)
-            Text(heading).font(.title2.bold())
-            Text(body).foregroundStyle(MediaTheme.muted).multilineTextAlignment(.center).frame(maxWidth: 460)
-            #if os(macOS)
-            Text("You can also drag files onto this window.").font(.callout).foregroundStyle(MediaTheme.muted)
-            #endif
+        return VStack(alignment: .leading, spacing: 22) {
+            SkeletonBlock(height: 220, corner: 18)
+            SkeletonBlock(width: 170, height: 22, corner: 6)
+            SkeletonShelf(count: card.count, cardWidth: card.width, cardHeight: card.height)
+                .frame(maxWidth: .infinity, alignment: .leading).clipped()
+        }
+        .padding(.horizontal, 24)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Looking through your media")
+    }
+
+    // MARK: Add to your collection
+
+    /// The heading and plain line for this section when it has nothing yet.
+    private var welcome: (symbol: String, heading: String) {
+        switch filter {
+        case .audiobooks: ("headphones", "No audiobooks yet")
+        case .music: ("music.note", "No music yet")
+        case .books: ("book", "No books yet")
+        case .video: ("film", "No movies yet")
+        case .all: ("play.rectangle.on.rectangle", "Make room for a good story.")
+        }
+    }
+    private var freeDetail: String {
+        switch filter {
+        case .video: "Free films to download and keep"
+        case .audiobooks: "Free classics read by LibriVox volunteers"
+        case .music: "Free music to download and keep"
+        case .books: "Free public domain books"
+        case .all: "Free films, audiobooks and books"
+        }
+    }
+
+    /// Always visible. Three ways in: files, Find My Media, and the free sources. Empty sections show it large, with
+    /// the section's welcome on top; a section with things in it shows it small at the bottom.
+    private func collectionCard(_ proxy: ScrollViewProxy, prominent: Bool) -> some View {
+        let shape = RoundedRectangle(cornerRadius: prominent ? 20 : 16, style: .continuous)
+        #if os(macOS)
+        let dropLine = "Drop files here, or pick a way to add them."
+        #else
+        let dropLine = "Pick a way to add them."
+        #endif
+        return VStack(alignment: .leading, spacing: prominent ? 24 : 16) {
+            if prominent {
+                VStack(spacing: 10) {
+                    Image(systemName: welcome.symbol).font(.system(size: 46)).foregroundStyle(MediaTheme.accent).accessibilityHidden(true)
+                    Text(welcome.heading).font(.title2.bold())
+                    Text("\(dropLine) Everything stays on this device and plays without internet.")
+                        .foregroundStyle(MediaTheme.muted).multilineTextAlignment(.center).frame(maxWidth: 460)
+                }.frame(maxWidth: .infinity)
+            } else {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Add to your collection").font(.title3.bold())
+                    Text(dropLine).font(.callout).foregroundStyle(MediaTheme.muted)
+                }
+            }
             ViewThatFits(in: .horizontal) {
-                HStack(spacing: 12) { welcomeActions(add: add, free: free, proxy: proxy) }
-                VStack(spacing: 10) { welcomeActions(add: add, free: free, proxy: proxy) }
+                HStack(alignment: .top, spacing: 12) { addChoices(proxy) }.fixedSize(horizontal: false, vertical: true)
+                VStack(spacing: 10) { addChoices(proxy) }
+            }
+            if more {
+                VStack(alignment: .leading, spacing: 22) {
+                    if filter == .all || filter == .video || filter == .books { StarterPackCard() }
+                    if filter == .all || filter == .audiobooks { librivoxCard }
+                    findMore
+                }
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .padding(28).frame(maxWidth: .infinity)
-        .background(MediaTheme.surface, in: RoundedRectangle(cornerRadius: 18))
-    }
-    @ViewBuilder private func welcomeActions(add: String, free: String, proxy: ScrollViewProxy) -> some View {
-        Button(add, systemImage: "plus") { importing = true }.buttonStyle(.borderedProminent)
+        .padding(prominent ? 28 : 20)
+        .frame(maxWidth: .infinity)
+        .background(MediaTheme.surface, in: shape)
+        .overlay(shape.strokeBorder(dropTargeted ? MediaTheme.accent : .white.opacity(0.08),
+                                    style: StrokeStyle(lineWidth: dropTargeted ? 2.5 : 0.5, dash: dropTargeted ? [9, 6] : [])))
+        .animation(Motion.gentle(reduceMotion), value: dropTargeted)
+        .animation(Motion.gentle(reduceMotion), value: more)
+        .padding(.horizontal, 24)
+        .id("more")
         #if os(macOS)
-        Button("Find My Media", systemImage: "sparkle.magnifyingglass") { finding = true }.buttonStyle(.bordered)
+        .onDrop(of: [.fileURL], isTargeted: $dropTargeted) { providers in
+            guard let dropImporter else { return false }
+            let section = importSection
+            Task { @MainActor in
+                var urls: [URL] = []
+                for provider in providers {
+                    if let url = await Self.fileURL(from: provider) { urls.append(url) }
+                }
+                if !urls.isEmpty { dropImporter.receive(urls, section: section) }
+            }
+            return true
+        }
         #endif
-        Button(free, systemImage: "arrow.down.circle") {
-            more = true
-            Task { try? await Task.sleep(for: .milliseconds(150)); withAnimation { proxy.scrollTo("more", anchor: .top) } }
-        }.buttonStyle(.bordered)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Add to your collection")
+    }
+
+    #if os(macOS)
+    private static func fileURL(from provider: NSItemProvider) async -> URL? {
+        await withCheckedContinuation { continuation in
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in continuation.resume(returning: url) }
+        }
+    }
+    #endif
+
+    @ViewBuilder private func addChoices(_ proxy: ScrollViewProxy) -> some View {
+        AddChoice(symbol: "plus.circle.fill", title: "Add files", detail: addHelp) { importing = true }
+        #if os(macOS)
+        AddChoice(symbol: "sparkle.magnifyingglass", title: "Find My Media", detail: "Look through this Mac’s folders and drives") { finding = true }
+        #endif
+        AddChoice(symbol: "arrow.down.circle.fill", title: "Free sources", detail: freeDetail, chevron: more ? "chevron.up" : "chevron.down", selected: more) {
+            withAnimation(Motion.gentle(reduceMotion)) { more.toggle() }
+            if more { Task { try? await Task.sleep(for: .milliseconds(200)); withAnimation(Motion.gentle(reduceMotion)) { proxy.scrollTo("more", anchor: .top) } } }
+        }
     }
 
     private var controls: some View {
@@ -340,7 +413,7 @@ struct WatchListenView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack {
                     ForEach(MediaFilter.allCases) { option in
-                        Button { filter = option } label: { Text(option.label).font(.callout.weight(.semibold)).padding(.horizontal, 17).padding(.vertical, 10) }
+                        Button { withAnimation(Motion.gentle(reduceMotion)) { filter = option } } label: { Text(option.label).font(.callout.weight(.semibold)).padding(.horizontal, 17).padding(.vertical, 10) }
                             .buttonStyle(.plain).background(filter == option ? MediaTheme.accent : MediaTheme.surface, in: Capsule())
                             .foregroundStyle(filter == option ? MediaTheme.canvas : MediaTheme.ink)
                             .accessibilityAddTraits(filter == option ? .isSelected : [])
@@ -352,21 +425,16 @@ struct WatchListenView: View {
                 Picker("Browse music", selection: $musicBrowse) { ForEach(MusicBrowse.allCases) { Text($0.rawValue).tag($0) } }
                     .pickerStyle(.segmented).onChange(of: musicBrowse) { artist = nil; genre = nil }
             }
-            if filter != .all && !MediaCatalog.genres(media.items, info: media.info, filter: filter).isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(spacing: 12) {
-                        ForEach(MediaCatalog.genres(media.items, info: media.info, filter: filter), id: \.self) { name in
-                            let matching = media.items.filter { MediaCatalog.category($0, media.info[$0.progressKey]) == filter && media.info[$0.progressKey]?.genre == name }
-                            Button { genre = genre == name ? nil : name; collection = nil } label: {
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text(name).font(.headline)
-                                    Text("\(matching.count) \(matching.count == 1 ? "item" : "items")").font(.caption)
-                                }.frame(width: 130, height: 48, alignment: .bottomLeading).padding(12)
-                                    .foregroundStyle(.white)
-                                    .background(LinearGradient(colors: MediaTheme.posterColors(name), startPoint: .topLeading, endPoint: .bottomTrailing), in: RoundedRectangle(cornerRadius: 12))
-                                    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(genre == name ? MediaTheme.accent : .white.opacity(0.15), lineWidth: genre == name ? 2 : 0.5))
-                            }.buttonStyle(.plain).accessibilityAddTraits(genre == name ? .isSelected : [])
-                        }
+            if filter != .all {
+                let names = MediaCatalog.genres(media.items, info: media.info, filter: filter)
+                if !names.isEmpty {
+                    let counts = MediaCatalog.genreCounts(media.items, info: media.info, filter: filter)
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        LazyHStack(spacing: 12) {
+                            ForEach(names, id: \.self) { name in
+                                GenreTile(name: name, count: counts[name] ?? 0, selected: genre == name) { toggleGenre(name) }
+                            }
+                        }.padding(.vertical, 8).padding(.horizontal, 2)
                     }
                 }
             }
@@ -379,12 +447,21 @@ struct WatchListenView: View {
     private var searchField: some View {
         TextField("Search titles, artists and genres", text: $query).textFieldStyle(.roundedBorder).accessibilityLabel("Search \(title)")
     }
-    private var genrePicker: some View {
-        Menu {
-            Button("All genres") { genre = nil; collection = nil }
-            ForEach(MediaCatalog.genres(media.items, info: media.info, filter: filter), id: \.self) { name in Button(name) { genre = name; collection = nil } }
-        } label: { Label(genre ?? "Browse genres", systemImage: "square.grid.2x2").font(.callout) }
-        .accessibilityLabel("Genre: \(genre ?? "All genres")")
+    /// Tiles are the way to pick a genre wherever they show (every section but All); the menu only stands in for them there.
+    @ViewBuilder private var genrePicker: some View {
+        let names = MediaCatalog.genres(media.items, info: media.info, filter: filter)
+        if filter == .all && !names.isEmpty {
+            Menu {
+                Button("All genres") { setGenre(nil) }
+                ForEach(names, id: \.self) { name in Button(name, systemImage: GenreIcon.symbol(for: name)) { setGenre(name) } }
+            } label: { Label(genre ?? "Browse genres", systemImage: genre.map(GenreIcon.symbol(for:)) ?? "square.grid.2x2").font(.callout) }
+            .accessibilityLabel("Genre: \(genre ?? "All genres")")
+        } else { Color.clear.frame(width: 0, height: 0) }
+    }
+    /// A tile or menu pick: choosing the genre that's already chosen clears it.
+    private func toggleGenre(_ name: String) { setGenre(genre == name ? nil : name) }
+    private func setGenre(_ name: String?) {
+        withAnimation(Motion.gentle(reduceMotion)) { genre = name; collection = nil }
     }
     private var sorting: some View {
         HStack {
@@ -406,9 +483,10 @@ struct WatchListenView: View {
                 Spacer(); Text("\(visibleItems.count) \(visibleItems.count == 1 ? "item" : "items")").font(.callout).foregroundStyle(MediaTheme.muted)
             }
             LazyVGrid(columns: [GridItem(.adaptive(minimum: typeSize.isAccessibilitySize ? 260 : (filter == .music || filter == .audiobooks ? 140 : 240)), spacing: 18)], alignment: .leading, spacing: 24) {
-                ForEach(visibleItems) { item in
+                ForEach(Array(visibleItems.enumerated()), id: \.element.id) { index, item in
                     Button { selected = item } label: { MediaCard(item: item, info: media.info[item.progressKey], progress: media.progress[item.progressKey]) }
                         .buttonStyle(.plain).mediaCardMenu(item)
+                        .appearFade(delay: min(Double(index), 8) * 0.03)
                 }
             }
         }.padding(.horizontal, 24)
@@ -447,33 +525,12 @@ struct WatchListenView: View {
         }.padding(.horizontal, 24)
     }
     private var genreGrid: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150))], spacing: 16) {
+        let counts = MediaCatalog.genreCounts(media.items, info: media.info, filter: filter)
+        return LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 14)], spacing: 14) {
             ForEach(MediaCatalog.genres(media.items, info: media.info, filter: filter), id: \.self) { name in
-                Button { genre = name } label: {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Image(systemName: "music.note.list").font(.title)
-                        Text(name).font(.headline)
-                        Text("\(filtered.filter { media.info[$0.progressKey]?.genre == name }.count) albums").font(.caption)
-                    }.frame(maxWidth: .infinity, minHeight: 100, alignment: .leading).padding(20)
-                        .background(MediaTheme.posterColors(name)[0], in: RoundedRectangle(cornerRadius: 14))
-                }.buttonStyle(.plain)
+                GenreTile(name: name, count: counts[name] ?? 0, noun: "album", selected: genre == name, width: nil) { toggleGenre(name) }
             }
         }.padding(.horizontal, 24)
-    }
-    private var emptyCard: some View {
-        VStack(spacing: 18) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 22).fill(MediaTheme.accent.opacity(0.12)).frame(width: 170, height: 110).rotationEffect(.degrees(-6))
-                Image(systemName: "play.rectangle.on.rectangle").font(.system(size: 54)).foregroundStyle(MediaTheme.accent)
-            }.accessibilityHidden(true)
-            Text("Make room for a good story.").font(.title2.bold())
-            Text("Add home videos, audiobooks or music with +. On Mac you can also drag files here. They stay on your device and play without internet.").foregroundStyle(MediaTheme.muted).multilineTextAlignment(.center)
-            Button("Add Files", systemImage: "plus") { importing = true }.buttonStyle(.borderedProminent)
-            #if os(macOS)
-            Button("Find media already on this Mac", systemImage: "sparkle.magnifyingglass") { finding = true }
-            #endif
-            Button("Find free films and audiobooks") { more = true }
-        }.padding(28).frame(maxWidth: .infinity).background(MediaTheme.surface, in: RoundedRectangle(cornerRadius: 18))
     }
     private func start(_ item: MediaItem, _ fromStart: Bool = false, _ track: Int? = nil) {
         if let place = item.unavailable {
@@ -496,22 +553,6 @@ struct WatchListenView: View {
         guard let item = nowPlaying.expandRequest else { return }
         nowPlaying.expandRequest = nil; playing = item
     }
-    #if os(macOS)
-    private var findMyMediaCard: some View {
-        HStack(alignment: .top, spacing: 12) {
-            Image(systemName: "sparkle.magnifyingglass").font(.title3).foregroundStyle(.tint).frame(width: 34, height: 34)
-                .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Already have it somewhere?").font(.headline)
-                Text("Find my media looks through this Mac’s Music, Movies, Downloads, Documents and Desktop folders, and drives you choose. Ask for what you want, like “my Beatles albums”, then keep it where it is, copy it or move it into the kit.")
-                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Button("Find My Media", systemImage: "sparkle.magnifyingglass") { finding = true }.buttonStyle(.bordered)
-            }
-        }
-        .card(padding: 18)
-    }
-    #endif
-
     private var findMore: some View {
         FindMoreCard(title: "Where to find more",
                      intro: "Free films, audiobooks, music and books you can download once and keep. Drag them onto this window, or use +.",
@@ -570,5 +611,88 @@ struct WatchListenView: View {
                     .buttonStyle(.bordered)
             }
         }
+    }
+}
+
+/// A genre or category tile: its symbol, name and count on the poster gradient. The chosen one gets an accent edge and a check.
+private struct GenreTile: View {
+    let name: String
+    let count: Int
+    var noun = "item"
+    let selected: Bool
+    var width: CGFloat? = 150
+    let action: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    private var symbol: String { GenreIcon.symbol(for: name) }
+    private var countText: String { "\(count) \(noun)\(count == 1 ? "" : "s")" }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        Button(action: action) {
+            ZStack {
+                // Opacity on the view, not the color: some symbols (waveform, paintpalette) ignored a faint color
+                // and drew solid white.
+                Image(systemName: symbol).font(.system(size: 62, weight: .semibold))
+                    .symbolRenderingMode(.monochrome).foregroundStyle(.white)
+                    .opacity(selected ? 0.2 : 0.12)
+                    .offset(x: 16, y: 16).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack {
+                        Image(systemName: symbol).font(.title3.weight(.semibold)).opacity(0.92)
+                        Spacer()
+                        if selected { Image(systemName: "checkmark.circle.fill").foregroundStyle(MediaTheme.accent).transition(.opacity) }
+                    }
+                    Spacer(minLength: 4)
+                    Text(name).font(.headline).lineLimit(1)
+                    Text(countText).font(.caption).opacity(0.85)
+                }.padding(12)
+            }
+            .frame(minWidth: width, maxWidth: width ?? .infinity, minHeight: 96, maxHeight: 96)
+            .foregroundStyle(.white)
+            .background(LinearGradient(colors: MediaTheme.posterColors(name), startPoint: .topLeading, endPoint: .bottomTrailing), in: shape)
+            .clipShape(shape)
+            .overlay(shape.strokeBorder(selected ? MediaTheme.accent : .white.opacity(0.15), lineWidth: selected ? 2 : 0.5))
+            .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .hoverLift()
+        .animation(Motion.gentle(reduceMotion), value: selected)
+        .accessibilityLabel("\(name), \(countText)")
+        .accessibilityHint(selected ? "Shows everything again" : "Shows only \(name)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// One of the three ways to add to the collection.
+private struct AddChoice: View {
+    let symbol: String
+    let title: String
+    let detail: String
+    var chevron: String? = nil
+    var selected = false
+    let action: () -> Void
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: symbol).font(.title3).foregroundStyle(MediaTheme.accent).frame(width: 36, height: 36)
+                    .background(MediaTheme.accent.opacity(0.14), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.headline)
+                    Text(detail).font(.caption).foregroundStyle(MediaTheme.muted).lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                if let chevron { Image(systemName: chevron).font(.caption.weight(.semibold)).foregroundStyle(MediaTheme.muted) }
+            }
+            .foregroundStyle(MediaTheme.ink)
+            .padding(14).frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            .background(MediaTheme.canvas.opacity(0.5), in: shape)
+            .overlay(shape.strokeBorder(selected ? MediaTheme.accent : .white.opacity(0.12), lineWidth: selected ? 1.5 : 0.5))
+            .contentShape(shape)
+        }
+        .buttonStyle(.plain)
+        .hoverLift(1.02)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
