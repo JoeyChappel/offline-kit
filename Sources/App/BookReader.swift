@@ -1,0 +1,435 @@
+import SwiftUI
+import WebKit
+import PDFKit
+
+/// Reading looks, saved per device.
+enum ReaderTheme: String, CaseIterable, Identifiable {
+    case light, sepia, dark
+    var id: String { rawValue }
+    var label: String { rawValue.capitalized }
+    var background: String { switch self { case .light: "#ffffff"; case .sepia: "#f4ecd8"; case .dark: "#141615" } }
+    var text: String { switch self { case .light: "#1c1f1d"; case .sepia: "#4b3a2a"; case .dark: "#e4e8e5" } }
+    var link: String { switch self { case .light, .sepia: "#2E7F60"; case .dark: "#5FC398" } }
+}
+
+/// Opens an EPUB or PDF from Watch & Listen › Books and remembers the place.
+struct BookReaderView: View {
+    let item: MediaItem
+    var body: some View {
+        if item.tracks[0].pathExtension.lowercased() == "pdf" {
+            PDFBookView(item: item)
+        } else {
+            EPUBReaderView(item: item)
+        }
+    }
+}
+
+// MARK: - EPUB
+
+/// Serves files from inside the EPUB to the web view at epub-book://local/<path in the zip>.
+final class EPUBSchemeHandler: NSObject, WKURLSchemeHandler {
+    static let scheme = "epub-book"
+    let zip: ZipReader
+    init(zip: ZipReader) { self.zip = zip }
+
+    func webView(_ webView: WKWebView, start task: any WKURLSchemeTask) {
+        guard let url = task.request.url else { return }
+        var path = url.path(percentEncoded: false)
+        if path.hasPrefix("/") { path.removeFirst() }
+        guard let data = zip.data(path) else {
+            task.didFailWithError(URLError(.fileDoesNotExist)); return
+        }
+        let ext = (path as NSString).pathExtension.lowercased()
+        let mime: String = switch ext {
+        case "xhtml", "xht": "application/xhtml+xml"
+        case "html", "htm": "text/html"
+        case "css": "text/css"
+        case "jpg", "jpeg": "image/jpeg"
+        case "png": "image/png"
+        case "gif": "image/gif"
+        case "svg": "image/svg+xml"
+        case "webp": "image/webp"
+        case "otf", "ttf", "woff", "woff2": "font/\(ext)"
+        default: "application/octet-stream"
+        }
+        task.didReceive(URLResponse(url: url, mimeType: mime, expectedContentLength: data.count,
+                                    textEncodingName: mime.hasPrefix("text") || mime.contains("xml") ? "utf-8" : nil))
+        task.didReceive(data)
+        task.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, stop task: any WKURLSchemeTask) {}
+}
+
+@MainActor @Observable
+final class EPUBReaderModel {
+    let item: MediaItem
+    private(set) var book: EPUBBook?
+    private(set) var zip: ZipReader?
+    private(set) var chapter = 0
+    var fraction: Double = 0
+    /// Where to scroll after a chapter loads (0…1).
+    var pendingScroll: Double = 0
+    var theme: ReaderTheme { didSet { KitSettings.shared.set(theme.rawValue, forKey: "readerTheme") } }
+    var textScale: Double { didSet { KitSettings.shared.set(String(textScale), forKey: "readerTextScale") } }
+    @ObservationIgnored weak var media: MediaLibrary?
+
+    init(item: MediaItem) {
+        self.item = item
+        theme = ReaderTheme(rawValue: KitSettings.shared.string(forKey: "readerTheme") ?? "") ?? .light
+        textScale = Double(KitSettings.shared.string(forKey: "readerTextScale") ?? "") ?? 1.1
+        if let (book, zip) = EPUBBook.open(item.tracks[0]) { self.book = book; self.zip = zip }
+    }
+
+    var chapterURL: URL? {
+        guard let book, book.chapters.indices.contains(chapter) else { return nil }
+        let encoded = book.chapters[chapter].path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? book.chapters[chapter].path
+        return URL(string: "\(EPUBSchemeHandler.scheme)://local/\(encoded)")
+    }
+
+    func start(media: MediaLibrary) {
+        self.media = media
+        guard let book else { return }
+        let saved = media.progress[item.progressKey]
+        if let saved, !saved.finished {
+            chapter = min(max(0, saved.track), book.chapters.count - 1)
+            pendingScroll = min(max(0, saved.seconds), 1)
+        }
+    }
+
+    func go(to index: Int, at scroll: Double = 0) {
+        guard let book, book.chapters.indices.contains(index) else { return }
+        chapter = index
+        pendingScroll = scroll
+        fraction = scroll
+        save()
+    }
+
+    /// Saves the chapter and how far down it they are. Reaching the end of the last chapter marks the book read.
+    func save() {
+        guard let media, let book else { return }
+        let done = chapter == book.chapters.count - 1 && fraction > 0.97
+        media.saveProgress(MediaProgress(track: chapter, seconds: done ? 0 : fraction, finished: done), for: item)
+    }
+
+    var css: String {
+        """
+        html { font-size: \(Int(textScale * 100))% !important; -webkit-text-size-adjust: none; }
+        html, body { background: \(theme.background) !important; color: \(theme.text) !important; }
+        body { max-width: 38em; margin: 0 auto !important; padding: 2.2em 1.4em 4em !important;
+               line-height: 1.6 !important; font-family: "New York", "Iowan Old Style", Georgia, serif; }
+        a { color: \(theme.link) !important; }
+        img, svg { max-width: 100% !important; height: auto !important; }
+        """
+    }
+}
+
+private struct EPUBReaderView: View {
+    @Environment(MediaLibrary.self) private var media
+    @State private var model: EPUBReaderModel
+    @State private var showingChapters = false
+
+    init(item: MediaItem) { _model = State(initialValue: EPUBReaderModel(item: item)) }
+
+    var body: some View {
+        Group {
+            if let book = model.book, let zip = model.zip {
+                VStack(spacing: 0) {
+                    EPUBWebView(model: model, zip: zip)
+                    bottomBar(book)
+                }
+                .background(Color(hex: model.theme.background))
+            } else {
+                ContentUnavailableView("This book can’t be opened", systemImage: "book.closed",
+                                       description: Text("The EPUB file may be damaged or protected with DRM. Books bought from stores are usually locked to their own apps."))
+            }
+        }
+        .navigationTitle(model.book?.title ?? MediaCatalog.displayTitle(model.item.title))
+        .toolbar {
+            ToolbarItemGroup {
+                if let book = model.book {
+                    Menu {
+                        ForEach(Array(book.chapters.enumerated()), id: \.offset) { index, chapter in
+                            Button { model.go(to: index) } label: {
+                                if index == model.chapter { Label(chapter.title, systemImage: "checkmark") } else { Text(chapter.title) }
+                            }
+                        }
+                    } label: { Label("Chapters", systemImage: "list.bullet") }
+                    .help("Chapters")
+                }
+                Button { model.textScale = max(0.8, model.textScale - 0.1) } label: { Label("Smaller Text", systemImage: "textformat.size.smaller") }
+                    .keyboardShortcut("-", modifiers: .command)
+                    .help("Smaller text (⌘−)")
+                Button { model.textScale = min(2.2, model.textScale + 0.1) } label: { Label("Larger Text", systemImage: "textformat.size.larger") }
+                    .keyboardShortcut("+", modifiers: .command)
+                    .help("Larger text (⌘+)")
+                Picker("Theme", selection: $model.theme) {
+                    ForEach(ReaderTheme.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.menu)
+                .help("Page color")
+            }
+        }
+        .onAppear { model.start(media: media) }
+        .onDisappear { model.save() }
+        // ⌘= is the same key as ⌘+ without Shift; both make the text larger.
+        .background {
+            Button("Larger Text") { model.textScale = min(2.2, model.textScale + 0.1) }
+                .keyboardShortcut("=", modifiers: .command).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+        }
+    }
+
+    private func bottomBar(_ book: EPUBBook) -> some View {
+        HStack(spacing: 14) {
+            Button { model.go(to: model.chapter - 1) } label: { Label("Previous", systemImage: "chevron.left") }
+                .keyboardShortcut(.leftArrow, modifiers: [])
+                .help("Previous chapter (←)")
+                .disabled(model.chapter == 0)
+            VStack(spacing: 4) {
+                Text(book.chapters[model.chapter].title).font(.callout.weight(.medium)).lineLimit(1)
+                ProgressView(value: (Double(model.chapter) + model.fraction) / Double(book.chapters.count))
+                    .frame(maxWidth: 360)
+                Text("Section \(model.chapter + 1) of \(book.chapters.count)").font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity)
+            Button { model.go(to: model.chapter + 1) } label: { Label("Next", systemImage: "chevron.right") }
+                .labelStyle(.titleAndIcon)
+                .keyboardShortcut(.rightArrow, modifiers: [])
+                .help("Next chapter (→)")
+                .disabled(model.chapter + 1 >= book.chapters.count)
+        }
+        .buttonStyle(.bordered)
+        .padding(.horizontal, 18).padding(.vertical, 10)
+        .background(.bar)
+    }
+}
+
+private struct EPUBWebView: PlatformViewRepresentable {
+    let model: EPUBReaderModel
+    let zip: ZipReader
+
+    func makeCoordinator() -> Coordinator { Coordinator(model: model) }
+
+    private func make(_ context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.setURLSchemeHandler(EPUBSchemeHandler(zip: zip), forURLScheme: EPUBSchemeHandler.scheme)
+        config.websiteDataStore = .nonPersistent()
+        // Reports how far down the chapter the reader is.
+        let report = """
+        (function(){ let t; window.addEventListener('scroll', function(){ clearTimeout(t); t = setTimeout(function(){
+          var h = document.documentElement.scrollHeight - window.innerHeight;
+          window.webkit.messageHandlers.progress.postMessage(h > 0 ? window.scrollY / h : 1); }, 250); }); })();
+        """
+        config.userContentController.addUserScript(WKUserScript(source: report, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        config.userContentController.add(context.coordinator, name: "progress")
+        let web = WKWebView(frame: .zero, configuration: config)
+        web.navigationDelegate = context.coordinator
+        #if os(macOS)
+        web.setValue(false, forKey: "drawsBackground")
+        #else
+        web.isOpaque = false
+        #endif
+        context.coordinator.web = web
+        context.coordinator.load()
+        return web
+    }
+
+    private func update(_ web: WKWebView, _ context: Context) { context.coordinator.sync() }
+
+    #if os(macOS)
+    func makeNSView(context: Context) -> WKWebView { make(context) }
+    func updateNSView(_ web: WKWebView, context: Context) { update(web, context) }
+    #else
+    func makeUIView(context: Context) -> WKWebView { make(context) }
+    func updateUIView(_ web: WKWebView, context: Context) { update(web, context) }
+    #endif
+
+    @MainActor final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        let model: EPUBReaderModel
+        weak var web: WKWebView?
+        private var loadedChapter = -1
+        private var appliedCSS = ""
+
+        init(model: EPUBReaderModel) { self.model = model }
+
+        func load() {
+            guard let web, let url = model.chapterURL else { return }
+            loadedChapter = model.chapter
+            web.load(URLRequest(url: url))
+        }
+
+        /// Follows chapter changes from the bar and menu, and restyles when the theme or text size changes.
+        func sync() {
+            if model.chapter != loadedChapter { load() } else if model.css != appliedCSS { applyStyle() }
+        }
+
+        private func applyStyle() {
+            appliedCSS = model.css
+            let css = model.css.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "`", with: "\\`")
+            web?.evaluateJavaScript("""
+            (function(){ var s = document.getElementById('ok-reader'); if (!s) { s = document.createElement('style'); s.id = 'ok-reader';
+              (document.head || document.documentElement).appendChild(s); } s.textContent = `\(css)`; })();
+            """)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            applyStyle()
+            let target = model.pendingScroll
+            model.pendingScroll = 0
+            if target > 0 {
+                webView.evaluateJavaScript("window.scrollTo(0, (document.documentElement.scrollHeight - window.innerHeight) * \(target));")
+            }
+        }
+
+        /// Links inside the book move between chapters; anything else stays put.
+        func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
+            guard let url = action.request.url else { return .cancel }
+            guard url.scheme == EPUBSchemeHandler.scheme else { return .cancel }
+            if action.navigationType == .linkActivated, let book = model.book {
+                var path = url.path(percentEncoded: false)
+                if path.hasPrefix("/") { path.removeFirst() }
+                if let index = book.chapters.firstIndex(where: { $0.path == path }), index != model.chapter {
+                    model.go(to: index)
+                    return .cancel
+                }
+            }
+            return .allow
+        }
+
+        func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let value = message.body as? Double else { return }
+            model.fraction = min(max(value, 0), 1)
+            model.save()
+        }
+    }
+}
+
+extension Color {
+    /// "#rrggbb"
+    init(hex: String) {
+        let v = UInt64(hex.dropFirst(), radix: 16) ?? 0
+        self.init(red: Double((v >> 16) & 0xff) / 255, green: Double((v >> 8) & 0xff) / 255, blue: Double(v & 0xff) / 255)
+    }
+}
+
+// MARK: - PDF books
+
+/// The open PDF: its page, and zoom controls for the toolbar.
+@MainActor @Observable
+private final class PDFReaderState {
+    var page = 0
+    var count = 0
+    @ObservationIgnored weak var view: PDFView?
+    func zoomIn() { view?.zoomIn(nil) }
+    func zoomOut() { view?.zoomOut(nil) }
+    func fit() { view?.autoScales = true }
+}
+
+private struct PDFBookView: View {
+    let item: MediaItem
+    @Environment(MediaLibrary.self) private var media
+    @State private var document: PDFDocument?
+    @State private var loaded = false
+    @State private var state = PDFReaderState()
+    var body: some View {
+        Group {
+            if let document {
+                PDFBookKitView(document: document, startPage: media.progress[item.progressKey].map { $0.finished ? 0 : $0.track } ?? 0, state: state) { page, count in
+                    media.saveProgress(MediaProgress(track: page, seconds: 0, finished: page >= count - 1 && count > 1), for: item)
+                }
+                .overlay(alignment: .bottom) {
+                    if state.count > 0 {
+                        Text("Page \(state.page + 1) of \(state.count)")
+                            .font(.callout.weight(.medium)).monospacedDigit()
+                            .padding(.horizontal, 14).padding(.vertical, 7)
+                            .background(.regularMaterial, in: Capsule())
+                            .padding(.bottom, 14)
+                            .allowsHitTesting(false)
+                    }
+                }
+            } else if loaded {
+                ContentUnavailableView("This PDF can’t be opened", systemImage: "doc.questionmark",
+                                       description: Text("The file may be damaged, still copying, or locked with a password. Try opening it in Preview, or add the file again."))
+            } else {
+                ProgressView()
+            }
+        }
+        .navigationTitle(MediaCatalog.displayTitle(item.title))
+        .toolbar {
+            if document != nil {
+                ToolbarItemGroup {
+                    Button { state.zoomOut() } label: { Label("Zoom Out", systemImage: "minus.magnifyingglass") }
+                        .keyboardShortcut("-", modifiers: .command).help("Zoom out (⌘−)")
+                    Button { state.fit() } label: { Label("Fit to Window", systemImage: "arrow.up.left.and.down.right.magnifyingglass") }
+                        .keyboardShortcut("0", modifiers: .command).help("Fit the page to the window (⌘0)")
+                    Button { state.zoomIn() } label: { Label("Zoom In", systemImage: "plus.magnifyingglass") }
+                        .keyboardShortcut("+", modifiers: .command).help("Zoom in (⌘+)")
+                }
+            }
+        }
+        .background {
+            Button("Zoom In") { state.zoomIn() }
+                .keyboardShortcut("=", modifiers: .command).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+        }
+        .task(id: item.id) {
+            let url = item.tracks[0]
+            // Read off the main thread: a big PDF takes a moment to open.
+            let opened = await Task.detached(priority: .userInitiated) { () -> PDFDocument? in
+                guard let doc = PDFDocument(url: url), doc.pageCount > 0, !doc.isLocked else { return nil }
+                return doc
+            }.value
+            document = opened
+            loaded = true
+        }
+    }
+}
+
+private struct PDFBookKitView: PlatformViewRepresentable {
+    let document: PDFDocument
+    let startPage: Int
+    let state: PDFReaderState
+    let onPage: (Int, Int) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPage: onPage, state: state) }
+
+    private func make(_ context: Context) -> PDFView {
+        let view = PDFView()
+        view.autoScales = true
+        view.displayMode = .singlePageContinuous
+        view.document = document
+        let start = min(startPage, max(0, document.pageCount - 1))
+        if let page = document.page(at: start) { view.go(to: page) }
+        state.view = view
+        let count = document.pageCount, state = state
+        DispatchQueue.main.async { state.count = count; state.page = start }
+        context.coordinator.observe(view)
+        return view
+    }
+
+    #if os(macOS)
+    func makeNSView(context: Context) -> PDFView { make(context) }
+    func updateNSView(_ view: PDFView, context: Context) {}
+    #else
+    func makeUIView(context: Context) -> PDFView { make(context) }
+    func updateUIView(_ view: PDFView, context: Context) {}
+    #endif
+
+    final class Coordinator: NSObject {
+        let onPage: (Int, Int) -> Void
+        let state: PDFReaderState
+        private var token: NSObjectProtocol?
+        init(onPage: @escaping (Int, Int) -> Void, state: PDFReaderState) { self.onPage = onPage; self.state = state }
+        func observe(_ view: PDFView) {
+            token = NotificationCenter.default.addObserver(forName: .PDFViewPageChanged, object: view, queue: .main) { [weak self, weak view] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let view, let doc = view.document, let page = view.currentPage else { return }
+                    let index = doc.index(for: page)
+                    self.state.page = index
+                    self.state.count = doc.pageCount
+                    self.onPage(index, doc.pageCount)
+                }
+            }
+        }
+        deinit { if let token { NotificationCenter.default.removeObserver(token) } }
+    }
+}

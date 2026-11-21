@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+	</array>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Find my media looks on your Desktop for movies, music, audiobooks, books and games. Offline Kit only reads what is there and adds only what you pick.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Find my media looks in your Documents folder for movies, music, audiobooks, books and games. Offline Kit only reads what is there and adds only what you pick.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Find my media looks in your Downloads folder for movies, music, audiobooks, books and games. Offline Kit only reads what is there and adds only what you pick.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Share on Wi-Fi lets phones and tablets on your home network use Offline Kit from this Mac.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Ask listens for your spoken question when you tap the mic or use Hands-Free. Your voice is turned into text on this Mac and never sent anywhere.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Offline Kit can keep or copy your library on a network drive, and Find my media can look in shared folders you choose. It only reads what is there unless you add or copy something.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Offline Kit can keep your library on a USB drive, run from a drive, copy your kit to one, and look on drives you choose for media to add. Nothing on the drive is changed unless you add, copy or move something.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Ask turns your spoken question into text using on-device speech recognition only. Nothing is sent to a server.</string>
+</dict>
+</plist>

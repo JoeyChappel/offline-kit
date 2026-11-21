@@ -1,0 +1,1 @@
+-DNDEBUG -D__LIBRETRO__ -Iinclude -D_FILE_OFFSET_BITS=64 -DDISABLE_DYNAREC=1 -fexceptions -fomit-frame-pointer -pthread

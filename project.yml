@@ -1,0 +1,229 @@
+name: OfflineKit
+options:
+  bundleIdPrefix: com.joeychappel.offlinekit
+  deploymentTarget:
+    macOS: "26.0"
+    iOS: "26.0"
+    tvOS: "26.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CLANG_CXX_LANGUAGE_STANDARD: gnu++20
+    SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge/Bridging.h
+    MARKETING_VERSION: "0.2.5"
+    CURRENT_PROJECT_VERSION: "7"
+    GENERATE_INFOPLIST_FILE: YES
+    INFOPLIST_KEY_CFBundleDisplayName: Offline Kit
+    OTHER_LDFLAGS: ["-lc++"]
+    HEADER_SEARCH_PATHS: ["$(SRCROOT)/Vendor/Cores"]
+    # llama.cpp and the emulator cores are built for Apple silicon only.
+    EXCLUDED_ARCHS: x86_64
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+
+targets:
+  OfflineKit-macOS:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/Bridge
+      - Sources/Core
+      - Sources/App
+      - Sources/Mac
+      - path: Resources
+        excludes: ["StarterBooks/**", "Licenses/**"]
+      # Public-domain classics copied into the kit on first launch (kept as a folder in the app).
+      - path: Resources/StarterBooks
+        type: folder
+        buildPhase: resources
+      # The license texts the bundled software requires to travel with the app (see THIRD-PARTY-NOTICES.md).
+      - path: Resources/Licenses
+        type: folder
+        buildPhase: resources
+      - path: THIRD-PARTY-NOTICES.md
+        buildPhase: resources
+    dependencies:
+      - framework: Vendor/CoreKiwix.xcframework
+        embed: false
+      - framework: Vendor/llama.xcframework
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/mgba_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/fceumm_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/mednafen_pce_fast_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/dosbox_pure_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/scummvm_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_NAME: Offline Kit
+        PRODUCT_BUNDLE_IDENTIFIER: com.joeychappel.offlinekit.mac
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: NO
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.reference
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Copyright © 2026 Joey Chappel. Free software under the GNU GPL, version 3."
+      configs:
+        # Debug builds get their own bundle ID, so test runs never touch the real app's preferences
+        # (window frames, settings) or notifications. Keychain service names and test key files don't use it.
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: com.joeychappel.offlinekit.mac.debug
+    info:
+      path: Sources/Mac/Info.plist
+      properties:
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
+        NSLocalNetworkUsageDescription: Share on Wi-Fi lets phones and tablets on your home network use Offline Kit from this Mac.
+        NSRemovableVolumesUsageDescription: Offline Kit can keep your library on a USB drive, run from a drive, copy your kit to one, and look on drives you choose for media to add. Nothing on the drive is changed unless you add, copy or move something.
+        NSNetworkVolumesUsageDescription: Offline Kit can keep or copy your library on a network drive, and Find my media can look in shared folders you choose. It only reads what is there unless you add or copy something.
+        NSDesktopFolderUsageDescription: Find my media looks on your Desktop for movies, music, audiobooks, books and games. Offline Kit only reads what is there and adds only what you pick.
+        NSDocumentsFolderUsageDescription: Find my media looks in your Documents folder for movies, music, audiobooks, books and games. Offline Kit only reads what is there and adds only what you pick.
+        NSDownloadsFolderUsageDescription: Find my media looks in your Downloads folder for movies, music, audiobooks, books and games. Offline Kit only reads what is there and adds only what you pick.
+        NSBonjourServices: ["_http._tcp"]
+        NSMicrophoneUsageDescription: Ask listens for your spoken question when you tap the mic or use Hands-Free. Your voice is turned into text on this Mac and never sent anywhere.
+        NSSpeechRecognitionUsageDescription: Ask turns your spoken question into text using on-device speech recognition only. Nothing is sent to a server.
+    # The hardened runtime (release builds) blocks the microphone without this. Tools/Release/make-release.sh signs with it.
+    entitlements:
+      path: Sources/Mac/OfflineKit.entitlements
+      properties:
+        com.apple.security.device.audio-input: true
+
+  OfflineKit-iOS:
+    type: application
+    platform: iOS
+    sources:
+      - Sources/Bridge
+      - Sources/Core
+      - Sources/App
+      - Sources/iOS
+      - path: Resources
+        excludes: ["StarterBooks/**", "Licenses/**"]
+      # Public-domain classics copied into the kit on first launch (kept as a folder in the app).
+      - path: Resources/StarterBooks
+        type: folder
+        buildPhase: resources
+      # The license texts the bundled software requires to travel with the app (see THIRD-PARTY-NOTICES.md).
+      - path: Resources/Licenses
+        type: folder
+        buildPhase: resources
+      - path: THIRD-PARTY-NOTICES.md
+        buildPhase: resources
+    dependencies:
+      - framework: Vendor/CoreKiwix.xcframework
+        embed: false
+      - framework: Vendor/llama.xcframework
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/mgba_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/fceumm_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/mednafen_pce_fast_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/dosbox_pure_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+      - framework: Vendor/Cores/scummvm_libretro.xcframework
+        link: false
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_NAME: Offline Kit
+        PRODUCT_BUNDLE_IDENTIFIER: com.joeychappel.offlinekit.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Automatic
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UIFileSharingEnabled: YES
+        INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connects to Ollama on your Mac over home Wi-Fi when available.
+        INFOPLIST_KEY_NSCameraUsageDescription: Scans barcodes on your supplies so you don't have to type them. Nothing from the camera is saved or sent.
+    info:
+      path: Sources/iOS/Info.plist
+      properties:
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UIBackgroundModes: [audio]
+        # Finds Offline Kit on the Mac for "From your Mac" (Send to iPhone).
+        NSBonjourServices: ["_http._tcp"]
+        NSMicrophoneUsageDescription: Ask listens for your spoken question when you tap the mic or use Hands-Free. Your voice is turned into text on this device and never sent anywhere.
+        NSSpeechRecognitionUsageDescription: Ask turns your spoken question into text using on-device speech recognition only. Nothing is sent to a server.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
+
+  # Apple TV: a client of the Mac's Share on Wi-Fi server. Streams Watch & Listen; stores nothing locally.
+  OfflineKit-tvOS:
+    type: application
+    platform: tvOS
+    sources:
+      - Sources/TV
+      - Sources/App/MediaForestBackground.swift
+      - Resources/watch-forest.jpg
+    settings:
+      base:
+        PRODUCT_NAME: Offline Kit
+        PRODUCT_BUNDLE_IDENTIFIER: com.joeychappel.offlinekit.tv
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+        OTHER_LDFLAGS: []
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: ""
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: QF9W87MQ59
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Finds Offline Kit on your Mac over home Wi-Fi so you can watch and listen here.
+    info:
+      path: Sources/TV/Info.plist
+      properties:
+        NSBonjourServices: ["_http._tcp"]
+        UILaunchScreen: {}
+        NSAppTransportSecurity:
+          # Plain HTTP to the Mac's private IP address. Local-networking rules alone have been unreliable for raw IPs.
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
+
+  okit:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/Bridge
+      - Sources/Core
+      - Tools/okit
+    dependencies:
+      - framework: Vendor/CoreKiwix.xcframework
+        embed: false
+      - framework: Vendor/llama.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_NAME: okit
+        LD_RUNPATH_SEARCH_PATHS: ["$(SRCROOT)/Vendor/llama.xcframework/macos-arm64"]
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        GENERATE_INFOPLIST_FILE: NO

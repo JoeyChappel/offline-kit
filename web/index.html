@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Offline Kit for Mac</title>
+<meta name="description" content="A family reference library for the Mac that works with no internet. Ask questions, read Wikipedia and repair guides, keep a family plan and play your own movies, books and games.">
+<meta property="og:title" content="Offline Kit for Mac">
+<meta property="og:description" content="Your family’s library, ready when the internet isn’t.">
+<meta property="og:image" content="https://joeychappel.com/offline-kit/img/books.jpg">
+<meta property="og:type" content="website">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="img/icon.png" type="image/png">
+<link rel="apple-touch-icon" href="img/icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Fraunces:opsz,wght@9..144,600&display=swap">
+<style>
+  :root {
+    --night:  #0F1412;
+    --panel:  #17201C;
+    --seam:   #26352E;
+    --text:   #EEF2EF;
+    --soft:   #B7C4BD;
+    --faint:  #8A9890;
+    --accent: #5FC398;
+    --deep:   #2E7F60;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+  body {
+    margin: 0;
+    background: var(--night);
+    color: var(--text);
+    font-family: "Atkinson Hyperlegible", ui-sans-serif, system-ui, -apple-system, sans-serif;
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+
+  img { max-width: 100%; height: auto; display: block; }
+  a { color: var(--accent); }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+  h1, h2 { font-family: "Fraunces", Georgia, serif; font-weight: 600; letter-spacing: -.01em; line-height: 1.15; }
+  .eyebrow { color: var(--accent); font-size: 13px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; margin: 0 0 10px; }
+
+  /* Top bar */
+  .top { display: flex; align-items: center; justify-content: space-between; padding: 20px 0; font-size: 15px; }
+  .top a { color: var(--soft); text-decoration: none; }
+  .top a:hover { color: var(--text); }
+
+  /* Hero: the app's own forest, faded into the page */
+  .hero { position: relative; padding: 40px 0 0; }
+  .hero::before {
+    content: "";
+    position: absolute; inset: 0 0 auto 0; height: 760px; z-index: -1;
+    background:
+      linear-gradient(to bottom, rgba(15,20,18,.35), var(--night) 92%),
+      url("img/forest.jpg") center top / cover no-repeat;
+  }
+  .intro { display: grid; grid-template-columns: 132px 1fr; gap: 28px; align-items: center; }
+  .intro img { width: 132px; height: 132px; border-radius: 28px; box-shadow: 0 14px 40px rgba(0,0,0,.45); }
+  .hero h1 { font-size: clamp(38px, 6vw, 60px); margin: 0 0 10px; }
+  .tagline { font-size: clamp(19px, 2.4vw, 23px); color: var(--soft); margin: 0; max-width: 640px; }
+
+  .download { margin: 34px 0 0; display: flex; flex-wrap: wrap; align-items: center; gap: 14px 22px; }
+  .button {
+    display: inline-flex; align-items: center; gap: 10px;
+    background: var(--accent); color: #0B1A13; font-weight: 700; font-size: 18px;
+    padding: 14px 26px; border-radius: 999px; text-decoration: none;
+    box-shadow: 0 8px 24px rgba(95,195,152,.25);
+  }
+  .button:hover { background: #74D2A9; }
+  .button:focus-visible { outline: 3px solid var(--text); outline-offset: 3px; }
+  .button svg { width: 20px; height: 20px; }
+  .needs { color: var(--faint); font-size: 15px; margin: 0; }
+  .tip { color: var(--soft); font-size: 15px; margin: 14px 0 0; }
+  .tip a { color: var(--accent); font-weight: 700; }
+  .coffee { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 16px; margin: 22px 0 0; color: var(--soft); font-size: 15px; }
+  .coffee img { width: 180px; height: auto; border-radius: 10px; }
+  .coffee a:focus-visible { outline: 3px solid var(--text); outline-offset: 3px; border-radius: 12px; }
+  .cta .coffee { justify-content: center; }
+
+  .shot {
+    margin: 52px 0 0; border-radius: 14px; overflow: hidden;
+    border: 1px solid var(--seam); box-shadow: 0 30px 80px rgba(0,0,0,.55);
+  }
+  figcaption { color: var(--faint); font-size: 15px; padding: 12px 4px 0; }
+
+  section { padding: 84px 0 0; }
+  section h2 { font-size: clamp(30px, 4vw, 40px); margin: 0 0 14px; }
+  .lede { color: var(--soft); font-size: 19px; max-width: 700px; margin: 0 0 34px; }
+
+  .features { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 16px; }
+  .feature { background: var(--panel); border: 1px solid var(--seam); border-radius: 14px; padding: 22px 22px 20px; }
+  .feature h3 { margin: 0 0 6px; font-size: 19px; display: flex; align-items: center; gap: 10px; }
+  .feature h3 span { font-size: 22px; }
+  .feature p { margin: 0; color: var(--soft); font-size: 16px; }
+
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; align-items: start; }
+  .pair .shot { margin-top: 0; }
+  /* Same height for both, so the captions line up; the top of each window is what matters. */
+  .pair .shot img { aspect-ratio: 16 / 11; object-fit: cover; object-position: top; }
+  .pair h3 { font-size: 21px; margin: 18px 0 6px; }
+  .pair p { margin: 0; color: var(--soft); font-size: 16px; }
+
+  .steps { counter-reset: step; list-style: none; padding: 0; margin: 0; display: grid; gap: 14px; max-width: 760px; }
+  .steps li { counter-increment: step; position: relative; padding: 18px 20px 18px 66px; background: var(--panel); border: 1px solid var(--seam); border-radius: 14px; color: var(--soft); }
+  .steps li::before {
+    content: counter(step); position: absolute; left: 20px; top: 17px;
+    width: 30px; height: 30px; border-radius: 50%; background: var(--deep); color: var(--text);
+    font-weight: 700; font-size: 15px; display: grid; place-items: center;
+  }
+  .steps strong { color: var(--text); }
+
+  .note { border-left: 3px solid var(--accent); padding: 4px 0 4px 18px; color: var(--soft); max-width: 760px; margin: 28px 0 0; }
+
+  .cta { text-align: center; padding: 96px 0 0; }
+  .cta .download { justify-content: center; }
+
+  footer { margin: 96px 0 0; padding: 30px 0 46px; border-top: 1px solid var(--seam); color: var(--faint); font-size: 14px; }
+  footer p { margin: 0 0 10px; max-width: 860px; }
+  footer a { color: var(--soft); }
+
+  @media (max-width: 760px) {
+    .wrap { padding: 0 16px; }
+    .intro { grid-template-columns: 1fr; gap: 18px; }
+    .intro img { width: 96px; height: 96px; border-radius: 22px; }
+    .pair { grid-template-columns: 1fr; gap: 44px; }
+    .hero::before { height: 560px; }
+    .shot { margin-top: 40px; border-radius: 10px; }
+    section { padding-top: 64px; }
+    .button { width: 100%; justify-content: center; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav class="top" aria-label="Site">
+    <a href="/">Joey Chappel</a>
+    <a href="/projects/">Projects</a>
+  </nav>
+</div>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="intro">
+      <img src="img/icon.png" alt="Offline Kit app icon" width="132" height="132">
+      <div>
+        <h1>Offline Kit</h1>
+        <p class="tagline">Your family’s library, ready when the internet isn’t. Ask questions, read Wikipedia and repair guides, keep a family plan and enjoy your own movies, books and games, all with no connection.</p>
+      </div>
+    </div>
+
+    <div class="download">
+      <a class="button" href="https://github.com/JoeyChappel/offline-kit/releases/latest/download/OfflineKit.dmg">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>
+        Download for Mac
+      </a>
+      <p class="needs">Always the newest version. Needs a Mac with Apple silicon (M1 or newer) and macOS 26 or later.</p>
+    </div>
+    <div class="coffee">
+      <a href="https://buymeacoffee.com/joeychappel"><img src="img/bmc-button.png" alt="Buy me a coffee" width="180" height="51"></a>
+      <span>Offline Kit is free and open source. If it helps your family, a coffee keeps it growing.</span>
+    </div>
+
+    <figure class="shot">
+      <img src="img/books.jpg" alt="Offline Kit showing the Books section: genre shelves, a featured classic and a row of book covers" width="1600" height="1242">
+    </figure>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <section aria-labelledby="inside">
+    <p class="eyebrow">What’s inside</p>
+    <h2 id="inside">Everything you save stays on your Mac.</h2>
+    <p class="lede">You need the internet once, to download what you choose. After that it all works offline: in a storm, on a trip or when the power’s out.</p>
+
+    <div class="features">
+      <article class="feature">
+        <h3><span aria-hidden="true">💬</span>Ask</h3>
+        <p>Ask in plain English and get an answer from your saved library, with numbered sources you can open. The AI runs on your Mac, so your questions stay on it, unless you choose to use Ollama on another computer at home. You can ask out loud, too.</p>
+      </article>
+      <article class="feature">
+        <h3><span aria-hidden="true">📚</span>Library</h3>
+        <p>Wikipedia, medical references, iFixit repair guides, Stack Exchange and more. Browse by area and topic or search everything. Offline maps come from OpenStreetMap.</p>
+      </article>
+      <article class="feature">
+        <h3><span aria-hidden="true">🏠</span>Prepare</h3>
+        <p>A family plan with meeting places, contacts and utility shutoffs, printable wallet cards, supplies with expiry reminders and a power-out mode that times your fridge and freezer.</p>
+      </article>
+      <article class="feature">
+        <h3><span aria-hidden="true">🎬</span>Watch and listen</h3>
+        <p>Your movies, shows, music, audiobooks and books in one place, plus free classic books to start. It remembers where you stopped, and your keyboard’s play and skip keys work.</p>
+      </article>
+      <article class="feature">
+        <h3><span aria-hidden="true">🎮</span>Play</h3>
+        <p>Games you add for Game Boy, Game Boy Color, Game Boy Advance, NES, PC Engine, DOS and ScummVM, right in the app.</p>
+      </article>
+      <article class="feature">
+        <h3><span aria-hidden="true">📶</span>Share on Wi-Fi</h3>
+        <p>Phones and tablets in the house can use the library from a web browser, with no internet and nothing to install on them.</p>
+      </article>
+      <article class="feature">
+        <h3><span aria-hidden="true">💾</span>Take it with you</h3>
+        <p>Copy the app and your whole library to a USB drive. Every file is checked, and the drive runs Offline Kit on any Apple silicon Mac with macOS 26 or later.</p>
+      </article>
+      <article class="feature">
+        <h3><span aria-hidden="true">✨</span>Stays current</h3>
+        <p>When a new version is out, Offline Kit tells you. One click installs it and reopens the app. Your library and settings stay as they are.</p>
+      </article>
+    </div>
+  </section>
+
+  <section aria-labelledby="look">
+    <p class="eyebrow">A closer look</p>
+    <h2 id="look">Pick what you need. Plan for the rest.</h2>
+    <div class="pair">
+      <figure>
+        <div class="shot"><img src="img/resources.jpg" alt="Get Resources: areas such as Emergency and preparedness, Health and family, and Home and repairs, with a starter set picked" width="1600" height="1120" loading="lazy"></div>
+        <h3>Choose what to keep</h3>
+        <p>Pick areas like Emergency, Health and Home, see the size of everything before it downloads and save to your Mac or a USB drive. Downloads pick up where they left off and are checked when they finish.</p>
+      </figure>
+      <figure>
+        <div class="shot"><img src="img/plan.jpg" alt="Prepare: a family plan with a meeting place near home, an out-of-area contact and utility shutoff notes, filled in with sample details" width="1600" height="1242" loading="lazy"></div>
+        <h3>Your family plan, private</h3>
+        <p>What you tell Offline Kit about your household is encrypted on your Mac and never shared over Wi-Fi. It’s only sent anywhere if you choose an Ollama computer on your home network to answer questions. Ask uses it to give answers that fit your family.</p>
+      </figure>
+    </div>
+  </section>
+
+  <section aria-labelledby="start">
+    <p class="eyebrow">Getting started</p>
+    <h2 id="start">Up and running in a few minutes.</h2>
+    <ol class="steps">
+      <li><strong>Download and install.</strong> Open the disk image and drag Offline Kit to Applications. It’s signed and notarized by Apple, so it opens like any other app you download.</li>
+      <li><strong>Choose your library.</strong> The welcome screens suggest a starter set and show the size of everything before it downloads. Change anything you like, or add more later. A USB drive works well for big collections.</li>
+      <li><strong>Turn on answers.</strong> If your Mac has Apple Intelligence, Ask works right away. For fuller answers, download the built-in answer model, about 5 GB, from Get Resources.</li>
+    </ol>
+    <p class="note">Answers come from your offline library where it covers the question, and anything else is labeled “Not from the library.” They can still be wrong. Double-check anything medical, electrical or safety-related against the source article, and get professional help when you can.</p>
+  </section>
+
+  <section class="cta" aria-labelledby="get">
+    <h2 id="get">Get Offline Kit before you need it.</h2>
+    <div class="download">
+      <a class="button" href="https://github.com/JoeyChappel/offline-kit/releases/latest/download/OfflineKit.dmg">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>
+        Download for Mac
+      </a>
+    </div>
+    <p class="needs" style="margin-top:14px">Mac with Apple silicon, macOS 26 or later. <a href="https://github.com/JoeyChappel/offline-kit/releases">Release notes</a></p>
+    <div class="coffee">
+      <a href="https://buymeacoffee.com/joeychappel"><img src="img/bmc-button.png" alt="Buy me a coffee" width="180" height="51" loading="lazy"></a>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>Library content comes from Kiwix (Wikipedia, WikiMed, iFixit, Stack Exchange and more), LibriVox, OpenStreetMap and Open Food Facts. Licenses vary by source; Wikipedia and Stack Exchange use CC BY-SA.</p>
+    <p>Offline Kit is free software under the <a href="https://github.com/JoeyChappel/offline-kit/blob/main/LICENSE">GNU GPL, version 3</a>. It includes Kiwix and libzim, llama.cpp and the mGBA, FCEUmm, Mednafen PCE Fast, DOSBox Pure and ScummVM game engines. <a href="https://github.com/JoeyChappel/offline-kit">Source code</a> and <a href="https://github.com/JoeyChappel/offline-kit/blob/main/THIRD-PARTY-NOTICES.md">third-party notices</a> are on GitHub.</p>
+    <p>Made by <a href="/">Joey Chappel</a>. Not affiliated with Apple, Wikipedia or Kiwix.</p>
+  </div>
+</footer>
+
+</body>
+</html>

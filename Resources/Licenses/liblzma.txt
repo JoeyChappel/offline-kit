@@ -1,0 +1,1 @@
+liblzma, from XZ Utils 5.2.6, is in the public domain.
