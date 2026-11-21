@@ -226,7 +226,7 @@ struct OrganizeSheet: View {
             if value != (suggestion.proposed[key]?.value ?? "") { userKeys[key] = value; edited[key] = nil }
         }
         catalog.approve(suggestion.key, edited: edited)
-        for (key, value) in userKeys { catalog.setByUser(suggestion.key, field: key, value: value, owner: owner) }
+        for (key, value) in userKeys { catalog.setByUser(suggestion.key, field: key, value: value, owner: owner, undoable: false) }   // part of the approve, one Undo
         editing = nil
         note = nil
         media.applyCatalog(library: library)

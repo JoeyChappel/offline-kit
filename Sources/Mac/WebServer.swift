@@ -76,7 +76,8 @@ final class WebServer: @unchecked Sendable {
                 while remaining > 0 {
                     let chunk = try handle.read(upToCount: Int(min(remaining, 1 << 20))) ?? Data()
                     if chunk.isEmpty { break }
-                    await write(chunk)
+                    // The viewer closed the tab or seeked away: stop reading the file for nobody.
+                    if !(await write(chunk)) { break }
                     remaining -= Int64(chunk.count)
                 }
             } catch {}
@@ -93,9 +94,11 @@ final class WebServer: @unchecked Sendable {
             await write(Data(head.utf8))
         }
 
-        func event(_ name: String, _ payload: Any) async {
+        /// False once the other end has gone away, so callers can stop producing the rest of the answer.
+        @discardableResult
+        func event(_ name: String, _ payload: Any) async -> Bool {
             let data = (try? JSONSerialization.data(withJSONObject: payload, options: [.fragmentsAllowed])) ?? Data("null".utf8)
-            await write(Data("event: \(name)\ndata: ".utf8) + data + Data("\n\n".utf8))
+            return await write(Data("event: \(name)\ndata: ".utf8) + data + Data("\n\n".utf8))
         }
 
         /// False once the other end has gone away.
@@ -142,11 +145,17 @@ final class WebServer: @unchecked Sendable {
 
     /// Starts on the first free port in `ports`. Advertises over Bonjour as "_http._tcp".
     /// With no service name, it isn't advertised.
-    func start(ports: ClosedRange<UInt16>, serviceName: String?, onState: @escaping @Sendable (String?) -> Void) throws {
+    /// `preferred` (the port used last time) is tried first, so phone bookmarks keep working across relaunches.
+    func start(ports: ClosedRange<UInt16>, preferred: UInt16? = nil, serviceName: String?, onState: @escaping @Sendable (String?) -> Void) throws {
         var lastError: Error?
-        for candidate in ports where Self.isPortFree(candidate) {
+        var order = Array(ports)
+        if let preferred, let at = order.firstIndex(of: preferred) { order.remove(at: at); order.insert(preferred, at: 0) }
+        for candidate in order where Self.isPortFree(candidate) {
             do {
                 let params = NWParameters.tcp
+                // Lets the server take back its port while the last run's connections are still winding down.
+                // isPortFree has already made sure no other program is listening on it.
+                params.allowLocalEndpointReuse = true
                 let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: candidate)!)
                 // The TXT record lets the Apple TV app tell Offline Kit apart from other web servers on the network.
                 if let serviceName {
@@ -173,31 +182,54 @@ final class WebServer: @unchecked Sendable {
     }
 
     /// True if nothing else is listening on this TCP port (IPv4 or IPv6).
+    /// Whether the port can be used. A port whose only users are connections from the last run winding down
+    /// (TIME_WAIT, after a quick quit and relaunch) counts as free, so phone bookmarks keep working; a port another
+    /// program is listening on, even on one address only, never does.
     static func isPortFree(_ port: UInt16) -> Bool {
-        func canBind(_ family: Int32) -> Bool {
-            let fd = socket(family, SOCK_STREAM, IPPROTO_TCP)
-            guard fd >= 0 else { return true }   // family unsupported: don't block on it
-            defer { close(fd) }
-            if family == AF_INET6 {
-                var addr = sockaddr_in6()
-                addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-                addr.sin6_family = sa_family_t(AF_INET6)
-                addr.sin6_port = port.bigEndian
-                addr.sin6_addr = in6addr_any
-                return withUnsafePointer(to: &addr) {
-                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) == 0 }
-                }
-            }
-            var addr = sockaddr_in()
-            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = port.bigEndian
-            addr.sin_addr = in_addr(s_addr: INADDR_ANY)
+        if canBind(port, AF_INET, reuse: false) && canBind(port, AF_INET6, reuse: false) { return true }
+        return canBind(port, AF_INET, reuse: true) && canBind(port, AF_INET6, reuse: true)
+            && !answers(port, AF_INET) && !answers(port, AF_INET6)
+    }
+
+    private static func canBind(_ port: UInt16, _ family: Int32, reuse: Bool) -> Bool {
+        let fd = socket(family, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else { return true }   // family unsupported: don't block on it
+        defer { close(fd) }
+        if reuse {
+            var on: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
+        }
+        return withAddress(port, family, loopback: false) { bind(fd, $0, $1) == 0 }
+    }
+
+    /// True when something is listening on this port on this Mac's own loopback address.
+    private static func answers(_ port: UInt16, _ family: Int32) -> Bool {
+        let fd = socket(family, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        return withAddress(port, family, loopback: true) { connect(fd, $0, $1) == 0 }
+    }
+
+    private static func withAddress(_ port: UInt16, _ family: Int32, loopback: Bool,
+                                    _ body: (UnsafePointer<sockaddr>, socklen_t) -> Bool) -> Bool {
+        if family == AF_INET6 {
+            var addr = sockaddr_in6()
+            addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_port = port.bigEndian
+            addr.sin6_addr = loopback ? in6addr_loopback : in6addr_any
             return withUnsafePointer(to: &addr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 }
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { body($0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
             }
         }
-        return canBind(AF_INET) && canBind(AF_INET6)
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = port.bigEndian
+        addr.sin_addr = in_addr(s_addr: loopback ? inet_addr("127.0.0.1") : INADDR_ANY)
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { body($0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
     }
 
     func stop() {

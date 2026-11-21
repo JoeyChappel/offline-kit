@@ -70,6 +70,8 @@ final class EPUBReaderModel {
     var fraction: Double = 0
     /// Where to scroll after a chapter loads (0…1).
     var pendingScroll: Double = 0
+    /// True once the saved place has been applied. The web view isn't created before then, so its first load is the right chapter.
+    private(set) var ready = false
     var theme: ReaderTheme { didSet { KitSettings.shared.set(theme.rawValue, forKey: "readerTheme") } }
     var textScale: Double { didSet { KitSettings.shared.set(String(textScale), forKey: "readerTextScale") } }
     @ObservationIgnored weak var media: MediaLibrary?
@@ -89,7 +91,8 @@ final class EPUBReaderModel {
 
     func start(media: MediaLibrary) {
         self.media = media
-        guard let book else { return }
+        defer { ready = true }
+        guard let book, !ready else { return }
         let saved = media.progress[item.progressKey]
         if let saved, !saved.finished {
             chapter = min(max(0, saved.track), book.chapters.count - 1)
@@ -135,7 +138,7 @@ private struct EPUBReaderView: View {
         Group {
             if let book = model.book, let zip = model.zip {
                 VStack(spacing: 0) {
-                    EPUBWebView(model: model, zip: zip)
+                    if model.ready { EPUBWebView(model: model, zip: zip) } else { Color.clear }
                     bottomBar(book)
                 }
                 .background(Color(hex: model.theme.background))
@@ -249,12 +252,15 @@ private struct EPUBWebView: PlatformViewRepresentable {
         weak var web: WKWebView?
         private var loadedChapter = -1
         private var appliedCSS = ""
+        /// True from the start of a chapter load until it finishes. Scroll reports in that window belong to the old page.
+        private var loading = false
 
         init(model: EPUBReaderModel) { self.model = model }
 
         func load() {
             guard let web, let url = model.chapterURL else { return }
             loadedChapter = model.chapter
+            loading = true
             web.load(URLRequest(url: url))
         }
 
@@ -274,11 +280,21 @@ private struct EPUBWebView: PlatformViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             applyStyle()
+            loading = false
             let target = model.pendingScroll
             model.pendingScroll = 0
             if target > 0 {
                 webView.evaluateJavaScript("window.scrollTo(0, (document.documentElement.scrollHeight - window.innerHeight) * \(target));")
             }
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { loading = false }
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { loading = false }
+
+        /// The same chapter file, ignoring any #section a link added.
+        static func samePage(_ a: URL?, _ b: URL?) -> Bool {
+            guard let a, let b else { return false }
+            return a.path(percentEncoded: false) == b.path(percentEncoded: false)
         }
 
         /// Links inside the book move between chapters; anything else stays put.
@@ -297,7 +313,8 @@ private struct EPUBWebView: PlatformViewRepresentable {
         }
 
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard let value = message.body as? Double else { return }
+            guard let value = message.body as? Double, !loading,
+                  Self.samePage(message.frameInfo.request.url, model.chapterURL) else { return }
             model.fraction = min(max(value, 0), 1)
             model.save()
         }

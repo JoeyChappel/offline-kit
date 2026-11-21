@@ -152,6 +152,26 @@ final class DownloadManager {
         }
     }
 
+    /// Bytes that queued, running and paused downloads still have to write to the same drive as `folder`.
+    /// Free space only shrinks as they arrive, so the space check subtracts this up front.
+    func bytesStillNeeded(on folder: URL) -> Int64 {
+        func volume(_ url: URL) -> AnyObject? {
+            var probe = url
+            while !FileManager.default.fileExists(atPath: probe.path) && probe.path != "/" { probe.deleteLastPathComponent() }
+            return (try? probe.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as AnyObject?
+        }
+        let target = volume(folder)
+        return jobs.filter { job in
+            switch job.state {
+            case .queued, .preparing, .downloading, .verifying, .paused: return true
+            default: return false
+            }
+        }.filter { job in
+            guard let target, let other = volume(job.folder) else { return job.folder.standardizedFileURL == folder.standardizedFileURL }
+            return target.isEqual(other)
+        }.reduce(Int64(0)) { $0 + max(0, $1.total - $1.done) }
+    }
+
     func pause(_ job: DownloadJob) {
         job.task?.cancel()
         job.task = nil
@@ -226,6 +246,8 @@ final class DownloadManager {
                         job.state = progress.phase == .verifying ? .verifying : .downloading
                     }
                 }
+                // Paused or cancelled right as it finished: leave the job as the person set it.
+                guard !Task.isCancelled else { return }
                 job.done = job.total
                 job.state = .done
                 job.task = nil

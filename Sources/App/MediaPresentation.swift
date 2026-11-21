@@ -129,7 +129,7 @@ struct MediaCard: View {
 struct MediaShelfRow: View {
     let shelf: MediaShelf
     let open: (MediaItem) -> Void
-    let seeAll: () -> Void
+    var seeAll: (() -> Void)? = nil
     @Environment(MediaLibrary.self) private var media
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -137,7 +137,7 @@ struct MediaShelfRow: View {
                 Text(shelf.title).font(.title2.bold())
                 Text("\(shelf.items.count)").font(.callout).foregroundStyle(MediaTheme.muted)
                 Spacer()
-                Button("See all", action: seeAll).font(.callout).accessibilityLabel("See all \(shelf.title)")
+                if let seeAll { Button("See all", action: seeAll).font(.callout).accessibilityLabel("See all \(shelf.title)") }
             }.padding(.horizontal, 24)
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .top, spacing: 18) {
@@ -234,10 +234,10 @@ struct MediaItemDetail: View {
                 }
                 if let studio = info?.studio {
                     let others = media.items.filter { $0.id != current.id && media.info[$0.progressKey]?.studio == studio }
-                    if !others.isEmpty { MediaShelfRow(shelf: MediaShelf(title: "More from \(studio)", items: others), open: open, seeAll: { if let first = others.first { open(first) } }) }
+                    if !others.isEmpty { MediaShelfRow(shelf: MediaShelf(title: "More from \(studio)", items: others), open: open) }
                 }
                 let related = MediaCatalog.related(to: current, items: media.items, info: media.info)
-                if !related.isEmpty { MediaShelfRow(shelf: MediaShelf(title: "More like this", items: Array(related.prefix(12))), open: open, seeAll: { if let first = related.first { open(first) } }) }
+                if !related.isEmpty { MediaShelfRow(shelf: MediaShelf(title: "More like this", items: Array(related.prefix(12))), open: open) }
             }.padding(24)
         }.background { MediaForestBackground() }
     }
@@ -314,6 +314,7 @@ struct MediaPlayerView: View {
                         .overlay(alignment: .topLeading) { Text(MediaCatalog.displayTitle(item.title)).font(.headline).padding(12).background(.black.opacity(0.85), in: Capsule()).padding().allowsHitTesting(false) }
                         .overlay(alignment: .bottomTrailing) {
                             if !cancelledNext, playback.duration > 0, playback.duration - playback.current <= 20,
+                               MediaCatalog.chainsToNext(item, duration: playback.duration, info: media.info),
                                let next = MediaCatalog.nextVideo(after: item, items: media.items, info: media.info, progress: media.progress) {
                                 VStack(alignment: .leading, spacing: 10) {
                                     Text("Up next in \(max(0, Int(ceil(playback.duration - playback.current))))s").font(.caption).monospacedDigit()
@@ -323,7 +324,7 @@ struct MediaPlayerView: View {
                             }
                         }
                         .onChange(of: playback.finished) {
-                            if playback.finished, !cancelledNext, let next = MediaCatalog.nextVideo(after: item, items: media.items, info: media.info, progress: media.progress) { advance(next) }
+                            if playback.finished, !cancelledNext, MediaCatalog.chainsToNext(item, duration: playback.duration, info: media.info), let next = MediaCatalog.nextVideo(after: item, items: media.items, info: media.info, progress: media.progress) { advance(next) }
                         }
                 } else { AudioPlayerView(playback: playback) }
             } else { ProgressView() }

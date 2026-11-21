@@ -250,8 +250,11 @@ struct KitCopySheet: View {
     @ViewBuilder private var finished: some View {
         let outcome = copier.outcome
         if let recheck = copier.recheck {
-            KitHeading(eyebrow: "CHECK", title: recheck.mismatched.isEmpty ? "Every file matches." : "Some files don’t match.",
-                       subtitle: "Read every file on both sides again and compared checksums.")
+            KitHeading(eyebrow: "CHECK",
+                       title: recheck.stopped && recheck.mismatched.isEmpty ? "Check stopped: \(recheck.checked) of \(recheck.total) checked."
+                            : recheck.mismatched.isEmpty ? "Every file matches." : "Some files don’t match.",
+                       subtitle: recheck.stopped ? "You stopped the check early, so the rest of the files weren’t read. Run it again to check them all."
+                                                 : "Read every file on both sides again and compared checksums.")
             VStack(alignment: .leading, spacing: 8) {
                 fact("Checked", "\(recheck.checked) \(recheck.checked == 1 ? "file" : "files")")
                 fact("Match", "\(recheck.checked - recheck.mismatched.filter { $0.reason == "Doesn’t match the original" }.count)")

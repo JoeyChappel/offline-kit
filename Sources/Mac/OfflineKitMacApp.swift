@@ -16,9 +16,15 @@ struct OfflineKitMacApp: App {
     init() {
         // Release the built-in AI model while the app is still fully alive.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+            // Household saves are debounced; write any edit still waiting so quitting right after a change keeps it.
+            MainActor.assumeIsolated { Household.shared?.flushPendingSave() }
             LlamaRuntime.shared.shutdown()
         }
     }
+
+    /// Startup work belongs to the launch, not to a window: a second main window (or one reopened from the Dock)
+    /// must not re-attach sharing, restart downloads the user paused, or add duplicate observers.
+    @MainActor private static var didStartUp = false
 
     /// Watches every library folder, plus the older Kids and Device Manuals folders, for changes made outside the app.
     private func watchLibrary() {
@@ -107,10 +113,12 @@ struct OfflineKitMacApp: App {
     #endif
 
     var body: some Scene {
-        WindowGroup("Offline Kit") {
+        WindowGroup("Offline Kit", id: "main") {
             RootView()
                 .frame(minWidth: 820, minHeight: 520)
                 .task {
+                    guard !Self.didStartUp else { return }
+                    Self.didStartUp = true
                     // Opened straight from the disk image: offer to move into Applications first.
                     AppMover.offerMoveIfNeeded()
                     // Downloads can be archives, maps, answer models or media: show whichever it was.
@@ -161,6 +169,8 @@ struct OfflineKitMacApp: App {
         .environment(nowPlaying)
         .environment(starterFilms)
         .commands {
+            // One main window: File › New Window would only make a second copy of the same library.
+            CommandGroup(replacing: .newItem) {}
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") { Task { await AppUpdater.shared.check(userInitiated: true) } }
             }
@@ -178,6 +188,8 @@ struct OfflineKitMacApp: App {
             }
         }
         .defaultSize(width: 720, height: 560)
+        // Don't bring a game back (with its sound) when the app launches.
+        .restorationBehavior(.disabled)
 
         WindowGroup("Article", for: ArticleRef.self) { $ref in
             if let ref {
@@ -187,6 +199,7 @@ struct OfflineKitMacApp: App {
         .environment(library)
         .environment(household)
         .defaultSize(width: 900, height: 760)
+        .restorationBehavior(.disabled)
 
         Settings {
             SettingsView()

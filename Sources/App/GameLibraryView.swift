@@ -534,7 +534,7 @@ private struct GameDetailView: View {
                     VStack(alignment: .leading, spacing: 12) { playActions }
                 }
                 if game.canResume {
-                    Text("Resume carries on from where you left off. Play starts from the beginning and keeps your saves.")
+                    Text("Resume carries on from where you left off. Play starts from the beginning, and a quick look won’t replace where you left off.")
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Label(game.system.controlsHint, systemImage: "keyboard")

@@ -21,7 +21,8 @@ final class VoiceAsk {
     var notice: String?
 
     /// Asks a question the same way typing it would. Set by the Ask view.
-    var ask: ((String) -> Void)?
+    /// Returns whether the question was taken.
+    var ask: ((String) -> Bool)?
     weak var model: AskModel?
     /// Where the words come from. Debug tests swap in a recorded file.
     var source: VoiceListener.Source = .microphone
@@ -198,16 +199,15 @@ final class VoiceAsk {
     private func submit(_ question: String) {
         waitingForTurn = true
         Task {
-            // Ask finishes noting facts after an answer; wait for it rather than drop the question.
+            // Wait out an answer that is still being written rather than drop the question.
             var waited = 0
             while model?.isBusy == true, waited < 100 {
                 try? await Task.sleep(for: .milliseconds(150)); waited += 1
             }
             guard handsFree, waitingForTurn else { return }
-            let before = model?.turns.last?.id
-            ask?(question)
+            let accepted = ask?(question) ?? false
             waitingForTurn = false
-            if let last = model?.turns.last, last.id != before {
+            if accepted, let last = model?.turns.last {
                 followTurn = last.id
                 update(last)
             } else {

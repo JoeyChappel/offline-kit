@@ -322,7 +322,8 @@ final class KitCopier {
     private(set) var bytesPerSecond: Double = 0
     private(set) var finishedAt: Date?
     /// Set by "Check the copy again": how many files matched and which didn't.
-    private(set) var recheck: (checked: Int, mismatched: [KitCopy.Skipped])?
+    /// `stopped` means the person ended the check early, so `checked` of `total` files were read and no verdict is given.
+    private(set) var recheck: (checked: Int, mismatched: [KitCopy.Skipped], stopped: Bool, total: Int)?
     private(set) var destinationKit: URL?
     /// Files the person chose not to replace.
     private(set) var leftAlone: [KitCopy.Item] = []
@@ -454,6 +455,7 @@ final class KitCopier {
         Task.detached(priority: .utility) {
             var mismatched: [KitCopy.Skipped] = []
             var checked = 0
+            var stopped = false
             for item in items {
                 await MainActor.run { KitCopier.shared.current = item.relative }
                 let report: (Int64) -> Void = { bytes in Task { @MainActor in KitCopier.shared.advance(bytes) } }
@@ -467,6 +469,7 @@ final class KitCopier {
                     checked += 1
                     if original != copy { mismatched.append(KitCopy.Skipped(relative: item.relative, reason: "Doesn’t match the original")) }
                 } catch is CancellationError {
+                    stopped = true
                     break
                 } catch {
                     mismatched.append(KitCopy.Skipped(relative: item.relative, reason: error.localizedDescription))
@@ -475,7 +478,7 @@ final class KitCopier {
             let done = checked, bad = mismatched
             await MainActor.run {
                 let copier = KitCopier.shared
-                copier.recheck = (done, bad)
+                copier.recheck = (done, bad, stopped, items.count)
                 copier.current = ""
                 copier.phase = .finished
                 copier.finishedAt = Date()

@@ -12,8 +12,8 @@ settings:
     SWIFT_VERSION: "5.0"
     CLANG_CXX_LANGUAGE_STANDARD: gnu++20
     SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge/Bridging.h
-    MARKETING_VERSION: "0.2.5"
-    CURRENT_PROJECT_VERSION: "7"
+    MARKETING_VERSION: "0.2.6"
+    CURRENT_PROJECT_VERSION: "8"
     GENERATE_INFOPLIST_FILE: YES
     INFOPLIST_KEY_CFBundleDisplayName: Offline Kit
     OTHER_LDFLAGS: ["-lc++"]
@@ -85,6 +85,12 @@ targets:
         # (window frames, settings) or notifications. Keychain service names and test key files don't use it.
         Debug:
           PRODUCT_BUNDLE_IDENTIFIER: com.joeychappel.offlinekit.mac.debug
+        # Strip the debug map from the shipped program: it lists every source and object file by its full
+        # path on the build Mac. Crash reports still symbolicate from the dSYM, which isn't shipped.
+        Release:
+          DEPLOYMENT_POSTPROCESSING: YES
+          STRIP_INSTALLED_PRODUCT: YES
+          STRIP_STYLE: debugging
     info:
       path: Sources/Mac/Info.plist
       properties:

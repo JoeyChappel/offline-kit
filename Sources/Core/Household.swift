@@ -105,6 +105,10 @@ final class Household {
     var data: HouseholdData { didSet { scheduleSave() } }
     private(set) var saveError: String?
     @ObservationIgnored private var saveTask: Task<Void, Never>?
+    /// True from an edit until its debounced write lands, so quitting can tell there is something to flush.
+    @ObservationIgnored private var hasPendingSave = false
+    /// The live store, for the quit handler (which runs outside any view).
+    @ObservationIgnored static weak var shared: Household?
 
     /// The details are on a drive protected by a passphrase this Mac doesn't know yet. Nothing is saved until it's entered,
     /// so the drive's details can't be overwritten by an empty household.
@@ -123,6 +127,7 @@ final class Household {
         var loaded = (locked ? nil : PrivateStore.load(HouseholdData.self)) ?? HouseholdData()
         Preparedness.addMissingDefaults(to: &loaded.checklist)
         data = loaded
+        Household.shared = self
         isLocked = locked
     }
 
@@ -182,11 +187,21 @@ final class Household {
     private func flush() throws {
         guard !isLocked else { throw PrivateStore.PassphraseError.locked }
         saveTask?.cancel()
+        hasPendingSave = false
         try PrivateStore.save(data)
+    }
+
+    /// Writes an edit that is still inside the 400 ms debounce, synchronously. Called as the app quits.
+    func flushPendingSave() {
+        guard hasPendingSave, !isLocked, !savesPaused else { return }
+        saveTask?.cancel()
+        hasPendingSave = false
+        try? PrivateStore.save(data)
     }
 
     private func reload() {
         saveTask?.cancel()
+        hasPendingSave = false
         isLocked = PrivateStore.isLocked
         var loaded = (isLocked ? nil : PrivateStore.load(HouseholdData.self)) ?? HouseholdData()
         Preparedness.addMissingDefaults(to: &loaded.checklist)
@@ -245,9 +260,11 @@ final class Household {
         guard !isLocked else { return }
         if savesPaused { changedWhilePaused = true; return }
         let snapshot = data
+        hasPendingSave = true
         saveTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(400))
             guard !Task.isCancelled else { return }
+            self?.hasPendingSave = false
             do { try PrivateStore.save(snapshot); self?.saveError = nil }
             catch { self?.saveError = "Couldn’t save your private details: \(error.localizedDescription)" }
         }

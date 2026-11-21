@@ -308,22 +308,32 @@ enum KitTransfer {
         do {
             try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
             if source.standardizedFileURL == target.standardizedFileURL { return nil }   // already in place
-            if fm.fileExists(atPath: target.path) {
-                guard replace else { return nil }
-                try fm.removeItem(at: target)
-            }
+            let exists = fm.fileExists(atPath: target.path)
+            if exists && !replace { return nil }
             let sameDisk = volume(of: source) == volume(of: target.deletingLastPathComponent())
             if move && sameDisk {
-                try fm.moveItem(at: source, to: target)        // instant on the same disk
+                // Instant on the same disk. With Replace, the old file only goes away once the move has worked.
+                if exists { _ = try fm.replaceItemAt(target, withItemAt: source) } else { try fm.moveItem(at: source, to: target) }
             } else {
-                try fm.copyItem(at: source, to: target)
-                // Moving across disks: the original goes to the Trash only once the copy is complete and checks out.
-                if move {
-                    guard verify(target, matches: source) else {
-                        return "\(name): the copy didn’t match the original, so the original was kept."
+                // Copy next to the target under a .part name (the media scan ignores those), so a full or unplugged
+                // drive never costs the old file or leaves a half-copied one that looks playable.
+                let temp = target.deletingLastPathComponent().appending(path: target.lastPathComponent + ".part")
+                try? fm.removeItem(at: temp)
+                do {
+                    try fm.copyItem(at: source, to: temp)
+                    if move {
+                        guard verify(temp, matches: source) else {
+                            try? fm.removeItem(at: temp)
+                            return "\(name): the copy didn’t match the original, so the original was kept."
+                        }
                     }
-                    try fm.trashItem(at: source, resultingItemURL: nil)
+                    if exists { _ = try fm.replaceItemAt(target, withItemAt: temp) } else { try fm.moveItem(at: temp, to: target) }
+                } catch {
+                    try? fm.removeItem(at: temp)
+                    throw error
                 }
+                // Moving across disks: the original goes to the Trash only once the copy is complete and checks out.
+                if move { try fm.trashItem(at: source, resultingItemURL: nil) }
             }
             return nil
         } catch {

@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(macOS)
+import AppKit
+#endif
 
 struct AskView: View {
     @Environment(KitNavigation.self) private var navigation
@@ -78,6 +81,12 @@ struct AskView: View {
             voice.ask = { ask($0) }
         }
         .onDisappear { voice.end() }
+        #if os(macOS)
+        // Hiding the window or switching apps must not leave the microphone listening.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in
+            if voice.isActive { voice.end() }
+        }
+        #endif
         .onChange(of: voice.dictating) { _, dictating in
             if dictating { dictationBase = draft.isEmpty ? "" : draft + " " }
         }
@@ -326,10 +335,13 @@ struct AskView: View {
 
     private func send() { ask(draft) }
 
-    private func ask(_ question: String) {
-        guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        draft = ""
-        model.ask(question, library: library, scope: navigation.askScope, household: household)
+    /// Clears the text box only when the question was taken, so nothing typed is lost.
+    @discardableResult
+    private func ask(_ question: String) -> Bool {
+        guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        let accepted = model.ask(question, library: library, scope: navigation.askScope, household: household)
+        if accepted { draft = "" }
+        return accepted
     }
 }
 

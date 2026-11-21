@@ -196,13 +196,14 @@ struct PlayerView: View {
         case 0x31: return .select        // Space
         default: break
         }
-        switch (event.charactersIgnoringModifiers ?? "").lowercased() {
-        case "x": return system == .atari2600 ? .B : .A
-        case "z": return .B
-        case "s": return .X
-        case "a": return .Y
-        case "q": return .L
-        case "w": return .R
+        // By physical key, so AZERTY and Dvorak keep the same shape under the fingers.
+        switch event.keyCode {
+        case 0x07: return system == .atari2600 ? .B : .A   // X
+        case 0x06: return .B                                // Z
+        case 0x01: return .X                                // S
+        case 0x00: return .Y                                // A
+        case 0x0C: return .L                                // Q
+        case 0x0D: return .R                                // W
         default: return nil
         }
     }

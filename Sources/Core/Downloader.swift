@@ -240,6 +240,8 @@ actor ChunkedDownload {
 
             report(.verifying)
             let bad = try await verify()
+            // Paused or cancelled while checking: stop here, and never move a half-checked file into place.
+            try Task.checkCancellation()
             if bad.isEmpty { break }
             // Rare: a chunk got damaged on disk (power loss, yanked drive). Fetch just those again.
             for chunk in bad { state.done[chunk] = false }
@@ -247,6 +249,7 @@ actor ChunkedDownload {
             if round == 2 { throw DownloadError.checksum }
         }
 
+        try Task.checkCancellation()
         report(.finishing)
         try handle?.truncate(atOffset: UInt64(state.meta.size))
         try handle?.close()
@@ -448,7 +451,10 @@ actor ChunkedDownload {
         let chunkSize = state.chunkSize
         let progress = self.progress
         let total = meta.size
-        return try await Task.detached(priority: .utility) {
+        // A detached task doesn't inherit cancellation, so Pause and Cancel flip this flag for the read loop to see.
+        let stopped = VerifyStopFlag()
+        return try await withTaskCancellationHandler {
+          try await Task.detached(priority: .utility) {
             var sha = SHA256()
             var bad = Set<Int>()
             let piece = Int(meta.pieceLength ?? 0)
@@ -457,7 +463,7 @@ actor ChunkedDownload {
             var offset: Int64 = 0
             var lastReport = Date()
             while offset < total {
-                try Task.checkCancellation()
+                if stopped.isSet { throw CancellationError() }
                 let want = Int(min(Int64(block), total - offset))
                 guard let data = try handle.read(upToCount: want), data.count == want else {
                     bad.insert(Int(offset / chunkSize)); break
@@ -485,8 +491,19 @@ actor ChunkedDownload {
                 return Array(0..<Int((total + chunkSize - 1) / chunkSize))
             }
             return bad.sorted()
-        }.value
+          }.value
+        } onCancel: {
+            stopped.set()
+        }
     }
+}
+
+/// A thread-safe "stop now" flag shared between a cancelled task and the detached work it started.
+private final class VerifyStopFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
 }
 
 extension Digest {

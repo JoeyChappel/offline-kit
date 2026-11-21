@@ -286,7 +286,9 @@ final class KitCatalog {
 
     /// A person's own value. It wins over every automatic source and is never overwritten by a re-run.
     /// An empty value clears the field (and keeps it cleared).
-    func setByUser(_ key: String, field: CatalogDetails.Key, value: String, owner: URL) {
+    func setByUser(_ key: String, field: CatalogDetails.Key, value: String, owner: URL, undoable: Bool = true) {
+        // Each edit is its own undo step (a caller that already took a checkpoint for this change passes false).
+        if undoable { checkpoint([key], label: "Edit") }
         var current = details[key] ?? CatalogDetails()
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         current[field] = CatalogField(value: trimmed, source: .user)

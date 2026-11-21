@@ -90,6 +90,10 @@ struct OnboardingView: View {
             }
         }
         #endif
+        // The list can arrive after the review step is already showing; tick the picks then, or nothing would be ticked.
+        .onChange(of: catalog != nil) { _, loaded in
+            if loaded && step == steps - 1 { preselect() }
+        }
         .task {
             await model.refreshOllama()
             locations = SaveLocation.available()

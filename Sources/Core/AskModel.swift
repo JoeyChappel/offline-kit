@@ -78,6 +78,8 @@ final class AskModel {
         #endif
     }
     private var task: Task<Void, Never>?
+    /// The after-answer pass that notes lasting facts. Separate from `task` so it never blocks the next question.
+    private var learnTask: Task<Void, Never>?
     private var requestID = UUID()
 
     /// http(s) to localhost, a ".local" name or a private IPv4 address.
@@ -197,6 +199,8 @@ final class AskModel {
     }
 
     func stop() {
+        learnTask?.cancel()
+        learnTask = nil
         task?.cancel()
         task = nil
         requestID = UUID()
@@ -227,9 +231,14 @@ final class AskModel {
 
     func endEmergency() { alert = nil }
 
-    func ask(_ rawQuestion: String, library: Library, scope: SubjectTopic? = nil, household: Household? = nil) {
+    /// Returns whether the question was taken, so the caller only clears what the person typed when it was.
+    @discardableResult
+    func ask(_ rawQuestion: String, library: Library, scope: SubjectTopic? = nil, household: Household? = nil) -> Bool {
         let question = rawQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !question.isEmpty, task == nil else { return }
+        guard !question.isEmpty, task == nil else { return false }
+        // A new question outranks noting facts from the last one.
+        learnTask?.cancel()
+        learnTask = nil
         libraryFolders = library.folders
         // Words that sound like danger now raise a smaller alert; once the Emergency button is on, it stays full-window.
         if var found = EmergencyAlert.detect(in: question) {
@@ -246,7 +255,8 @@ final class AskModel {
         // A short follow-up ("would we notice it first?") is searched together with the question before it.
         let previous = turns.dropLast().last(where: { $0.status == .done })?.question
         let searchText = previous.map { Self.isFollowUp(question) ? $0 + " " + question : question } ?? question
-        let retrievalQuestion = scope.map { "\($0.title): \(searchText)" } ?? searchText
+        // The bare question is always tried first; the merged one is the fallback for a follow-up.
+        let retrievalQuestion = scope.map { "\($0.title): \(question)" } ?? question
         let aboutKit = Self.isAboutKit(question)
         let request = UUID()
         requestID = request
@@ -299,10 +309,19 @@ final class AskModel {
                     Retriever.retrieve(question: retrievalQuestion, archives: medical, budgetChars: budget)
                 }.value
             }
-            if !aboutKit, Retriever.strength(sources, question: searchText) == 0 {
+            if !aboutKit, Retriever.strength(sources, question: question) == 0 {
                 sources = await Task.detached(priority: .userInitiated) { [budget] in
                     Retriever.retrieve(question: retrievalQuestion, archives: archives, budgetChars: budget)
                 }.value
+            }
+            if Task.isCancelled { return }
+            // A follow-up the bare question didn't answer: search it together with the question before it.
+            if !aboutKit, searchText != question, Retriever.strength(sources, question: question) == 0 {
+                let merged = scope.map { "\($0.title): \(searchText)" } ?? searchText
+                let found = await Task.detached(priority: .userInitiated) { [budget] in
+                    Retriever.retrieve(question: merged, archives: archives, budgetChars: budget)
+                }.value
+                if Retriever.strength(found, question: searchText) > 0 { sources = found }
             }
             if Task.isCancelled { return }
             // The search missed (a misspelling like "carpel tunel", or everyday words the articles don't use):
@@ -326,13 +345,29 @@ final class AskModel {
                 }
                 if Task.isCancelled { return }
             }
+            // Still nothing, but PDF and reference packs are being read for the first time: give them a moment
+            // rather than answering "not in the library" about books that are about to be searchable.
+            if !aboutKit, Retriever.strength(sources, question: searchText) == 0, PDFIndex.shared.isBuilding {
+                var waited = 0
+                while PDFIndex.shared.isBuilding, waited < 80 {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard !Task.isCancelled, self.requestID == request else { return }
+                    waited += 1
+                }
+                let found = await Task.detached(priority: .userInitiated) { [budget] in
+                    Retriever.retrieve(question: retrievalQuestion, archives: archives, budgetChars: budget)
+                }.value
+                if Task.isCancelled { return }
+                if Retriever.strength(found, question: question) > 0 { sources = found }
+            }
             turns[index].sources = sources
             turns[index].status = .answering
 
             var current = sources
+            var history = earlier
             for attempt in 0..<3 {
                 do {
-                    let prompt = Self.prompt(question: question, sources: current, context: context, history: earlier)
+                    let prompt = Self.prompt(question: question, sources: current, context: context, history: history)
                     for try await text in engine.stream(instructions: instructions, prompt: prompt) {
                         if Task.isCancelled { break }
                         turns[index].answer = text
@@ -342,26 +377,46 @@ final class AskModel {
                     turns[index].finished = Date()
                     household?.log(question: question, answer: turns[index].answer, sources: current.map(\.ref.title))
                     if let household, !emergency {
-                        await learn(from: question, engine: engine, household: household, turn: index)
+                        // Run after this turn's task ends (the defer above), so a new question is never refused.
+                        learnTask = Task(priority: .utility) { [weak self] in
+                            await self?.learn(from: question, engine: engine, household: household, turn: index)
+                        }
                     }
                     return
-                } catch where (AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error)) && attempt < 2 && current.count > 1 {
+                } catch where (AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error)) && attempt < 2 {
                     guard !Task.isCancelled, self.requestID == request else { return }
-                    // Too much text for the small model: keep the strongest sources and retry.
-                    budget /= 2
-                    current = Array(current.prefix(max(1, current.count / 2)))
-                    turns[index].sources = current
+                    // Too much text for the model: drop the older conversation first, then the weakest sources.
                     turns[index].answer = ""
+                    if attempt == 0, !history.isEmpty {
+                        history = String(history.suffix(history.count / 3))
+                    } else if current.count > 1 {
+                        history = ""
+                        budget /= 2
+                        current = Array(current.prefix(max(1, current.count / 2)))
+                        turns[index].sources = current
+                    } else if !history.isEmpty {
+                        history = ""
+                    } else {
+                        fail(index, Self.tooLongMessage)
+                        return
+                    }
                 } catch {
                     if Task.isCancelled { break }
-                    fail(index, error.localizedDescription)
+                    if AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error) {
+                        fail(index, Self.tooLongMessage)
+                    } else {
+                        fail(index, error.localizedDescription)
+                    }
                     return
                 }
             }
             guard !Task.isCancelled, self.requestID == request, turns.indices.contains(index) else { return }
             if turns[index].status != .done { turns[index].status = .done; turns[index].finished = Date() }
         }
+        return true
     }
+
+    private static let tooLongMessage = "That conversation got too long for the answer model. Start a new conversation and ask again."
 
     private func fail(_ index: Int, _ message: String) {
         turns[index].status = .failed
@@ -421,7 +476,7 @@ final class AskModel {
     /// Short questions that lean on the one before ("would we notice it first?").
     static func isFollowUp(_ question: String) -> Bool {
         question.split(separator: " ").count <= 12
-            && (matches(#"\b(it|that|this|they|them|those|these|first|then|instead|also|else|more|why)\b"#, question)
+            && (matches(#"\b(it|that|they|them|those|these|instead|else)\b"#, question)
                 || matches(#"^(and|but|so|or|what about|how about)\b"#, question))
     }
 

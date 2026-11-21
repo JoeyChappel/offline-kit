@@ -75,6 +75,42 @@ struct ChipRow<Item: Hashable & Identifiable>: View {
     }
 }
 
+/// A number field that updates its value on every keystroke. `TextField(value:format:)` only commits on
+/// Return or focus loss on macOS, which made the calculators look frozen while typing.
+/// The text stays as typed while editing; it is rewritten only when the value changes from elsewhere.
+struct LiveNumberField: View {
+    let prompt: String
+    @Binding var value: Double?
+    var digits: ClosedRange<Int> = 0...3
+    var allowNegative = false
+    @State private var text = ""
+    @State private var started = false
+
+    private var format: FloatingPointFormatStyle<Double> { .number.precision(.fractionLength(digits)) }
+
+    var body: some View {
+        TextField(prompt, text: $text)
+            .onAppear {
+                guard !started else { return }
+                started = true
+                text = value.map { format.format($0) } ?? ""
+            }
+            .onChange(of: text) {
+                let trimmed = text.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty { if value != nil { value = nil }; return }
+                // Locale-aware, so "1,5" works where the decimal separator is a comma. Half-typed text is ignored.
+                guard let parsed = try? format.parseStrategy.parse(trimmed), parsed.isFinite else { return }
+                let clean = allowNegative ? parsed : abs(parsed)
+                if value != clean { value = clean }
+            }
+            .onChange(of: value) {
+                // Changed from elsewhere (a reset, a saved value): show it. Skip when it already matches the text.
+                let shown = text.trimmingCharacters(in: .whitespaces).isEmpty ? nil : try? format.parseStrategy.parse(text.trimmingCharacters(in: .whitespaces))
+                if shown != value { text = value.map { format.format($0) } ?? "" }
+            }
+    }
+}
+
 /// A labeled number box. Empty or invalid text reads as nil.
 struct NumberInput: View {
     let label: String
@@ -89,8 +125,7 @@ struct NumberInput: View {
         HStack(spacing: 8) {
             Text(label)
             Spacer(minLength: 8)
-            TextField(prompt, value: Binding(get: { value }, set: { value = allowNegative ? $0 : $0.map { abs($0) } }),
-                      format: .number.precision(.fractionLength(0...3)))
+            LiveNumberField(prompt: prompt, value: $value, digits: 0...3, allowNegative: allowNegative)
                 .textFieldStyle(.roundedBorder)
                 .multilineTextAlignment(.trailing)
                 .frame(width: width)
@@ -280,11 +315,18 @@ extension WaterCalculator {
 
 // MARK: - Generator load
 
+private struct GeneratorRating: Codable, Equatable {
+    static let key = "calculatorGenerator"
+    var running: Double?
+    var surge: Double?
+}
+
 private struct GeneratorCalculator: View {
     let openPowerOut: () -> Void
     @State private var store = ApplianceStore()
-    @State private var running: Double? = nil
-    @State private var surge: Double? = nil
+    @State private var rating = CalculatorMemory.load(GeneratorRating.key, as: GeneratorRating.self) ?? GeneratorRating()
+    private var running: Double? { rating.running }
+    private var surge: Double? { rating.surge }
     @State private var newName = ""
 
     var body: some View {
@@ -295,8 +337,8 @@ private struct GeneratorCalculator: View {
         VStack(alignment: .leading, spacing: 16) {
             SectionCard(symbol: "bolt.fill", title: "What can my generator run?",
                         subtitle: "Pick what you’ll plug in. Wattages are typical; check your appliance’s label and change them to match.") {
-                NumberInput(label: "Generator running (rated) watts", value: $running, unit: "W", prompt: "On its label")
-                NumberInput(label: "Generator starting (surge) watts", value: $surge, unit: "W", prompt: "On its label")
+                NumberInput(label: "Generator running (rated) watts", value: $rating.running, unit: "W", prompt: "On its label")
+                NumberInput(label: "Generator starting (surge) watts", value: $rating.surge, unit: "W", prompt: "On its label")
                 ViewThatFits(in: .horizontal) {
                     HStack(alignment: .firstTextBaseline, spacing: 10) { safetyLine; Spacer(minLength: 0); safetyButton }
                     VStack(alignment: .leading, spacing: 6) { safetyLine; safetyButton }
@@ -375,6 +417,7 @@ private struct GeneratorCalculator: View {
             }
         }
         .onChange(of: store.items) { store.save() }
+        .onChange(of: rating) { CalculatorMemory.save(rating, GeneratorRating.key) }
     }
 
     private func verdict(running: Double, surge: Double?, total: Double, peak: Double) -> String {
@@ -401,7 +444,10 @@ private struct GeneratorCalculator: View {
     }
 
     private func wattField(_ value: Binding<Double>) -> some View {
-        TextField("W", value: value, format: .number.precision(.fractionLength(0)))
+        // Watts can't be negative, and the field updates as you type.
+        LiveNumberField(prompt: "W", value: Binding<Double?>(get: { value.wrappedValue },
+                                                             set: { value.wrappedValue = max(0, $0 ?? 0) }),
+                        digits: 0...0)
             .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing).frame(width: 82)
             #if os(iOS)
             .keyboardType(.numberPad)
@@ -557,8 +603,7 @@ private struct SolarCalculator: View {
     }
 
     private func smallField(_ value: Binding<Double?>, _ prompt: String) -> some View {
-        TextField(prompt, value: Binding(get: { value.wrappedValue }, set: { value.wrappedValue = $0.map { abs($0) } }),
-                  format: .number.precision(.fractionLength(0...2)))
+        LiveNumberField(prompt: prompt, value: value, digits: 0...2)
             .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing).frame(width: 70)
             #if os(iOS)
             .keyboardType(.decimalPad)
@@ -626,7 +671,11 @@ private struct UnitsCalculator: View {
                 converter
             }
         }
-        .onChange(of: kind) { from = 0 }
+        .onChange(of: kind) {
+            from = 0
+            // The amount is shared across kinds: -40 as °F must not become negative gallons.
+            if kind != .temperature, let a = amount, a < 0 { amount = 0 }
+        }
     }
 
     private var converter: some View {

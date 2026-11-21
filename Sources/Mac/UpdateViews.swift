@@ -150,6 +150,7 @@ struct UpdateSheet: View {
 /// Settings › Updates: the version, the daily check, and a way to check now.
 struct UpdateSettingsSection: View {
     @State private var updater = AppUpdater.shared
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         @Bindable var updater = updater
@@ -159,7 +160,8 @@ struct UpdateSettingsSection: View {
             HStack {
                 Button("Check Now") {
                     NSApp.keyWindow?.close()   // the Settings window; the update window opens on the main one
-                    Task { await updater.check(userInitiated: true) }
+                    // The update sheet shows on the main window, so make sure one is open first.
+                    MainWindow.run(openWindow: openWindow) { Task { await updater.check(userInitiated: true) } }
                 }
                 .disabled(updater.isBusy)
                 Spacer()

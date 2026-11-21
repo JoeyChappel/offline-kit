@@ -4,3 +4,4 @@ build/
 Vendor/llama.xcframework/
 Vendor/.build-llama/
 dist/
+__pycache__/

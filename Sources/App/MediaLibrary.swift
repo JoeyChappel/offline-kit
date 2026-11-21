@@ -355,7 +355,16 @@ final class MediaLibrary {
                             if !fm.fileExists(atPath: candidate.path) { target = candidate; break }
                         }
                     }
-                    try fm.copyItem(at: url, to: target)
+                    // Copied under a .part name first so a failed copy never leaves a truncated file that looks playable.
+                    let temp = dest.appending(path: target.lastPathComponent + ".part")
+                    try? fm.removeItem(at: temp)
+                    do {
+                        try fm.copyItem(at: url, to: temp)
+                        try fm.moveItem(at: temp, to: target)
+                    } catch {
+                        try? fm.removeItem(at: temp)
+                        throw error
+                    }
                 }
                 return (already, nil)
             } catch { return (already, error) }
@@ -426,7 +435,12 @@ final class AudiobookDownloads {
     }
 
     func get(_ book: LibriVoxBook) {
-        guard states[book.id] == nil || { if case .failed = states[book.id] { return true }; return false }() else { return }
+        // A finished book that has since been deleted can be fetched again; only block while it's queued or downloading.
+        switch states[book.id] {
+        case .queued?, .downloading?: return
+        case .done? where isInstalled(book): return
+        default: break
+        }
         states[book.id] = .queued
         queue.append(book)
         if !running { Task { await run() } }

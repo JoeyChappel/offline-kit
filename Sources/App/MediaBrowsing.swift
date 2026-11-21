@@ -72,11 +72,39 @@ extension MediaCatalog {
             return sort == .titleDescending ? order == .orderedDescending : order == .orderedAscending
         }
     }
+    /// The episode that follows this one: the next in its series (series order, then title), or the next file in the
+    /// same folder in natural title order, skipping anything already finished. Only when nothing comes after it does
+    /// this fall back to an unwatched video in the same genre.
     static func nextVideo(after item: MediaItem, items: [MediaItem], info: [String: MediaInfo], progress: [String: MediaProgress]) -> MediaItem? {
-        guard item.kind == .video, let genre = info[item.progressKey]?.genre else { return nil }
-        return related(to: item, items: items, info: info).first {
-            $0.kind == .video && info[$0.progressKey]?.genre == genre && progress[$0.progressKey]?.finished != true && !isInProgress(progress[$0.progressKey])
+        guard item.kind == .video else { return nil }
+        func open(_ v: MediaItem) -> Bool { v.kind == .video && progress[v.progressKey]?.finished != true }
+        func after(_ group: [MediaItem]) -> MediaItem? {
+            guard let i = group.firstIndex(where: { $0.id == item.id }) else { return nil }
+            return group[(i + 1)...].first(where: open)
         }
+        let mine = info[item.progressKey]
+        if let series = mine?.series {
+            let group = items.filter { $0.kind == .video && info[$0.progressKey]?.series == series }.sorted { a, b in
+                let x = info[a.progressKey]?.seriesOrder ?? .infinity, y = info[b.progressKey]?.seriesOrder ?? .infinity
+                if x != y { return x < y }
+                return a.title.localizedStandardCompare(b.title) == .orderedAscending
+            }
+            if let next = after(group) { return next }
+        }
+        if let folder = item.tracks.first?.deletingLastPathComponent().standardizedFileURL,
+           folder.path != item.root.standardizedFileURL.path {
+            let group = items.filter { $0.kind == .video && $0.tracks.first?.deletingLastPathComponent().standardizedFileURL == folder }
+                .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+            if let next = after(group) { return next }
+        }
+        guard let genre = mine?.genre else { return nil }
+        return related(to: item, items: items, info: info).first {
+            $0.kind == .video && info[$0.progressKey]?.genre == genre && open($0) && !isInProgress(progress[$0.progressKey])
+        }
+    }
+    /// Whether the auto-advancing "Up next" card makes sense: not for short clips, unless it's part of a series.
+    static func chainsToNext(_ item: MediaItem, duration: Double, info: [String: MediaInfo]) -> Bool {
+        info[item.progressKey]?.series != nil || duration > 180
     }
     static func related(to item: MediaItem, items: [MediaItem], info: [String: MediaInfo]) -> [MediaItem] {
         let i = info[item.progressKey]

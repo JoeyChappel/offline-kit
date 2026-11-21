@@ -652,6 +652,37 @@ private final class SessionControl: @unchecked Sendable {
     var running: Bool { get { lock.withLock { _running } } set { lock.withLock { _running = newValue } } }
     var paused: Bool { get { lock.withLock { _paused } } set { lock.withLock { _paused = newValue } } }
     let done = DispatchSemaphore(value: 0)
+
+    /// Whether the audio engine is actually running. The emulation thread only paces itself by how much audio is
+    /// queued when something is draining that queue; otherwise it would slow the game down for sound nobody hears.
+    private var _audioRunning = false
+    var audioRunning: Bool { get { lock.withLock { _audioRunning } } set { lock.withLock { _audioRunning = newValue } } }
+
+    /// Seconds of game time that actually ran (not paused), counted by the emulation thread.
+    private var _played: TimeInterval = 0
+    var played: TimeInterval { lock.withLock { _played } }
+    func addPlayed(_ seconds: TimeInterval) { lock.withLock { _played += seconds } }
+
+    /// The newest picture from the emulation thread, and whether a hop to the main thread is already waiting to show
+    /// it. The emulator may make many pictures before the main thread gets round to one; only the newest is shown.
+    private var latest: CGImage?
+    private var hopScheduled = false
+    /// Stores the picture; true when the caller needs to schedule a hop to the main thread.
+    func submit(_ image: CGImage) -> Bool {
+        lock.withLock {
+            latest = image
+            if hopScheduled { return false }
+            hopScheduled = true
+            return true
+        }
+    }
+    func takeLatest() -> CGImage? {
+        lock.withLock {
+            hopScheduled = false
+            defer { latest = nil }
+            return latest
+        }
+    }
 }
 
 /// Messages the core sent while a game was loading (ScummVM says "Game not found" when it doesn't recognize a folder).
@@ -715,6 +746,11 @@ final class GameDisplay {
 final class GameSession {
     static private(set) weak var current: GameSession?
 
+    /// A session shorter than this (a peek) leaves the autosave and the shelf picture alone.
+    private static let minimumPlay: TimeInterval = 15
+    /// States bigger than this (DOS can be huge) aren't written in the background, where they'd make the game hitch.
+    private static let periodicStateLimit = 64 * 1024 * 1024
+
     /// Why the game stopped by itself.
     enum Ending: Equatable {
         /// The game quit (a DOS program exited, or ScummVM's Quit).
@@ -748,7 +784,13 @@ final class GameSession {
     @ObservationIgnored private var engine: AVAudioEngine?
     @ObservationIgnored private var autosave: Timer?
     @ObservationIgnored private var lastSaveRAM: Data?
-    @ObservationIgnored private var framePending = false
+    @ObservationIgnored private var stateAutosave: Timer?
+    @ObservationIgnored private var audioObserver: NSObjectProtocol?
+    /// Set while saves are failing, so one toast covers the whole episode rather than one every 10 seconds.
+    @ObservationIgnored private var savesFailing = false
+    @ObservationIgnored private var audioFailing = false
+    /// The autosave from before this session is kept once as ".prev" before the first time it's replaced.
+    @ObservationIgnored private var backedUpAutosave = false
     @ObservationIgnored private var resumeSavedState: Bool
 
     init(game: Game, resumeSavedState: Bool = false) {
@@ -816,10 +858,19 @@ final class GameSession {
                     flash(url == game.autosaveURL ? "Picked up where you left off" : "Back to your saved place")
                 } else { flash("Couldn’t go back to your place. The game started from the beginning.") }
             }
+            backedUpAutosave = false
+            savesFailing = false
             startAudio(core)
             startThread(core)
             autosave = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.writeBatterySave() }
+            }
+            // So a crash or power cut loses a minute or two, not the whole session.
+            stateAutosave = Timer.scheduledTimer(withTimeInterval: 90, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, !self.isPaused else { return }
+                    self.writeAutosave(periodic: true)
+                }
             }
             isRunning = true
             ControllerInput.shared.start()
@@ -844,14 +895,23 @@ final class GameSession {
         guard isRunning else { return }
         isRunning = false
         autosave?.invalidate()
+        stateAutosave?.invalidate()
         control.running = false
         control.done.wait()
+        if let audioObserver { NotificationCenter.default.removeObserver(audioObserver) }
+        audioObserver = nil
         engine?.stop()
         engine = nil
+        control.audioRunning = false
         if let reason { ending = reason }
-        if ending != .finished { writeAutosave() }
+        // A quick look ("Play from the Start", then close) must not overwrite where the player really was.
+        if playedEnough && ending != .finished {
+            writeAutosave()
+            writeThumbnail()
+        } else if !FileManager.default.fileExists(atPath: game.thumbnailURL.path) {
+            writeThumbnail()   // a first look still gives the tile some art
+        }
         writeBatterySave()
-        writeThumbnail()
         core?.frameHandler = nil
         core?.messageHandler = nil
         core = nil
@@ -864,6 +924,17 @@ final class GameSession {
         // Restarting from scratch: the autosave just written would only bring back the old controls' game.
         resumeSavedState = false
         start()
+    }
+
+    private var playedEnough: Bool { control.played >= Self.minimumPlay }
+
+    /// iPhone and iPad: the app is leaving the foreground, where the game would otherwise play on unseen (audio
+    /// background mode) and never save. Pauses it and writes what's worth keeping.
+    func pauseAndSave() {
+        guard isRunning else { return }
+        windowFocusChanged(false)
+        if playedEnough && ending != .finished { writeAutosave() }
+        writeBatterySave()
     }
 
     func setPaused(_ paused: Bool) {
@@ -931,6 +1002,8 @@ final class GameSession {
             return
         }
         let ok = withCore { $0.unserializeState(data) } ?? false
+        // While paused no frame runs, so the screen would still show the old picture. One frame brings it up to date.
+        if ok && isPaused { withCore { $0.runFrame() } }
         flash(ok ? "Back to your saved place" : "Couldn’t go back to your saved place")
     }
 
@@ -1034,9 +1107,11 @@ final class GameSession {
     }
 
     /// Called on the emulation thread; drops frames rather than queueing if the main thread is busy.
+    /// Only the newest picture is kept, and at most one hop to the main thread is waiting at a time.
     nonisolated private func present(_ image: CGImage) {
+        guard control.submit(image) else { return }
         Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self, let image = control.takeLatest() else { return }
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             display.layer.contents = image
@@ -1069,14 +1144,18 @@ final class GameSession {
                 lock.lock()
                 core.runFrame()
                 lock.unlock()
+                control.addPlayed(1.0 / max(1, core.framesPerSecond))
                 if core.shutdownRequested {
                     Task { @MainActor in self?.coreFinished() }
                     break
                 }
                 next += 1.0 / max(1, core.framesPerSecond)   // DOS games change frame rate with video mode
                 // Keep about 60 ms of audio queued so sound neither stutters nor lags.
-                let queued = Double(core.queuedAudioFrames) / rate
-                if queued > 0.12 { next += 0.002 } else if queued < 0.03 { next -= 0.001 }
+                // Only when the engine is draining the queue: with no sound running it would never empty.
+                if control.audioRunning {
+                    let queued = Double(core.queuedAudioFrames) / rate
+                    if queued > 0.12 { next += 0.002 } else if queued < 0.03 { next -= 0.001 }
+                }
                 let wait = next - CACurrentMediaTime()
                 if wait > 0 { Thread.sleep(forTimeInterval: wait) } else if wait < -0.1 { next = CACurrentMediaTime() }
             }
@@ -1110,26 +1189,67 @@ final class GameSession {
         let engine = AVAudioEngine()
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
-        do {
-            try engine.start()
-            self.engine = engine
-        } catch {
-            flash("No sound: \(error.localizedDescription)")
+        self.engine = engine
+        // Plugging in AirPods or switching the output device stops the engine; start it again.
+        audioObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.restartAudio() }
         }
+        restartAudio()
+    }
+
+    private func restartAudio() {
+        guard let engine else { return }
+        if !engine.isRunning {
+            do { try engine.start() } catch {
+                control.audioRunning = false
+                if !audioFailing { audioFailing = true; flash("No sound: \(error.localizedDescription)") }
+                return
+            }
+        }
+        audioFailing = false
+        control.audioRunning = engine.isRunning
     }
 
     /// In-game (battery) saves: written when they change and when the game closes.
     private func writeBatterySave() {
         guard let data = withCore({ $0.saveRAM() }) ?? nil, data != lastSaveRAM else { return }
-        if (try? data.write(to: game.batterySaveURL, options: .atomic)) != nil { lastSaveRAM = data }
+        do {
+            try data.write(to: game.batterySaveURL, options: .atomic)
+            lastSaveRAM = data
+            noteSave(succeeded: true)
+        } catch { noteSave(succeeded: false) }
+    }
+
+    /// One toast per stretch of failed saves (a drive pulled out, a full disk); cleared when a save works again.
+    private func noteSave(succeeded: Bool) {
+        if succeeded { savesFailing = false; return }
+        guard !savesFailing else { return }
+        savesFailing = true
+        flash("Can’t save to the drive. Reconnect it to keep your progress.")
     }
 
     /// Where the player left off, for Resume. Only once the game has drawn something (a game that never really
     /// ran has nothing worth keeping), and only for systems with save states.
-    private func writeAutosave() {
-        guard game.system.hasSaveStates, display.lastImage != nil,
-              let data = withCore({ $0.serializeState() }) ?? nil else { return }
-        try? data.write(to: game.autosaveURL, options: .atomic)
+    /// The one from before this session is copied to ".prev" first, so a bad overwrite is never the end of it.
+    /// `periodic` is the background save while playing: it waits for a meaningful session and skips huge states.
+    private func writeAutosave(periodic: Bool = false) {
+        guard game.system.hasSaveStates, display.lastImage != nil else { return }
+        if periodic && !playedEnough { return }
+        guard let data = withCore({ $0.serializeState() }) ?? nil else { return }
+        if periodic && data.count > Self.periodicStateLimit { return }
+        let fm = FileManager.default
+        if !backedUpAutosave {
+            backedUpAutosave = true
+            if fm.fileExists(atPath: game.autosaveURL.path) {
+                let prev = game.autosaveURL.appendingPathExtension("prev")
+                try? fm.removeItem(at: prev)
+                try? fm.copyItem(at: game.autosaveURL, to: prev)
+            }
+        }
+        do {
+            try data.write(to: game.autosaveURL, options: .atomic)
+            noteSave(succeeded: true)
+        } catch { noteSave(succeeded: false) }
     }
 
     /// The last frame becomes the game's tile art on the shelf.
@@ -1138,7 +1258,7 @@ final class GameSession {
               let dest = CGImageDestinationCreateWithURL(game.thumbnailURL as CFURL, UTType.png.identifier as CFString, 1, nil)
         else { return }
         CGImageDestinationAddImage(dest, image, nil)
-        CGImageDestinationFinalize(dest)
+        noteSave(succeeded: CGImageDestinationFinalize(dest))
     }
 }
 
@@ -1162,6 +1282,10 @@ final class ControllerInput {
         NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { note in
             guard let controller = note.object as? GCController else { return }
             MainActor.assumeIsolated { ControllerInput.shared.attach(controller) }
+        }
+        // A pad that vanishes mid-press (battery, Bluetooth) never sends its button-up, so let go of everything.
+        NotificationCenter.default.addObserver(forName: .GCControllerDidDisconnect, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { GameSession.current?.releaseInput() }
         }
     }
 

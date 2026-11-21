@@ -29,10 +29,11 @@ mkdir -p "$STAGE"
 ditto "$BUILT" "$STAGE/Offline Kit.app"
 APP="$STAGE/Offline Kit.app"
 
-# Nothing from this Mac's folders (user name, scratch paths) should ship inside the binaries.
-LEAKS=$(find "$APP" -type f -perm -u+x -exec sh -c 'strings -a "$1" | grep -l -q -e "/Users/" -e "/private/tmp/" && echo "$1"' _ {} \;)
+# Nothing from this Mac's folders (user name, scratch paths) should ship anywhere in the app.
+# A raw byte search: macOS `strings` skips the symbol table, where a debug map keeps full paths.
+LEAKS=$(find "$APP" -type f -exec env LC_ALL=C grep -l -a -e "/Users/" -e "/private/tmp/" {} + || true)
 if [[ -n $LEAKS ]]; then
-  echo "✗ These binaries contain local folder paths; rebuild them with -ffile-prefix-map:" >&2
+  echo "✗ These files contain local folder paths (rebuild with -ffile-prefix-map, or strip the debug map):" >&2
   echo "$LEAKS" >&2
   exit 1
 fi
@@ -58,10 +59,22 @@ fi
 
 echo "› Packaging"
 swift Tools/Release/html2pdf.swift Tools/Release/StartHere.html "$STAGE/Start Here.pdf" >/dev/null 2>&1
-ln -s /Applications "$STAGE/Applications"
+# The DMG tool writes its own Finder layout and a relocatable background alias.
+# It needs no Finder automation permission and never changes the user's Finder preferences.
+DMG_PYTHON=${DMG_PYTHON:-"$ROOT/build/dmg-tools/bin/python"}
+if [[ ! -x "$DMG_PYTHON" ]]; then
+  if [[ "$DMG_PYTHON" != "$ROOT/build/dmg-tools/bin/python" ]]; then
+    echo "✗ DMG_PYTHON must name an executable Python environment." >&2
+    exit 1
+  fi
+  python3 -m venv "$ROOT/build/dmg-tools"
+fi
+if ! "$DMG_PYTHON" -c 'from importlib.metadata import version; assert version("dmgbuild") == "2.0.0"' >/dev/null 2>&1; then
+  "$DMG_PYTHON" -m pip install --disable-pip-version-check -r Tools/Release/requirements-dmg.txt
+fi
 DMG="dist/OfflineKit-$VERSION.dmg"
 rm -f "$DMG"
-hdiutil create -quiet -volname "Offline Kit" -srcfolder "$STAGE" -fs HFS+ -format UDZO "$DMG"
+"$DMG_PYTHON" Tools/Release/build-dmg.py --stage "$STAGE" --output "$DMG"
 codesign --force --timestamp --sign "$IDENTITY" "$DMG"
 
 if $HAS_PROFILE; then

@@ -124,7 +124,9 @@ final class ShareController {
             await self?.route(request, responder)
         }
         do {
-            try server.start(ports: 8080...8099, serviceName: "Offline Kit") { [weak self] problem in
+            // The last port used comes first, so a phone's bookmark keeps working after a relaunch.
+            let lastPort = KitSettings.shared.string(forKey: "shareLastPort").flatMap { UInt16($0) }
+            try server.start(ports: 8080...8099, preferred: lastPort, serviceName: "Offline Kit") { [weak self] problem in
                 Task { @MainActor in
                     if let problem { self?.error = problem; self?.isRunning = false }
                 }
@@ -136,9 +138,13 @@ final class ShareController {
             self.server = server
             contentServer = articles
             port = server.port
+            KitSettings.shared.set(String(server.port), forKey: "shareLastPort")
             contentPort = articles.port
             isRunning = true
         } catch {
+            // The main server may already be listening and advertising: take it down so it doesn't
+            // hold its port and Bonjour name while pointing at nothing.
+            server.stop()
             self.error = "Couldn't start sharing: \(error.localizedDescription)"
         }
     }
@@ -529,13 +535,15 @@ final class ShareController {
             res.finish()
             return
         }
-        await res.event("engine", engine.displayName)
+        // Each event reports whether the device is still there; once it's gone, stop so the Mac isn't
+        // generating for nobody and other devices can ask (returning ends the stream, which cancels the engine).
+        guard await res.event("engine", engine.displayName) else { res.finish(); return }
         var budget = engine.sourceBudget
         let archives = library.books.map(\.archive)
         var sources = await Task.detached(priority: .userInitiated) {
             Retriever.retrieve(question: question, archives: archives, budgetChars: budget)
         }.value
-        await res.event("sources", sources.map(Self.sourceJSON))
+        guard await res.event("sources", sources.map(Self.sourceJSON)) else { res.finish(); return }
 
         for attempt in 0..<3 {
             do {
@@ -546,11 +554,11 @@ final class ShareController {
                     text = partial
                     if Date().timeIntervalSince(last) > 0.08 {
                         last = Date()
-                        await res.event("answer", text)
+                        // Leaving the loop terminates the engine's stream, which cancels generation.
+                        guard await res.event("answer", text) else { res.finish(); return }
                     }
                 }
-                await res.event("answer", text)
-                await res.event("done", true)
+                guard await res.event("answer", text), await res.event("done", true) else { res.finish(); return }
                 questionsAnswered += 1
                 break
             } catch where (AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error)) && attempt < 2 && sources.count > 1 {

@@ -63,7 +63,9 @@ struct IOSRoot: View {
         }
         // Files dropped in via the Files app or Finder show up when the app comes back.
         .onChange(of: phase) {
-            guard phase == .active else { return }
+            // Leaving the foreground: pause the game and save, since it would otherwise play on unseen and never save.
+            guard phase == .active else { GameSession.current?.pauseAndSave(); return }
+            GameSession.current?.windowFocusChanged(true)
             KitChanges.shared.documentsChanged()
             Task { await library.reload(); await media.reload(library: library); await games.reload(library: library) }
         }

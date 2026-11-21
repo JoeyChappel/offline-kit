@@ -2,6 +2,9 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SettingsView: View {
+    #if os(macOS)
+    @Environment(\.openWindow) private var openWindow
+    #endif
     @Environment(Library.self) private var library
     @Environment(AskModel.self) private var model
     @State private var showPicker = false
@@ -285,7 +288,7 @@ struct SettingsView: View {
     private func showWelcome() {
         #if os(macOS)
         NSApp.keyWindow?.close()   // the Settings window
-        DispatchQueue.main.async { NotificationCenter.default.post(name: .showOnboarding, object: nil) }
+        MainWindow.run(openWindow: openWindow) { NotificationCenter.default.post(name: .showOnboarding, object: nil) }
         #else
         NotificationCenter.default.post(name: .showOnboarding, object: nil)
         #endif
@@ -295,14 +298,16 @@ struct SettingsView: View {
     /// Copy my kit lives in Kit Care (checked, resumable, off the main thread); Settings just opens it.
     private func openKitCopy() {
         NSApp.keyWindow?.close()   // the Settings window; the main window comes forward showing Kit Care
-        DispatchQueue.main.async { NotificationCenter.default.post(name: .openKitCopy, object: nil) }
+        MainWindow.run(openWindow: openWindow) { NotificationCenter.default.post(name: .openKitCopy, object: nil) }
     }
     #endif
 
     private func openGetResources() {
-        NotificationCenter.default.post(name: .openGetResources, object: nil)
         #if os(macOS)
         NSApp.keyWindow?.close()   // the Settings window; the main window comes forward showing Get Resources
+        MainWindow.run(openWindow: openWindow) { NotificationCenter.default.post(name: .openGetResources, object: nil) }
+        #else
+        NotificationCenter.default.post(name: .openGetResources, object: nil)
         #endif
     }
 

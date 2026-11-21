@@ -311,7 +311,7 @@ struct GetResourcesView: View {
     private var footer: some View {
         let items = chosenEntries
         let total = items.reduce(Int64(0)) { $0 + $1.size }
-        let free = destination?.freeSpace ?? 0
+        let free = spaceLeft
         let fits = total < free - (1 << 30)
         return ViewThatFits(in: .horizontal) {
             HStack(spacing: 14) { footerSummary(items: items, total: total, free: free, fits: fits); Spacer(); reviewButton(items: items, fits: fits) }
@@ -359,12 +359,12 @@ struct GetResourcesView: View {
                     }
                     Divider()
                     let total = chosenEntries.reduce(Int64(0)) { $0 + $1.size }
-                    Text("\(bytes(total)) needed · \(bytes(destination?.freeSpace ?? 0)) free").font(.headline)
+                    Text("\(bytes(total)) needed · \(bytes(spaceLeft)) free").font(.headline)
                     Text("Downloading needs an internet connection. Time depends on the connection and archive size. Your saved references work offline.")
                         .foregroundStyle(.secondary)
                     Button("Download", systemImage: "arrow.down.circle") { startDownloads() }
                         .buttonStyle(.borderedProminent).controlSize(.large)
-                        .disabled(chosenEntries.isEmpty || destination == nil || total >= (destination?.freeSpace ?? 0) - (1 << 30))
+                        .disabled(chosenEntries.isEmpty || destination == nil || total >= spaceLeft - (1 << 30))
                 }.padding(24)
             }
             .background(Design.canvas)
@@ -376,11 +376,17 @@ struct GetResourcesView: View {
         #endif
     }
 
+    /// Free space on the chosen drive after what queued, running and paused downloads still have to write there.
+    private var spaceLeft: Int64 {
+        guard let destination else { return 0 }
+        return max(0, destination.freeSpace - downloads.bytesStillNeeded(on: destination.folder))
+    }
+
     private func startDownloads() {
         guard let destination else { return }
         let items = chosenEntries
         let total = items.reduce(Int64(0)) { $0 + $1.size }
-        guard !items.isEmpty, total < destination.freeSpace - (1 << 30) else { return }
+        guard !items.isEmpty, total < spaceLeft - (1 << 30) else { return }
         for entry in items { downloads.enqueue(entry, to: destination.folder) }
         selected.removeAll()
         encyclopedia = nil

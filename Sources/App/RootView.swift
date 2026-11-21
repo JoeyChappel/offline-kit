@@ -27,6 +27,35 @@ enum SidebarItem: Hashable {
     case book(String)
 }
 
+#if os(macOS)
+/// Settings buttons that act on the main window (Welcome, Kit Care, Get Resources, update sheet) work even when
+/// that window is closed: it is reopened first, and the action runs once RootView has appeared and is listening.
+@MainActor enum MainWindow {
+    static let id = "main"
+    private static var openCount = 0
+    private static var pending: (() -> Void)?
+
+    static func run(openWindow: OpenWindowAction, _ action: @escaping () -> Void) {
+        if openCount > 0 {
+            DispatchQueue.main.async(execute: action)
+        } else {
+            pending = action
+            openWindow(id: id)
+        }
+    }
+
+    static func didAppear() {
+        openCount += 1
+        guard let action = pending else { return }
+        pending = nil
+        // Let the window finish setting up its listeners before the action fires.
+        Task { try? await Task.sleep(for: .milliseconds(400)); action() }
+    }
+
+    static func didDisappear() { openCount = max(0, openCount - 1) }
+}
+#endif
+
 struct RootView: View {
     @Environment(Library.self) private var library
     @Environment(DownloadManager.self) private var downloads
@@ -142,6 +171,10 @@ struct RootView: View {
                 // What's playing keeps going, shrunk to a bar, while people move around the app.
                 .safeAreaInset(edge: .bottom) { MiniPlayerBar() }
         }
+        #if os(macOS)
+        .onAppear { MainWindow.didAppear() }
+        .onDisappear { MainWindow.didDisappear() }
+        #endif
         .modifier(FirstRunPresentation())
         .modifier(PrivateUnlockPresentation())
         #if os(macOS)
