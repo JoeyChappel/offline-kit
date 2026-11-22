@@ -37,7 +37,7 @@ enum SidebarItem: Hashable {
 
     static func run(openWindow: OpenWindowAction, _ action: @escaping () -> Void) {
         if openCount > 0 {
-            DispatchQueue.main.async(execute: action)
+            Task { @MainActor in action() }
         } else {
             pending = action
             openWindow(id: id)
@@ -58,10 +58,7 @@ enum SidebarItem: Hashable {
 
 struct RootView: View {
     @Environment(Library.self) private var library
-    @Environment(DownloadManager.self) private var downloads
     @Environment(AskModel.self) private var ask
-    @Environment(NowPlaying.self) private var nowPlaying
-    @Environment(Household.self) private var household
     @State private var navigation = KitNavigation()
     @State private var columns: NavigationSplitViewVisibility = .all
     /// The Library page shows every area, so the sidebar's list starts folded away.
@@ -110,16 +107,14 @@ struct RootView: View {
                 Section {
                     Label("Ask", systemImage: "bubble.left").tag(SidebarItem.ask)
                     Label("Library", systemImage: "books.vertical").tag(SidebarItem.library)
-                    Label("Get Resources", systemImage: "arrow.down.circle")
-                        .badge(downloads.activeCount).tag(SidebarItem.resources)
+                    GetResourcesSidebarLabel().tag(SidebarItem.resources)
                     Label("Kit Care", systemImage: "stethoscope").tag(SidebarItem.kit)
                     Label("Watch", systemImage: "play.rectangle.on.rectangle").tag(SidebarItem.media)
                     Label("Audiobooks", systemImage: "headphones").tag(SidebarItem.audiobooks)
                     Label("Music", systemImage: "music.note").tag(SidebarItem.music)
                     Label("Books", systemImage: "book").tag(SidebarItem.books)
                     Label("Play", systemImage: "gamecontroller").tag(SidebarItem.games)
-                    Label("Prepare", systemImage: "checklist")
-                        .badge(household.data.extra.suppliesNeedingAttention()).tag(SidebarItem.prepare)
+                    PrepareSidebarLabel().tag(SidebarItem.prepare)
                 }
                 Section("Browse by area", isExpanded: $showAreas) {
                     ForEach(SubjectArea.allCases) { area in
@@ -142,8 +137,7 @@ struct RootView: View {
                     #if os(macOS)
                     UpdateSidebarCard()
                     #endif
-                    DownloadStatusCard { navigation.getResources(nil) }
-                    Divider().padding(.top, downloads.summary == nil ? 0 : 10)
+                    SidebarDownloadStatus { navigation.getResources(nil) }
                     LibraryFooter()
                     #if os(macOS)
                     SettingsLink { Label("Settings", systemImage: "gearshape") }
@@ -155,13 +149,7 @@ struct RootView: View {
             }
             .navigationTitle("Offline Kit")
             .toolbar {
-                ToolbarItem {
-                    Button { Task { await library.reload() } } label: {
-                        Label("Rescan Library", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(library.isLoading)
-                    .help("Look for new or removed archives")
-                }
+                ToolbarItem { RescanLibraryButton() }
             }
             #if os(macOS)
             .navigationSplitViewColumnWidth(min: 220, ideal: 250)
@@ -174,6 +162,9 @@ struct RootView: View {
         #if os(macOS)
         .onAppear { MainWindow.didAppear() }
         .onDisappear { MainWindow.didDisappear() }
+        #endif
+        #if DEBUG
+        .onAppear { LaunchTiming.firstAppear() }
         #endif
         .modifier(FirstRunPresentation())
         .modifier(PrivateUnlockPresentation())
@@ -209,6 +200,12 @@ struct RootView: View {
             columns = emergency ? .detailOnly : .all
             if emergency { navigation.selection = .ask }
         }
+        // Once the library is open, index references for fast answers in the background (see AnswerIndex).
+        .onChange(of: library.isLoading, initial: true) {
+            guard !library.isLoading else { return }
+            AnswerIndex.shared.prepare(library.books.map(\.archive))
+            AnswerIndexStatus.shared.watchPower()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .openGetResources)) { _ in navigation.getResources(nil) }
         .onReceive(NotificationCenter.default.publisher(for: .openKitCopy)) { _ in
             navigation.wantsKitCopy = true
@@ -237,11 +234,11 @@ struct RootView: View {
             case "share": navigation.selection = .share
             default: break
             }
-            // Test hook: -cycleSections N clicks through Watch, Audiobooks, Music and Books N times, one a second.
+            // Test hook: -cycleSections N clicks through Watch, Audiobooks, Music, Books and Play N times, one a second.
             if let rounds = Int(UserDefaults.standard.string(forKey: "cycleSections") ?? "") {
                 Task {
                     try? await Task.sleep(for: .seconds(6))
-                    let order: [SidebarItem] = [.media, .audiobooks, .music, .books]
+                    let order: [SidebarItem] = [.media, .audiobooks, .music, .books, .games]
                     for step in 0..<(rounds * order.count) {
                         NSLog("CYCLE %@", "\(order[step % order.count])")
                         navigation.selection = order[step % order.count]
@@ -278,6 +275,46 @@ struct RootView: View {
         let base = url.deletingPathExtension().lastPathComponent
         let trimmed = base.replacingOccurrences(of: #"_\d{4}-\d{2}$"#, with: "", options: .regularExpression)
         return trimmed.replacingOccurrences(of: "_", with: " ")
+    }
+}
+
+// The pieces below read the fast-changing state (download progress, household edits) themselves, so a progress tick
+// or a keystroke redraws only them and not the whole RootView.
+
+/// "Get Resources" row with the count of running downloads.
+private struct GetResourcesSidebarLabel: View {
+    @Environment(DownloadManager.self) private var downloads
+    var body: some View {
+        Label("Get Resources", systemImage: "arrow.down.circle").badge(downloads.activeCount)
+    }
+}
+
+/// "Prepare" row with the count of supplies that need attention.
+private struct PrepareSidebarLabel: View {
+    @Environment(Household.self) private var household
+    var body: some View {
+        Label("Prepare", systemImage: "checklist").badge(household.suppliesAttention)
+    }
+}
+
+/// Download progress card and the divider under it.
+private struct SidebarDownloadStatus: View {
+    @Environment(DownloadManager.self) private var downloads
+    let open: () -> Void
+    var body: some View {
+        DownloadStatusCard(open: open)
+        Divider().padding(.top, downloads.summary == nil ? 0 : 10)
+    }
+}
+
+private struct RescanLibraryButton: View {
+    @Environment(Library.self) private var library
+    var body: some View {
+        Button { Task { await library.reload() } } label: {
+            Label("Rescan Library", systemImage: "arrow.clockwise")
+        }
+        .disabled(library.isLoading)
+        .help("Look for new or removed archives")
     }
 }
 

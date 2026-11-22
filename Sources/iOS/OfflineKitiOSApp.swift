@@ -26,6 +26,9 @@ struct OfflineKitiOSApp: App {
                 .environment(nowPlaying)
                 .environment(starterFilms)
                 .task {
+                    // The private details (Keychain + decrypt) are read after the first frame, off the main thread.
+                    Task { await household.ensureLoaded() }
+                    OfflineContentBlocker.prepare()
                     downloads.onInstalled = {
                         KitChanges.shared.modelsChanged()
                         Task { await library.reload(); await media.reload(library: library) }
@@ -33,7 +36,7 @@ struct OfflineKitiOSApp: App {
                     await library.reload()
                     // First launch: copy the bundled classic books into the kit.
                     if await StarterBooks.installIfNeeded() { await media.reload(library: library) }
-                    downloads.restore(from: library.folders)
+                    await downloads.restore(from: library.folders)
                     downloads.resumeAll()
                     // Send to iPhone: things downloaded from the Mac show up in Watch, Books, Play and Library.
                     MacTransfers.shared.onItemFinished = { Task { await library.reload(); await media.reload(library: library); await games.reload(library: library) } }
@@ -64,7 +67,7 @@ struct IOSRoot: View {
         // Files dropped in via the Files app or Finder show up when the app comes back.
         .onChange(of: phase) {
             // Leaving the foreground: pause the game and save, since it would otherwise play on unseen and never save.
-            guard phase == .active else { GameSession.current?.pauseAndSave(); return }
+            guard phase == .active else { GameSession.current?.pauseAndSave(); KitSettings.shared.flush(); return }
             GameSession.current?.windowFocusChanged(true)
             KitChanges.shared.documentsChanged()
             Task { await library.reload(); await media.reload(library: library); await games.reload(library: library) }
@@ -97,7 +100,7 @@ struct PhoneTabs: View {
                 NavigationStack { PrepareView() }
                     .safeAreaInset(edge: .bottom) { MiniPlayerBar() }
             }
-            .badge(household.data.extra.suppliesNeedingAttention())
+            .badge(household.suppliesAttention)
             Tab("Library", systemImage: "books.vertical", value: SidebarItem.library as SidebarItem?) {
                 PhoneLibrary()
                     .safeAreaInset(edge: .bottom) { MiniPlayerBar() }
@@ -123,7 +126,7 @@ struct PhoneTabs: View {
         .modifier(FirstRunPresentation())
         #if DEBUG
         // Test hook: -startSection prepare opens the Prepare tab.
-        .onAppear { if UserDefaults.standard.string(forKey: "startSection") == "prepare" { navigation.selection = .prepare } }
+        .onAppear { LaunchTiming.firstAppear(); if UserDefaults.standard.string(forKey: "startSection") == "prepare" { navigation.selection = .prepare } }
         #endif
         .onReceive(NotificationCenter.default.publisher(for: .openGetResources)) { _ in navigation.getResources(nil) }
         .onChange(of: ask.isFullEmergency) { _, emergency in if emergency { navigation.selection = .ask } }

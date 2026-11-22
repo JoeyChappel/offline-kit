@@ -113,7 +113,8 @@ final class SendList {
 
     /// Every file an entry sends, with where each goes on the phone. Folders are walked; hidden files, macOS "._"
     /// companions and game "Saves" folders are left out. Files that are missing right now (a drive unplugged) are skipped.
-    nonisolated static func files(for entry: Entry) -> [SendFile] {
+    /// `scope` limits what leaves this Mac (see SharePolicy.Scope); without one, as when sizing a pick, it isn't applied.
+    nonisolated static func files(for entry: Entry, scope: SharePolicy.Scope? = nil) -> [SendFile] {
         let fm = FileManager.default
         let base = URL(fileURLWithPath: entry.base).resolvingSymlinksInPath().standardizedFileURL.path
         let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
@@ -123,7 +124,7 @@ final class SendList {
         func add(_ link: URL) {
             let url = link.resolvingSymlinksInPath().standardizedFileURL
             // Checked again here, not only when added: the list can come from a drive's settings file.
-            guard !SharePolicy.isOffLimits(url), !url.lastPathComponent.hasPrefix("."), seen.insert(url.path).inserted,
+            guard !SharePolicy.isOffLimits(url), scope?.allows(url) ?? true, !url.lastPathComponent.hasPrefix("."), seen.insert(url.path).inserted,
                   let values = try? url.resourceValues(forKeys: Set(keys)), values.isRegularFile == true else { return }
             let full = url.path
             let relative = full.hasPrefix(base + "/") ? String(full.dropFirst(base.count + 1)) : url.lastPathComponent
@@ -156,10 +157,10 @@ final class SendList {
     // MARK: Share on Wi-Fi routes
 
     /// GET /api/send (manifest), GET /api/send/file/<item>/<index> (a file, resumable), POST /api/send/received.
-    func handle(_ req: WebServer.Request, _ res: WebServer.Responder, macName: String) async {
+    func handle(_ req: WebServer.Request, _ res: WebServer.Responder, macName: String, libraries: [URL]) async {
         switch (req.method, req.path) {
         case ("GET", "/api/send"):
-            await res.send(json: await manifestJSON(macName: macName))
+            await res.send(json: await manifestJSON(macName: macName, libraries: libraries))
         case ("POST", "/api/send/received"):
             let body = (try? JSONSerialization.jsonObject(with: req.body) as? [String: Any]) ?? [:]
             guard let id = body["item"] as? String, entries.contains(where: { $0.id == id }) else {
@@ -172,7 +173,7 @@ final class SendList {
             guard parts.count == 2, let entry = entries.first(where: { $0.id == parts[0] }), let index = Int(parts[1]) else {
                 await res.send(status: 404, text: "Not found"); return
             }
-            let files = await Task.detached(priority: .userInitiated) { Self.files(for: entry) }.value
+            let files = await Task.detached(priority: .userInitiated) { Self.files(for: entry, scope: SharePolicy.Scope(libraries: libraries)) }.value
             guard files.indices.contains(index) else { await res.send(status: 404, text: "Not found"); return }
             var throttle = 0
             #if DEBUG
@@ -184,9 +185,12 @@ final class SendList {
         }
     }
 
-    private func manifestJSON(macName: String) async -> [String: Any] {
+    private func manifestJSON(macName: String, libraries: [URL]) async -> [String: Any] {
         let entries = self.entries
-        let lists = await Task.detached(priority: .userInitiated) { entries.map { Self.files(for: $0) } }.value
+        let lists = await Task.detached(priority: .userInitiated) { () -> [[SendFile]] in
+            let scope = SharePolicy.Scope(libraries: libraries)
+            return entries.map { Self.files(for: $0, scope: scope) }
+        }.value
         var items: [[String: Any]] = []
         for (entry, files) in zip(entries, lists) where !files.isEmpty {
             var item: [String: Any] = [

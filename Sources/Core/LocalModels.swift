@@ -106,6 +106,23 @@ enum LocalModels {
         }
     }
 
+    private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var cached: (folders: [String], models: [InstalledModel])?
+
+    /// Same list as `installed(libraryFolders:)`, remembered until a model is added or removed, a download or a folder
+    /// change reports new models (`KitChanges.modelsChanged`), or the folders differ. For views, which ask on every redraw
+    /// (a download progress tick, say) and would otherwise list the Models folders and stat every file each time.
+    static func installedCached(libraryFolders: [URL]) -> [InstalledModel] {
+        let key = libraryFolders.map(\.path)
+        if let hit = cacheLock.withLock({ cached.flatMap { $0.folders == key ? $0.models : nil } }) { return hit }
+        let models = installed(libraryFolders: libraryFolders)
+        cacheLock.withLock { cached = (key, models) }
+        return models
+    }
+
+    /// Forget the remembered list; the next `installedCached` reads the folders again.
+    static func invalidateInstalledCache() { cacheLock.withLock { cached = nil } }
+
     /// The model Ask uses: the one chosen in Settings when it's installed, else the best installed one.
     static func selected(libraryFolders: [URL], id: String) -> InstalledModel? {
         selected(in: installed(libraryFolders: libraryFolders), id: id)
@@ -122,7 +139,7 @@ enum LocalModels {
     /// Model files used where they are (not copied into the library), Mac only.
     static var customPaths: [String] {
         get { KitSettings.shared.stringArray(forKey: customPathsKey) ?? [] }
-        set { KitSettings.shared.set(newValue, forKey: customPathsKey) }
+        set { KitSettings.shared.set(newValue, forKey: customPathsKey); invalidateInstalledCache() }
     }
 
     /// Checks a GGUF someone picked: a real chat model, in one file, that fits in this device's memory.
@@ -170,6 +187,7 @@ enum LocalModels {
             guard existing == size else { throw AddError.nameTaken(source.lastPathComponent) }
             return id
         }
+        defer { invalidateInstalledCache() }
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let free = (try? dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage ?? Int64.max
@@ -197,6 +215,7 @@ enum LocalModels {
     /// Removes a model the person added: forgets one used in place, deletes one copied into the library.
     static func remove(_ model: InstalledModel) throws {
         guard model.isCustom else { return }
+        defer { invalidateInstalledCache() }
         if model.inPlace {
             customPaths.removeAll { $0 == model.url.path }
         } else {

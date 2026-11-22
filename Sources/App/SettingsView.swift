@@ -107,7 +107,7 @@ struct SettingsView: View {
             }
 
             Section("Use a library you already have") {
-                ForEach(Library.defaultFolders, id: \.self) { url in
+                ForEach(library.builtInFolders, id: \.self) { url in
                     Label(url.path, systemImage: "folder").foregroundStyle(.secondary)
                 }
                 ForEach(library.extraFolders, id: \.self) { path in
@@ -179,7 +179,7 @@ struct SettingsView: View {
     @ViewBuilder private var answerModelSection: some View {
         let _ = modelsChanged
         let _ = KitChanges.shared.models   // a download finished, or a model was added elsewhere
-        let installed = LocalModels.installed(libraryFolders: library.folders)
+        let installed = LocalModels.installedCached(libraryFolders: library.folders)
         let selected = LocalModels.selected(in: installed, id: model.builtInModel)
         Section("Answer model") {
             if let selected {

@@ -169,7 +169,7 @@ struct OnboardingView: View {
                     KitSymbol(location.symbol)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(location.name).foregroundStyle(.primary)
-                        Text("\(bytes(location.freeSpace)) free")
+                        Text("\(bytes(location.cachedFreeSpace)) free")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -183,7 +183,7 @@ struct OnboardingView: View {
         Button { pickingFolder = true } label: { Label("Choose a USB Drive or Folder…", systemImage: "folder.badge.plus") }
         #endif
         if let estimate = estimatedBytes {
-            if let destination, destination.freeSpace < estimate + 1_000_000_000 {
+            if let destination, destination.cachedFreeSpace < estimate + 1_000_000_000 {
                 Label("Not enough room on \(destination.name): your choices need about \(bytes(estimate)). Choose a USB drive, or pick fewer items on the next screens.",
                       systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
             } else {
@@ -359,10 +359,10 @@ struct OnboardingView: View {
                     Text(totalBytes == 0 ? "Nothing selected" : "\(bytes(totalBytes)) to download").font(.callout.weight(.medium))
                     if let destination {
                         if fits {
-                            Text("\(bytes(destination.freeSpace)) free on \(destination.name) · Downloads continue in the background")
+                            Text("\(bytes(destination.cachedFreeSpace)) free on \(destination.name) · Downloads continue in the background")
                                 .font(.caption).foregroundStyle(.secondary)
                         } else {
-                            Text("Needs \(bytes(totalBytes)); only \(bytes(destination.freeSpace)) free on \(destination.name). Untick some items or choose Text only.")
+                            Text("Needs \(bytes(totalBytes)); only \(bytes(destination.cachedFreeSpace)) free on \(destination.name). Untick some items or choose Text only.")
                                 .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.trailing)
                             Button("Use a USB Drive Instead…") { step = 3 }.font(.caption.weight(.semibold)).buttonStyle(.borderless).foregroundStyle(Color.accentColor)
                         }
@@ -443,7 +443,7 @@ struct OnboardingView: View {
         entries.reduce(0) { $0 + $1.size } + (wantsModel && LocalModels.installed(libraryFolders: library.folders).isEmpty ? LocalModels.recommended.size : 0)
     }
 
-    private var fits: Bool { (destination?.freeSpace ?? 0) > totalBytes + 1_000_000_000 }
+    private var fits: Bool { (destination?.cachedFreeSpace ?? 0) > totalBytes + 1_000_000_000 }
 
     private func isInstalled(_ name: String) -> Bool { library.books.contains { $0.archive.name == name } }
 

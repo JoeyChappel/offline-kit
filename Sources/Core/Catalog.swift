@@ -205,21 +205,51 @@ enum Interests {
 
 /// The Kiwix OPDS catalog: every English archive with its latest version, size and download link.
 struct Catalog: Sendable {
-    var entries: [CatalogEntry]
+    var entries: [CatalogEntry] { didSet { (index, latest) = Self.makeIndex(entries) } }
+
+    /// name -> flavour -> newest entry, so a lookup doesn't scan the thousands of entries (it runs for every row on every redraw).
+    private var index: [String: [String: CatalogEntry]]
+    /// name -> newest entry of any flavour, for names whose flavours aren't in the preference list.
+    private var latest: [String: CatalogEntry]
+
+    init(entries: [CatalogEntry]) {
+        self.entries = entries
+        (index, latest) = Self.makeIndex(entries)
+    }
+
+    private static func makeIndex(_ entries: [CatalogEntry]) -> ([String: [String: CatalogEntry]], [String: CatalogEntry]) {
+        var byFlavour: [String: [String: CatalogEntry]] = [:]
+        var newest: [String: CatalogEntry] = [:]
+        for e in entries {
+            // Ties keep the first entry, like `max(by:)` over the list did.
+            if let have = byFlavour[e.name]?[e.flavour], !(have.issued < e.issued) { /* keep */ } else { byFlavour[e.name, default: [:]][e.flavour] = e }
+            if let have = newest[e.name], !(have.issued < e.issued) { /* keep */ } else { newest[e.name] = e }
+        }
+        return (byFlavour, newest)
+    }
 
     static let feed = URL(string: "https://library.kiwix.org/catalog/v2/entries?lang=eng&count=-1")!
 
     /// Best entry for a pack name, by the picture preference.
     func entry(for name: String, pictures: PictureChoice) -> CatalogEntry? {
-        let matches = entries.filter { $0.name == name }
+        guard let flavours = index[name] else { return nil }
         for flavour in pictures.preference {
-            if let e = matches.filter({ $0.flavour == flavour }).max(by: { $0.issued < $1.issued }) { return e }
+            if let e = flavours[flavour] { return e }
         }
-        return matches.max { $0.issued < $1.issued }
+        return latest[name]
     }
 
     /// Loads the catalog from Kiwix, caching it so the picker still shows sizes offline.
     static func load(cache: URL) async throws -> Catalog {
+        // The list is several MB of XML: reuse what was fetched within the last hour (in memory, then on disk)
+        // instead of downloading and parsing it again each time the screen opens.
+        if let fresh = Self.memory.fresh(maxAge: Self.maxAge) { return fresh }
+        if let modified = (try? cache.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+           -modified.timeIntervalSinceNow < Self.maxAge,
+           let data = try? Data(contentsOf: cache), let catalog = try? parse(data), !catalog.entries.isEmpty {
+            Self.memory.store(catalog, at: modified)
+            return catalog
+        }
         do {
             var request = URLRequest(url: feed, timeoutInterval: 30)
             request.setValue(ProductLookup.userAgent, forHTTPHeaderField: "User-Agent")
@@ -228,6 +258,7 @@ struct Catalog: Sendable {
             let catalog = try parse(data)
             try? FileManager.default.createDirectory(at: cache.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? data.write(to: cache, options: .atomic)
+            Self.memory.store(catalog, at: Date())
             return catalog
         } catch {
             if let data = try? Data(contentsOf: cache), let catalog = try? parse(data), !catalog.entries.isEmpty {
@@ -236,6 +267,21 @@ struct Catalog: Sendable {
             throw error
         }
     }
+
+    private static let maxAge: TimeInterval = 3600
+
+    private final class Memory: @unchecked Sendable {
+        private let lock = NSLock()
+        private var catalog: Catalog?
+        private var fetched = Date.distantPast
+        func fresh(maxAge: TimeInterval) -> Catalog? {
+            lock.withLock { -fetched.timeIntervalSinceNow < maxAge ? catalog : nil }
+        }
+        func store(_ catalog: Catalog, at date: Date) {
+            lock.withLock { self.catalog = catalog; fetched = date }
+        }
+    }
+    private static let memory = Memory()
 
     static func parse(_ data: Data) throws -> Catalog {
         let parser = OPDSParser()

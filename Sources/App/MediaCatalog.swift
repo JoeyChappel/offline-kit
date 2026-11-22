@@ -35,6 +35,10 @@ struct MediaInfo: Codable, Hashable, Sendable {
     var summary: String? = nil
     /// Which of those are the model's own guess ("genre", "creator"…), shown with an "AI guess" label.
     var guessed: [String]? = nil
+    /// The first file's path, so the cache can tell which entries belong to files that are gone.
+    var source: String? = nil
+    /// An EPUB's own title, kept so a rescan doesn't have to open every book just to name it ("" when it has none).
+    var bookTitle: String? = nil
 }
 
 /// Reads and caches MediaInfo. Thumbnails are a still from about a tenth of the way in, so they aren't black.
@@ -44,7 +48,7 @@ final class MediaInfoStore: @unchecked Sendable {
     private let lock = NSLock()
     private var cache: [String: MediaInfo] = [:]
     private var loaded = false
-    private static var folder: URL { KitLocation.caches.appending(path: "OfflineKit/media-info", directoryHint: .isDirectory) }
+    static var folder: URL { KitLocation.caches.appending(path: "OfflineKit/media-info", directoryHint: .isDirectory) }
     private static var file: URL { folder.appending(path: "info.json") }
 
     /// The automatic picture for an item, without reading the file again.
@@ -53,28 +57,102 @@ final class MediaInfoStore: @unchecked Sendable {
         return lock.withLock { cache[Self.cacheKey(item)]?.thumb }
     }
 
-    /// Info for every item, keyed by progress key. New or changed files are read in the background (3 at a time).
-    func infos(for items: [MediaItem]) async -> [String: MediaInfo] {
+    /// A book's own title from the cache, so a rescan doesn't open the EPUB again. "" means it was opened and has none.
+    func cachedBookTitle(_ url: URL) -> String? {
         loadIfNeeded()
-        var result: [String: MediaInfo] = [:]
-        var missing: [(MediaItem, String)] = []
+        return lock.withLock { cache[Self.cacheKey(tracks: [url])]?.bookTitle }
+    }
+
+    /// What the cache already knows about these items, with nothing read from the files: details by progress key,
+    /// a stand-in for each item that still has to be read, and the cache keys in use (for pruning).
+    struct Lookup: Sendable {
+        var found: [String: MediaInfo] = [:]
+        var missing: [MediaItem] = []
+        var provisional: [String: MediaInfo] = [:]
+        var keys: Set<String> = []
+    }
+    func lookup(_ items: [MediaItem]) async -> Lookup {
+        loadIfNeeded()
+        var result = Lookup()
         for item in items {
             let key = Self.cacheKey(item)
-            if let hit = lock.withLock({ cache[key] }) { result[item.progressKey] = hit } else { missing.append((item, key)) }
-        }
-        guard !missing.isEmpty else { return result }
-        await withTaskGroup(of: (String, String, MediaInfo).self) { group in
-            var next = missing.makeIterator()
-            func addNext() { if let (item, key) = next.next() { group.addTask { (item.progressKey, key, await Self.read(item)) } } }
-            for _ in 0..<3 { addNext() }
-            for await (progressKey, key, info) in group {
-                result[progressKey] = info
-                lock.withLock { cache[key] = info }
-                addNext()
+            result.keys.insert(key)
+            let isEPUB = item.kind == .book && item.tracks[0].pathExtension.lowercased() == "epub"
+            if var hit = lock.withLock({ cache[key] }), !(isEPUB && hit.bookTitle == nil) {
+                if hit.source == nil {
+                    // Entries from before the source was recorded get it now, so they can be pruned when the file goes.
+                    hit.source = item.tracks[0].path
+                    let updated = hit
+                    lock.withLock { cache[key] = updated }
+                }
+                result.found[item.progressKey] = hit
+            } else {
+                result.missing.append(item)
+                result.provisional[item.progressKey] = Self.placeholder(item)
             }
         }
-        save()
         return result
+    }
+
+    /// What can be said about an item before its files are read: the date it was added, its cover and a year in its name.
+    nonisolated static func placeholder(_ item: MediaItem) -> MediaInfo {
+        let added = (try? item.tracks[0].resourceValues(forKeys: [.addedToDirectoryDateKey, .creationDateKey]))
+            .flatMap { $0.addedToDirectoryDate ?? $0.creationDate } ?? Date()
+        return MediaInfo(duration: nil, year: MediaCatalog.year(in: item.title), genre: nil, added: added, thumb: item.cover?.path)
+    }
+
+    /// Reads new or changed files in the background (3 at a time) and hands each batch of finished details to
+    /// `onBatch`, so the screen fills in as the work goes instead of waiting for the last file.
+    func read(_ items: [MediaItem], batch: Int = 40, onBatch: @MainActor @Sendable ([String: MediaInfo]) -> Void) async {
+        guard !items.isEmpty else { return }
+        var pending: [String: MediaInfo] = [:]
+        var lastFlush = Date()
+        var sinceSave = 0
+        await withTaskGroup(of: (String, String, MediaInfo).self) { group in
+            var next = items.makeIterator()
+            func addNext() { if let item = next.next() { group.addTask { (item.progressKey, Self.cacheKey(item), await Self.read(item)) } } }
+            for _ in 0..<3 { addNext() }
+            for await (progressKey, key, info) in group {
+                lock.withLock { cache[key] = info }
+                pending[progressKey] = info
+                sinceSave += 1
+                addNext()
+                if pending.count >= batch || Date().timeIntervalSince(lastFlush) > 1.5 {
+                    let ready = pending
+                    pending = [:]
+                    lastFlush = Date()
+                    await onBatch(ready)
+                    // Saved along the way, so quitting in the middle of a big first scan doesn't lose it all.
+                    if sinceSave >= 200 { sinceSave = 0; save() }
+                }
+            }
+        }
+        if !pending.isEmpty { await onBatch(pending) }
+        save()
+    }
+
+    /// Forgets details (and their pictures) for files that are gone. Entries for drives that are just unplugged stay.
+    /// `complete` is true when every Media folder was there to scan, which makes entries from before sources were kept safe to drop.
+    func prune(keeping keys: Set<String>, complete: Bool) {
+        loadIfNeeded()
+        let fm = FileManager.default
+        let thumbs = Self.folder.appending(path: "thumbs", directoryHint: .isDirectory).path + "/"
+        let doomed: [(String, String?)] = lock.withLock {
+            cache.compactMap { key, info in
+                guard !keys.contains(key) else { return nil }
+                if let source = info.source {
+                    guard !source.hasPrefix("/Volumes/") else { return nil }
+                } else if !complete { return nil }
+                return (key, info.thumb)
+            }
+        }
+        guard !doomed.isEmpty else { return }
+        lock.withLock { for (key, _) in doomed { cache[key] = nil } }
+        let keep = lock.withLock { Set(cache.values.compactMap(\.thumb)) }
+        for (_, thumb) in doomed {
+            if let thumb, thumb.hasPrefix(thumbs), !keep.contains(thumb) { try? fm.removeItem(atPath: thumb) }
+        }
+        save()
     }
 
     private func loadIfNeeded() {
@@ -87,7 +165,11 @@ final class MediaInfoStore: @unchecked Sendable {
         }
     }
 
+    private let saving = NSLock()
     private func save() {
+        // One write at a time; the final save at the end of a scan always runs after the others have finished.
+        guard saving.try() else { return }
+        defer { saving.unlock() }
         let snapshot = lock.withLock { cache }
         try? FileManager.default.createDirectory(at: Self.folder, withIntermediateDirectories: true)
         try? JSONEncoder().encode(snapshot).write(to: Self.file, options: .atomic)
@@ -112,8 +194,9 @@ final class MediaInfoStore: @unchecked Sendable {
         return rules.first { rule in rule.1.contains(where: text.contains) }?.0 ?? "Classics"
     }
 
-    private static func cacheKey(_ item: MediaItem) -> String {
-        let revisions = item.tracks.map { url in
+    private static func cacheKey(_ item: MediaItem) -> String { cacheKey(tracks: item.tracks) }
+    private static func cacheKey(tracks: [URL]) -> String {
+        let revisions = tracks.map { url in
             let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             return "\(url.path)|\(values?.fileSize ?? 0)|\(values?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
         }.joined(separator: "\n")
@@ -123,10 +206,8 @@ final class MediaInfoStore: @unchecked Sendable {
 
     private static func read(_ item: MediaItem) async -> MediaInfo {
         let first = item.tracks[0]
-        let added = (try? first.resourceValues(forKeys: [.addedToDirectoryDateKey, .creationDateKey]))
-            .flatMap { $0.addedToDirectoryDate ?? $0.creationDate } ?? Date()
-        var info = MediaInfo(duration: nil, year: MediaCatalog.year(in: item.title), genre: nil, added: added,
-                             thumb: item.cover?.path)
+        var info = placeholder(item)
+        info.source = first.path
         if item.kind == .book {
             readBook(item, into: &info)
             if info.genre == nil { info.genre = folderGenre(item) }
@@ -134,6 +215,7 @@ final class MediaInfoStore: @unchecked Sendable {
         }
         if item.kind == .audio {
             var details: [MediaTrackInfo] = []
+            var wantsArtwork = info.thumb == nil
             for url in item.tracks {
                 let tag = await AudioTags.read(url)
                 details.append(MediaTrackInfo(title: tag.title ?? MediaLibrary.prettyTitle(url.deletingPathExtension().lastPathComponent),
@@ -143,7 +225,8 @@ final class MediaInfoStore: @unchecked Sendable {
                 if info.album == nil { info.album = tag.album }
                 if info.genre == nil { info.genre = tag.genre }
                 if info.year == nil { info.year = tag.year }
-                if info.thumb == nil, let art = tag.artwork {
+                if wantsArtwork, let art = await AudioTags.artwork(url) {
+                    wantsArtwork = false
                     let dest = folder.appending(path: "thumbs/\(thumbName(cacheKey(item))).jpg")
                     try? FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
                     if let source = CGImageSourceCreateWithData(art as CFData, nil),
@@ -219,7 +302,8 @@ final class MediaInfoStore: @unchecked Sendable {
         let thumbURL = folder.appending(path: "thumbs/\(thumbName(cacheKey(item))).jpg")
         try? FileManager.default.createDirectory(at: thumbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if url.pathExtension.lowercased() == "epub" {
-            guard let (book, zip) = EPUBBook.open(url) else { return }
+            guard let (book, zip) = EPUBBook.open(url) else { info.bookTitle = ""; return }
+            info.bookTitle = book.title
             info.author = book.author
             info.genre = friendlyGenre(book.subjects)
             info.parts = book.chapters.count

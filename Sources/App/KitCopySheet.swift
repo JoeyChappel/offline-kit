@@ -13,6 +13,8 @@ struct KitCopySheet: View {
     @State private var choosingFolder = false
     @State private var replaceConfirmed = false
     @State private var showSkipped = false
+    /// Connected drives with their names and free space, read off the main thread (see loadDrives).
+    @State private var driveRows: [DriveRow] = []
     #if DEBUG
     @State private var redid = false
     #endif
@@ -44,6 +46,9 @@ struct KitCopySheet: View {
         .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { destination = url; copier.reset() }
         }
+        .task { await loadDrives() }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in Task { await loadDrives() } }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in Task { await loadDrives() } }
         .onAppear {
             if sources.isEmpty { sources = Set(library.folders) }
             #if DEBUG
@@ -109,11 +114,12 @@ struct KitCopySheet: View {
             .card(padding: 16)
             VStack(alignment: .leading, spacing: 8) {
                 Text("Where to").font(.headline)
-                ForEach(drives, id: \.self) { drive in
+                ForEach(driveRows) { row in
+                    let drive = row.url
                     Button { destination = drive; copier.reset() } label: {
                         HStack {
                             Image(systemName: destination == drive ? "largecircle.fill.circle" : "circle").foregroundStyle(.tint)
-                            Label("\(driveName(drive)) · \(kitBytes(KitCopy.freeSpace(near: drive))) free", systemImage: "externaldrive")
+                            Label("\(row.name) · \(kitBytes(row.free)) free", systemImage: "externaldrive")
                             Spacer()
                         }.contentShape(Rectangle())
                     }.buttonStyle(.plain)
@@ -326,9 +332,26 @@ struct KitCopySheet: View {
     // MARK: Logic
 
     /// Connected drives other than this Mac's (where a kit copy can go), as volume roots.
-    private var drives: [URL] {
-        SaveLocation.available().filter { $0.symbol == "externaldrive" }
-            .map { $0.folder.deletingLastPathComponent().deletingLastPathComponent() }
+    private var drives: [URL] { driveRows.map(\.url) }
+
+    private struct DriveRow: Identifiable {
+        let url: URL, name: String, free: Int64
+        var id: URL { url }
+    }
+
+    /// Looking at the drives touches every mounted volume, so it runs once when the sheet opens and when a drive
+    /// comes or goes, not on each redraw (a copy redraws this sheet many times a second).
+    private func loadDrives() async {
+        let rows = await Task.detached(priority: .userInitiated) {
+            SaveLocation.available().filter { $0.symbol == "externaldrive" }
+                .map { $0.folder.deletingLastPathComponent().deletingLastPathComponent() }
+                .map { DriveRow(url: $0, name: Self.volumeName($0), free: KitCopy.freeSpace(near: $0)) }
+        }.value
+        if rows.map(\.url) != driveRows.map(\.url) || rows.map(\.free) != driveRows.map(\.free) { driveRows = rows }
+    }
+
+    private nonisolated static func volumeName(_ url: URL) -> String {
+        (try? KitCopy.nearestExisting(url).resourceValues(forKeys: [.volumeLocalizedNameKey]))?.volumeLocalizedName ?? url.lastPathComponent
     }
 
     private func driveName(_ url: URL) -> String {

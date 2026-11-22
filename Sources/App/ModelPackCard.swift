@@ -9,7 +9,7 @@ struct ModelPackCard: View {
 
     var body: some View {
         let _ = KitChanges.shared.models   // redraw when a model download finishes
-        let installed = LocalModels.installed(libraryFolders: library.folders)
+        let installed = LocalModels.installedCached(libraryFolders: library.folders)
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: "cpu")

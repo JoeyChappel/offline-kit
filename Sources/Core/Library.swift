@@ -68,11 +68,18 @@ final class Library {
 
     /// Extra folders the user added (Mac). Defaults are always scanned too.
     var extraFolders: [String] {
-        didSet { KitSettings.shared.set(extraFolders, forKey: "extraFolders") }
+        didSet {
+            KitSettings.shared.set(extraFolders, forKey: "extraFolders")
+            refreshFolders()
+        }
     }
 
     init() {
-        extraFolders = KitSettings.shared.stringArray(forKey: "extraFolders") ?? []
+        let extra = KitSettings.shared.stringArray(forKey: "extraFolders") ?? []
+        extraFolders = extra
+        let defaults = Self.defaultFolders
+        builtInFolders = defaults
+        folders = Self.merge(defaults, extra: extra)
     }
 
     func book(_ id: String) -> Book? { books.first { $0.id == id.lowercased() } }
@@ -105,10 +112,25 @@ final class Library {
     }
     #endif
 
-    /// Folders scanned on every reload.
-    var folders: [URL] {
-        var urls = Self.defaultFolders
-        urls += extraFolders.map { URL(fileURLWithPath: $0) }
+    /// Folders scanned on every reload. Cached: working it out touches the disk (creates the drive-mode folder,
+    /// lists /Volumes, stats each folder), and views read it in their bodies. Refreshed by `refreshFolders()`,
+    /// which runs on each reload, when extra folders change and when a drive is mounted or unmounted.
+    private(set) var folders: [URL]
+
+    /// Works the folder list out again. Only publishes when it changed, so views don't redraw for nothing.
+    func refreshFolders() {
+        let defaults = Self.defaultFolders
+        if defaults != builtInFolders { builtInFolders = defaults }
+        let fresh = Self.merge(defaults, extra: extraFolders)
+        if fresh != folders { folders = fresh }
+    }
+
+    /// The default library locations that exist (cached like `folders`), without the extra folders.
+    private(set) var builtInFolders: [URL]
+
+    private static func merge(_ defaults: [URL], extra: [String]) -> [URL] {
+        var urls = defaults
+        urls += extra.map { URL(fileURLWithPath: $0) }
         var seen = Set<String>()
         return urls.filter { seen.insert($0.standardizedFileURL.path).inserted }
     }
@@ -166,6 +188,7 @@ final class Library {
 
     private func scanOnce() async {
         isLoading = true
+        refreshFolders()
         // Internal folders first: reading an external drive can wait on a macOS permission prompt.
         let all = self.folders
         let local = all.filter { !$0.path.hasPrefix("/Volumes/") }

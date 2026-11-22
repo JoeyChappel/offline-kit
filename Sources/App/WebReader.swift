@@ -14,6 +14,23 @@ final class ZimSchemeHandler: NSObject, WKURLSchemeHandler {
         }
         var path = url.path(percentEncoded: false)
         if path.hasPrefix("/") { path.removeFirst() }
+        // A byte-range request (a video starting or seeking) reads only those bytes out of the archive, not the whole
+        // entry again for every seek.
+        if let rangeHeader = task.request.value(forHTTPHeaderField: "Range"),
+           let info = archive.info(atPath: path),
+           let range = ByteRange(header: rangeHeader, total: Int(info.totalSize)) {
+            // An open-ended request ("bytes=0-") would otherwise read the rest of a movie in one go; players accept less.
+            let openEnded = rangeHeader.hasSuffix("-")
+            let upper = openEnded ? min(range.upper, range.lower + ZimSchemeHandler.openEndedLimit - 1) : range.upper
+            if let body = archive.data(atPath: info.path, offset: UInt(range.lower), length: UInt(upper - range.lower + 1)) {
+                let headers = ["Content-Type": Self.contentType(info.mimeType), "Content-Length": "\(body.count)", "Accept-Ranges": "bytes",
+                               "Content-Range": "bytes \(range.lower)-\(range.lower + body.count - 1)/\(info.totalSize)"]
+                task.didReceive(HTTPURLResponse(url: url, statusCode: 206, httpVersion: "HTTP/1.1", headerFields: headers)!)
+                task.didReceive(body)
+                task.didFinish()
+                return
+            }
+        }
         guard let content = archive.content(atPath: path) else {
             let page = "<html><body style='font:16px -apple-system;padding:2em'>This page isn't in the offline archive.</body></html>"
             let data = Data(page.utf8)
@@ -22,9 +39,7 @@ final class ZimSchemeHandler: NSObject, WKURLSchemeHandler {
             task.didFinish()
             return
         }
-        let mime = content.mimeType.components(separatedBy: ";").first ?? content.mimeType
-        let isText = mime.hasPrefix("text/") || mime.contains("javascript") || mime.contains("json")
-        let contentType = isText ? "\(mime); charset=utf-8" : mime
+        let contentType = Self.contentType(content.mimeType)
         let total = content.data.count
         // Video and audio players ask for byte ranges; answer with 206 so videos in TED/Khan archives play and seek.
         if let range = ByteRange(header: task.request.value(forHTTPHeaderField: "Range"), total: total) {
@@ -42,6 +57,16 @@ final class ZimSchemeHandler: NSObject, WKURLSchemeHandler {
     }
 
     func webView(_ webView: WKWebView, stop task: any WKURLSchemeTask) {}
+
+    /// The most one open-ended range request is answered with.
+    static let openEndedLimit = 16 * 1024 * 1024
+
+    /// "text/html" becomes "text/html; charset=utf-8"; binary types are left as they are.
+    private static func contentType(_ mimeType: String) -> String {
+        let mime = mimeType.components(separatedBy: ";").first ?? mimeType
+        let isText = mime.hasPrefix("text/") || mime.contains("javascript") || mime.contains("json")
+        return isText ? "\(mime); charset=utf-8" : mime
+    }
 }
 
 /// "bytes=100-199", "bytes=100-" or "bytes=-500" resolved against a length.
@@ -102,19 +127,6 @@ struct ArticleWebView: PlatformViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(state: state) }
 
-    @MainActor private static var blocker: WKContentRuleList?
-    @MainActor private static func offlineOnly(_ apply: @escaping @MainActor (WKContentRuleList) -> Void) {
-        if let blocker { apply(blocker); return }
-        let rules = #"[{"trigger":{"url-filter":"^(https?|wss?|ftp)://","resource-type":["image","style-sheet","script","font","raw","svg-document","media","ping","fetch","websocket","other"]},"action":{"type":"block"}}]"#
-        WKContentRuleListStore.default().compileContentRuleList(forIdentifier: "offlinekit-offline-only", encodedContentRuleList: rules) { list, _ in
-            guard let list else { return }
-            Task { @MainActor in
-                blocker = list
-                apply(list)
-            }
-        }
-    }
-
     private func make(_ context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(ZimSchemeHandler(), forURLScheme: ZimSchemeHandler.scheme)
@@ -124,9 +136,9 @@ struct ArticleWebView: PlatformViewRepresentable {
         state.webView = web
         // Archive pages are read offline: nothing on them may load from the internet (tracking pixels, scripts),
         // which would tell a server what's being read. Links the person taps still work.
-        Self.offlineOnly { list in web.configuration.userContentController.add(list) }
         context.coordinator.loaded = ref.id
-        web.load(URLRequest(url: ref.url))
+        let url = ref.url
+        OfflineContentBlocker.apply(to: web) { web.load(URLRequest(url: url)) }
         return web
     }
 

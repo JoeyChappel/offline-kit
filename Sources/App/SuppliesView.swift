@@ -29,12 +29,14 @@ struct SuppliesSection: View {
     }
 
     @Environment(Household.self) private var household
+    @Environment(KitNavigation.self) private var navigation
     @State private var filter: Filter = .all
     @State private var sort: Sort = .expiry
     @State private var category: SupplyCategory?
     @State private var search = ""
     @State private var editing: SupplyItem?
     @State private var alertNote: String?
+    @State private var wide = false
 
     var body: some View {
         @Bindable var household = household
@@ -43,44 +45,27 @@ struct SuppliesSection: View {
         let soon = all.filter { $0.status() == .soon }.count
 
         VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 10) {
-                    StatTile(value: all.count, label: "items", tint: .accentColor)
-                    StatTile(value: soon, label: "expire in \(SupplyItem.soonDays) days", tint: .orange)
-                    StatTile(value: expired, label: "expired", tint: .red)
-                }
-                Text("Track what you’ve stored and when it goes bad. \(PrivateStore.whereText), because supply lists include medicines and where things are kept.")
-                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                alertsControls
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 18) { inventoryHeading; Spacer(); addButton }
+                VStack(alignment: .leading, spacing: 12) { inventoryHeading; addButton }
             }
-            .card(padding: 18)
-
-            HStack {
-                Button { editing = SupplyItem() } label: { Label("Add Item", systemImage: "plus") }
-                    .buttonStyle(.borderedProminent)
-                Spacer()
-                Menu {
-                    Picker("Sort by", selection: $sort) { ForEach(Sort.allCases) { Text($0.label).tag($0) } }
-                    Picker("Category", selection: $category) {
-                        Text("All categories").tag(SupplyCategory?.none)
-                        ForEach(SupplyCategory.allCases) { Label($0.label, systemImage: $0.symbol).tag(Optional($0)) }
-                    }
-                } label: {
-                    Label(category?.label ?? "Sort & Filter", systemImage: "line.3.horizontal.decrease.circle")
-                }
-                .fixedSize()
-            }
-
             Picker("Show", selection: $filter) {
                 ForEach(Filter.allCases) { item in
-                    Text(label(for: item, soon: soon, expired: expired)).tag(item)
+                    Text("\(item.label) (\(item == .all ? all.count : item == .soon ? soon : expired))").tag(item)
+                }
+            }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: 600)
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    searchField.frame(minWidth: 230)
+                    categoryMenu.fixedSize()
+                    sortMenu.fixedSize()
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    searchField
+                    FlowLayout(spacing: 12) { categoryMenu; sortMenu }
                 }
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-
-            TextField("Search supplies", text: $search)
-                .textFieldStyle(.roundedBorder)
 
             let items = visible(all)
             if all.isEmpty {
@@ -91,18 +76,34 @@ struct SuppliesSection: View {
                 }
                 .frame(maxWidth: .infinity).card(padding: 18)
             } else if items.isEmpty {
-                Text(filter == .all ? "Nothing matches." : "Nothing \(filter == .soon ? "expires in the next \(SupplyItem.soonDays) days" : "has expired"). ")
-                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).card(padding: 18)
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("No supplies match these filters.").foregroundStyle(.secondary)
+                    Button("Clear filters") { filter = .all; category = nil; search = "" }.buttonStyle(.borderless)
+                }.frame(maxWidth: .infinity, alignment: .leading).card(padding: 18)
             } else {
                 VStack(spacing: 0) {
+                    if wide { tableHeading; Divider() }
                     ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                         if index > 0 { Divider() }
-                        SupplyRow(item: item) { editing = item }
+                        SupplyRow(item: item, columns: wide) { editing = item }
                     }
                 }
                 .card(padding: 6)
             }
+            DisclosureGroup {
+                alertsControls.padding(.top, 12)
+            } label: {
+                Label(household.data.extra.supplyAlerts.enabled
+                      ? "Expiry reminders on · \(household.data.extra.supplyAlerts.leadDays) days before"
+                      : "Expiry reminders are off", systemImage: "bell")
+                    .font(.callout)
+            }.card(padding: 16)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 14) { checklistNote; Spacer(); checklistButton }
+                VStack(alignment: .leading, spacing: 10) { checklistNote; checklistButton }
+            }
         }
+        .onGeometryChange(for: Bool.self) { $0.size.width >= 760 } action: { wide = $0 }
         .sheet(item: $editing) { item in
             SupplyEditor(item: item, isNew: !all.contains { $0.id == item.id })
                 .environment(household)
@@ -121,12 +122,63 @@ struct SuppliesSection: View {
         #endif
     }
 
-    private func label(for item: Filter, soon: Int, expired: Int) -> String {
-        switch item {
-        case .all: "All"
-        case .soon: soon > 0 ? "Expires soon (\(soon))" : "Expires soon"
-        case .expired: expired > 0 ? "Expired (\(expired))" : "Expired"
+    private var inventoryHeading: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Your supplies").font(.title.bold())
+            Text("What you have, where it is, and when to replace it.").font(.callout).foregroundStyle(.secondary)
         }
+    }
+
+    private var addButton: some View {
+        Button { editing = SupplyItem() } label: { Label("Add Item", systemImage: "plus") }
+            .buttonStyle(.borderedProminent).controlSize(.large)
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Search supplies", text: $search).textFieldStyle(.plain)
+            if !search.isEmpty {
+                Button { search = "" } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("Clear supply search")
+            }
+        }.padding(10)
+            .background(Design.surface, in: RoundedRectangle(cornerRadius: 8))
+            .overlay { RoundedRectangle(cornerRadius: 8).stroke(Design.border) }
+    }
+
+    private var categoryMenu: some View {
+        Menu {
+            Picker("Category", selection: $category) {
+                Text("All categories").tag(SupplyCategory?.none)
+                ForEach(SupplyCategory.allCases) { Label($0.label, systemImage: $0.symbol).tag(Optional($0)) }
+            }
+        } label: { Text("Category: \(category?.label ?? "All")") }
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            Picker("Sort by", selection: $sort) { ForEach(Sort.allCases) { Text($0.label).tag($0) } }
+        } label: { Text("Sort: \(sort.label)") }
+    }
+
+    private var tableHeading: some View {
+        HStack(spacing: 12) {
+            Text("Item").frame(maxWidth: .infinity, alignment: .leading)
+            Text("Amount").frame(width: 90, alignment: .leading)
+            Text("Location").frame(width: 140, alignment: .leading)
+            Text("Expiry").frame(width: 150, alignment: .leading)
+            Color.clear.frame(width: 12, height: 1)
+        }.font(.caption.weight(.medium)).foregroundStyle(.secondary)
+            .padding(.horizontal, 10).padding(.vertical, 10)
+    }
+
+    private var checklistNote: some View {
+        Text("Checklist tracks what you need. Supplies tracks what you already have.")
+            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+    private var checklistButton: some View {
+        Button("Open Checklist", systemImage: "arrow.right") { navigation.prepare(.checklist) }.buttonStyle(.borderless)
     }
 
     /// Changes that affect reminders.
@@ -193,23 +245,9 @@ struct SuppliesSection: View {
     }
 }
 
-private struct StatTile: View {
-    let value: Int
-    let label: String
-    let tint: Color
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("\(value)").font(.system(.title, design: .rounded, weight: .bold)).foregroundStyle(value > 0 ? tint : .secondary)
-            Text(label).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(10)
-        .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-    }
-}
-
 private struct SupplyRow: View {
     let item: SupplyItem
+    var columns = false
     let edit: () -> Void
 
     var body: some View {
@@ -219,14 +257,22 @@ private struct SupplyRow: View {
                     .foregroundStyle(Color.accentColor)
                     .frame(width: 30, height: 30)
                     .background(Color.accentColor.opacity(0.09), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(item.name.isBlank ? "Unnamed item" : item.name).font(.body.weight(.semibold)).foregroundStyle(Design.ink)
-                    Text([item.amount, item.location].filter { !$0.isBlank }.joined(separator: " · "))
-                        .font(.caption).foregroundStyle(.secondary)
+                if columns {
+                    Text(item.name.isBlank ? "Unnamed item" : item.name).font(.body.weight(.semibold))
+                        .foregroundStyle(Design.ink).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(item.amount).font(.callout).foregroundStyle(.secondary).frame(width: 90, alignment: .leading)
+                    Text(item.location.isBlank ? "Not set" : item.location).font(.callout).foregroundStyle(.secondary)
+                        .frame(width: 140, alignment: .leading)
+                    ExpiryBadge(item: item).frame(width: 150, alignment: .leading)
+                } else {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(item.name.isBlank ? "Unnamed item" : item.name).font(.body.weight(.semibold)).foregroundStyle(Design.ink)
+                        Text([item.amount, item.location].filter { !$0.isBlank }.joined(separator: " · "))
+                            .font(.caption).foregroundStyle(.secondary)
+                        ExpiryBadge(item: item)
+                    }.frame(maxWidth: .infinity, alignment: .leading)
                 }
-                Spacer(minLength: 8)
-                ExpiryBadge(item: item)
-                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary).frame(width: 12)
             }
             .padding(.horizontal, 10).padding(.vertical, 8)
             .contentShape(Rectangle())

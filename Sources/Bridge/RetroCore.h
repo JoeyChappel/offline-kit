@@ -77,6 +77,10 @@ typedef NS_ENUM(NSInteger, RetroMouseButton) {
 @property (nonatomic, copy, nullable) void (^messageHandler)(NSString *message);
 
 - (void)setButton:(RetroButton)button pressed:(BOOL)pressed;
+/// A joypad button for player 1 (port 0) or player 2 (port 1). Port 1 is read only by cores with a second player.
+- (void)setButton:(RetroButton)button pressed:(BOOL)pressed port:(unsigned)port;
+/// Lets go of one player's joypad buttons.
+- (void)releaseButtonsOnPort:(unsigned)port;
 /// Releases joypad buttons, held keys and mouse buttons.
 - (void)releaseAllButtons;
 
@@ -97,6 +101,8 @@ typedef NS_ENUM(NSInteger, RetroMouseButton) {
 
 /// Pulls interleaved stereo int16 samples queued by the core. Returns frames copied; the rest is silence.
 - (NSInteger)readAudio:(int16_t *)buffer frames:(NSInteger)frames;
+/// Throws away audio waiting to play (after a pause).
+- (void)clearAudio;
 /// Frames of audio waiting, for pacing.
 @property (nonatomic, readonly) NSInteger queuedAudioFrames;
 

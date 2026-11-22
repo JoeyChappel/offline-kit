@@ -10,6 +10,12 @@ struct KitCareView: View {
     @Environment(GameLibrary.self) private var games
     @State private var report: CheckupReport?
     @State private var scanning = false
+    @State private var section = CareSection.overview
+    @State private var showingRecommendations = false
+    private enum CareSection: String, CaseIterable, Identifiable {
+        case overview = "Overview", references = "References", storage = "Storage"
+        var id: Self { self }
+    }
     /// A checkup was asked for while one ran (a fix finished, the library changed): run once more after it.
     @State private var scanAgain = false
     @State private var staleMonths = KitSettings.shared.string(forKey: "staleMonths").flatMap(Int.init) ?? KitCheckup.defaultStaleMonths
@@ -22,17 +28,34 @@ struct KitCareView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     KitHeading(eyebrow: "KIT CARE", title: "Keep your kit ready.",
-                               subtitle: "A checkup of what’s saved: how current it is, what needs fixing and how much room is left. Nothing is deleted without showing you first.")
+                               subtitle: "Review problems, check saved references, and manage storage.")
+                    Picker("Kit Care section", selection: $section) {
+                        ForEach(CareSection.allCases) { Text($0.rawValue).tag($0) }
+                    }.pickerStyle(.segmented).frame(maxWidth: 620)
                     if let report {
-                        CheckupSummary(report: report, staleMonths: staleMonths)
-                        HealthCard(report: report, rescan: rescan).id("health")
-                        RefreshCard().id("refresh")
-                        #if os(macOS)
-                        CopyKitCard { copying = true }.id("copy")
-                        #endif
-                        AgesCard(ages: report.ages, staleMonths: $staleMonths).id("ages")
-                        RecommendedCard(rescan: rescan).id("recommended")
-                        SpaceCard(spaces: report.spaces).id("space")
+                        switch section {
+                        case .overview:
+                            ViewThatFits(in: .horizontal) {
+                                HStack(alignment: .top, spacing: 20) {
+                                    overviewMain(report).frame(minWidth: 420, maxWidth: .infinity)
+                                    overviewSide(report).frame(minWidth: 280, maxWidth: 340)
+                                }
+                                VStack(alignment: .leading, spacing: 20) { overviewMain(report); overviewSide(report) }
+                            }
+                        case .references:
+                            savedReferences(report)
+                            AnswerIndexCard().id("answer-index")
+                            RefreshCard().id("refresh")
+                            AgesCard(ages: report.ages, staleMonths: $staleMonths).id("ages")
+                        case .storage:
+                            HealthCard(report: report, rescan: rescan).id("health")
+                            SpaceCard(spaces: report.spaces).id("space")
+                            #if os(macOS)
+                            CopyKitCard { copying = true }.id("copy")
+                            #endif
+                        }
+                        Label("Checks cover saved files; they don’t measure household preparedness.", systemImage: "info.circle")
+                            .font(.caption).foregroundStyle(.secondary)
                     } else {
                         // Shaped like the summary and the first cards.
                         VStack(alignment: .leading, spacing: 16) {
@@ -47,14 +70,17 @@ struct KitCareView: View {
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 28)
-                .frame(maxWidth: 860, alignment: .leading)
+                .frame(maxWidth: 1100, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
             .background(Design.canvas)
             #if DEBUG
-            // Test hook: -kitScrollTo health|refresh|copy|ages|recommended|space
+            // Test hook: -kitScrollTo health|refresh|copy|ages|recommended|space|answer-index
             .task(id: report == nil) {
                 guard report != nil, let target = UserDefaults.standard.string(forKey: "kitScrollTo") else { return }
+                if ["refresh", "ages", "answer-index"].contains(target) { section = .references }
+                else if ["copy", "space"].contains(target) { section = .storage }
+                if target == "recommended" { showingRecommendations = true }
                 try? await Task.sleep(for: .milliseconds(600))
                 proxy.scrollTo(target, anchor: .top)
             }
@@ -68,11 +94,19 @@ struct KitCareView: View {
                     .help("Run the checkup again")
             }
         }
-        .task(id: library.isLoading) { if !library.isLoading { await scan() } }
+        .onChange(of: library.isLoading, initial: true) {
+            // A library scan can restart while this view appears. Keep the checkup task independent
+            // of SwiftUI's task cancellation when that loading flag changes.
+            if !library.isLoading { Task { await scan() } }
+        }
         .onChange(of: staleMonths) { KitSettings.shared.set(String(staleMonths), forKey: "staleMonths") }
         .onAppear {
             KitRefresh.shared.onReplaced = { Task { await library.reload() } }
             KitRefresh.shared.watch(downloads: downloads)
+            #if DEBUG
+            if UserDefaults.standard.bool(forKey: "kitRefreshCheck") { section = .references }
+            if UserDefaults.standard.bool(forKey: "kitConfirmModel") { showingRecommendations = true }
+            #endif
         }
         #if os(macOS)
         .sheet(isPresented: $copying) { KitCopySheet() }
@@ -86,6 +120,63 @@ struct KitCareView: View {
         .onAppear { if UserDefaults.standard.string(forKey: "kitCopyTo") != nil { copying = true } }
         #endif
         #endif
+    }
+
+    private func overviewMain(_ report: CheckupReport) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HealthCard(report: report, rescan: rescan).id("health")
+            savedReferences(report)
+            DisclosureGroup(isExpanded: $showingRecommendations) {
+                RecommendedCard(rescan: rescan).padding(.top, 12)
+            } label: {
+                KitCardHeader(symbol: "square.stack.3d.up", title: "Recommended additions",
+                              subtitle: "Review emergency essentials, a local map, and an answer model.")
+            }.card(padding: 18).id("recommended")
+        }
+    }
+
+    private func overviewSide(_ report: CheckupReport) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 14) {
+                KitCardHeader(symbol: "internaldrive", title: "Storage", subtitle: "Room on the drives holding your library.")
+                if report.spaces.isEmpty {
+                    Text("No library storage found yet.").font(.callout).foregroundStyle(.secondary)
+                }
+                ForEach(report.spaces) { space in
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(space.driveName).font(.headline)
+                        Label(space.isLow ? "Low space" : "\(kitBytes(space.free)) free", systemImage: space.isLow ? "exclamationmark.triangle" : "internaldrive")
+                            .font(.callout).foregroundStyle(space.isLow ? Color.orange : Color.secondary)
+                    }
+                }
+                Button("View storage", systemImage: "arrow.right") { section = .storage }.buttonStyle(.bordered)
+            }.card(padding: 18)
+            #if os(macOS)
+            CopyKitCard { copying = true }.id("copy")
+            #endif
+        }
+    }
+
+    private func savedReferences(_ report: CheckupReport) -> some View {
+        let archives = report.ages.filter { $0.kind != .model }
+        let stale = archives.filter { $0.isStale(months: staleMonths) }.count
+        let undated = archives.filter { $0.contentDate == nil }.count
+        return VStack(alignment: .leading, spacing: 14) {
+            Label("Saved references", systemImage: "book.closed").font(.headline)
+            if library.books.isEmpty {
+                Text("No references saved yet").font(.title3.weight(.semibold))
+                Text("Add trusted references before checking for newer editions.").font(.callout).foregroundStyle(.secondary)
+                Button("Get Resources", systemImage: "arrow.right") { navigation.getResources() }.buttonStyle(.borderedProminent)
+            } else {
+                Text("\(library.books.count) saved \(library.books.count == 1 ? "reference or map" : "references and maps")").font(.title3.weight(.semibold))
+                Text(stale > 0 ? "\(stale) older than \(staleMonths) months." : "No dated references older than \(staleMonths) months.")
+                    .font(.callout).foregroundStyle(stale > 0 ? Color.orange : Color.secondary)
+                if undated > 0 { Text("\(undated) \(undated == 1 ? "file has" : "files have") no content date.").font(.caption).foregroundStyle(.secondary) }
+                if section != .references {
+                    Button("Review references and updates", systemImage: "arrow.right") { section = .references }.buttonStyle(.bordered)
+                }
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading).card(padding: 18)
     }
 
     private func rescan() {
@@ -139,35 +230,6 @@ struct CheckupReport: Sendable {
     var problemCount: Int { health.brokenLinks.count + health.partials.count + olderCopies.count + unreadable.count }
 }
 
-// MARK: - Summary
-
-private struct CheckupSummary: View {
-    let report: CheckupReport
-    let staleMonths: Int
-
-    var body: some View {
-        let stale = report.ages.filter { $0.isStale(months: staleMonths) }.count
-        let low = report.spaces.filter(\.isLow)
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 12)], spacing: 12) {
-            tile(report.problemCount == 0 ? "No problems found" : "\(report.problemCount) to fix",
-                 symbol: report.problemCount == 0 ? "checkmark.seal" : "wrench.adjustable", warn: report.problemCount > 0)
-            tile(stale == 0 ? "Everything is recent" : "\(stale) older than \(staleMonths) months",
-                 symbol: "calendar", warn: stale > 0)
-            tile(low.isEmpty ? "Room to grow" : "Low on space: \(low.map(\.driveName).joined(separator: ", "))",
-                 symbol: "internaldrive", warn: !low.isEmpty)
-        }
-    }
-
-    private func tile(_ text: String, symbol: String, warn: Bool) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: symbol).foregroundStyle(warn ? Color.orange : Color.accentColor)
-            Text(text).font(.callout.weight(.medium))
-            Spacer(minLength: 0)
-        }
-        .card(padding: 14)
-    }
-}
-
 /// Card header used across Kit Care.
 struct KitCardHeader: View {
     let symbol: String
@@ -205,34 +267,42 @@ private struct HealthCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            KitCardHeader(symbol: "stethoscope", title: "Health",
-                          subtitle: "Archives that won’t open, links to files that moved, and downloads that never finished.")
+            KitCardHeader(symbol: report.problemCount > 0 ? "exclamationmark.triangle" : "stethoscope", title: report.problemCount > 0 ? "Needs attention" : "File check",
+                          subtitle: report.problemCount > 0 ? "\(report.problemCount) file issues to review. Nothing is removed until you confirm." : "Checks for unreadable files, broken links and unfinished downloads.")
             Divider()
             if report.problemCount == 0 {
-                Label("Everything opens and nothing is left over.", systemImage: "checkmark.circle.fill")
+                Label("No saved file issues found.", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.tint)
             }
             if !report.unreadable.isEmpty {
                 section("Won’t open", count: report.unreadable.count, symbol: "exclamationmark.triangle") {
                     ForEach(report.unreadable) { item in
-                        row(item.url.lastPathComponent, detail: item.reason, url: item.url)
+                        issueRow(item.url.lastPathComponent, detail: item.reason, url: item.url, action: "Review damaged file…") {
+                            confirming = Removal(title: "Remove damaged archive?", explanation: "This file can’t be opened. You can download it again from Get Resources.", files: [(item.url, size(item.url))])
+                        }
                     }
-                    Button("Remove Damaged Archives…") {
-                        confirming = Removal(title: "Remove damaged archives?",
-                                             explanation: "These files can’t be opened. Removing them frees the space; you can download them again from Get Resources.",
-                                             files: report.unreadable.map { ($0.url, size($0.url)) })
+                    if report.unreadable.count > 1 {
+                        Button("Remove Damaged Archives…") {
+                            confirming = Removal(title: "Remove damaged archives?",
+                                                 explanation: "These files can’t be opened. Removing them frees the space; you can download them again from Get Resources.",
+                                                 files: report.unreadable.map { ($0.url, size($0.url)) })
+                        }
                     }
                 }
             }
             if !report.health.brokenLinks.isEmpty {
                 section("Broken links", count: report.health.brokenLinks.count, symbol: "link.badge.plus") {
                     ForEach(report.health.brokenLinks) { link in
-                        row(link.link.lastPathComponent, detail: "Pointed to \(link.target), which isn’t there. This happens when files move to another drive.", url: link.link.deletingLastPathComponent())
+                        issueRow(link.link.lastPathComponent, detail: "Linked file is missing: \(link.target). Removing this link won’t delete the original file.", url: link.link.deletingLastPathComponent(), action: "Review broken link…") {
+                            confirming = Removal(title: "Remove broken link?", explanation: "Only this link is removed. No film, song or book is deleted.", files: [(link.link, nil)])
+                        }
                     }
-                    Button("Remove Broken Links…") {
-                        confirming = Removal(title: "Remove broken links?",
-                                             explanation: "Only the links are removed. They point to nothing, so no film, song or book is deleted.",
-                                             files: report.health.brokenLinks.map { ($0.link, nil) })
+                    if report.health.brokenLinks.count > 1 {
+                        Button("Remove Broken Links…") {
+                            confirming = Removal(title: "Remove broken links?",
+                                                 explanation: "Only the links are removed. They point to nothing, so no film, song or book is deleted.",
+                                                 files: report.health.brokenLinks.map { ($0.link, nil) })
+                        }
                     }
                 }
             }
@@ -241,10 +311,15 @@ private struct HealthCard: View {
                 let leftover = report.health.partials.filter { !isRunning($0) }
                 section("Unfinished downloads", count: report.health.partials.count, symbol: "arrow.down.circle.dotted") {
                     ForEach(report.health.partials) { partial in
-                        row(partial.fileName, detail: "\(kitBytes(partial.size)) · " + (isRunning(partial) ? "Downloading now" : partialStatus(partial)),
-                            url: partial.folder)
+                        if isRunning(partial) {
+                            row(partial.fileName, detail: "\(kitBytes(partial.size)) · Downloading now", url: partial.folder)
+                        } else {
+                            issueRow(partial.fileName, detail: "\(kitBytes(partial.size)) · " + partialStatus(partial), url: partial.folder, action: "Review partial download…") {
+                                confirming = partialRemoval([partial])
+                            }
+                        }
                     }
-                    if !leftover.isEmpty {
+                    if leftover.count > 1 {
                         Button("Remove Partial Downloads…") { confirming = partialRemoval(leftover) }
                     }
                     if !active.isEmpty {
@@ -255,12 +330,16 @@ private struct HealthCard: View {
             if !report.olderCopies.isEmpty {
                 section("Older copies", count: report.olderCopies.count, symbol: "doc.on.doc") {
                     ForEach(report.olderCopies) { copy in
-                        row(copy.old.lastPathComponent, detail: "\(kitBytes(copy.size)) · Replaced by \(copy.newer.lastPathComponent)", url: copy.old)
+                        issueRow(copy.old.lastPathComponent, detail: "\(kitBytes(copy.size)) · Replaced by \(copy.newer.lastPathComponent)", url: copy.old, action: "Review older copy…") {
+                            confirming = Removal(title: "Remove older copy?", explanation: "A newer version is installed beside it. The newer file stays.", files: [(copy.old, copy.size)])
+                        }
                     }
-                    Button("Remove Older Copies…") {
-                        confirming = Removal(title: "Remove older copies?",
-                                             explanation: "A newer version of each is installed beside it. The newer ones stay.",
-                                             files: report.olderCopies.map { ($0.old, $0.size) })
+                    if report.olderCopies.count > 1 {
+                        Button("Remove Older Copies…") {
+                            confirming = Removal(title: "Remove older copies?",
+                                                 explanation: "A newer version of each is installed beside it. The newer ones stay.",
+                                                 files: report.olderCopies.map { ($0.old, $0.size) })
+                        }
                     }
                 }
             }
@@ -332,6 +411,13 @@ private struct HealthCard: View {
         }
         .buttonStyle(.bordered)
         .padding(.vertical, 4)
+    }
+
+    private func issueRow(_ title: String, detail: String, url: URL, action: String, review: @escaping () -> Void) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 14) { row(title, detail: detail, url: url).frame(minWidth: 240, alignment: .leading); Spacer(minLength: 8); Button(action, action: review) }
+            VStack(alignment: .leading, spacing: 8) { row(title, detail: detail, url: url); Button(action, action: review) }
+        }.padding(.vertical, 4)
     }
 
     private func row(_ title: String, detail: String, url: URL) -> some View {
@@ -824,14 +910,22 @@ private struct RefreshCard: View {
 private struct CopyKitCard: View {
     let open: () -> Void
     var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            KitCardHeader(symbol: "externaldrive.badge.plus", title: "Copy my kit",
-                          subtitle: "Make a copy for someone else on a drive or in a folder, with the app, checked file by file. " + Self.privacyNote)
-            Spacer()
-            Button("Copy My Kit…", action: open).buttonStyle(.borderedProminent)
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: 14) {
+                heading.frame(minWidth: 300)
+                Spacer()
+                copyButton
+            }
+            VStack(alignment: .leading, spacing: 14) { heading; copyButton }
         }
         .card(padding: 18)
     }
+
+    private var heading: some View {
+        KitCardHeader(symbol: "externaldrive.badge.plus", title: "Copy my kit",
+                      subtitle: "Make a checked copy on another drive or in a folder, including the app. " + Self.privacyNote)
+    }
+    private var copyButton: some View { Button("Copy My Kit…", action: open).buttonStyle(.borderedProminent) }
 
     /// Where the private household details are, which the copy never includes.
     static var privacyNote: String {

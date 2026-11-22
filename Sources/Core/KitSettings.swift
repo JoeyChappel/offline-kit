@@ -85,16 +85,44 @@ final class KitSettings: @unchecked Sendable {
     func stringArray(forKey key: String) -> [String]? { get(key) as? [String] }
     func bool(forKey key: String) -> Bool? { get(key) as? Bool }
 
+    /// Drive mode keeps the whole plist in one file, so a setting changed on every keystroke (calculator inputs, the
+    /// power-out checklist) would rewrite it each time. Changes are held in memory and written together once they
+    /// stop for this long. `flush()` writes at once: the app calls it when quitting, going to the background and
+    /// before a drive is ejected.
+    static let writeDelay: TimeInterval = 0.5
+    private let writeLock = NSLock()
+    private var dirty = false
+    private var pendingWrite: DispatchWorkItem?
+
     func set(_ value: Any?, forKey key: String) {
-        guard let fileURL else {
+        guard fileURL != nil else {
             UserDefaults.standard.set(value, forKey: key)
             return
         }
-        let snapshot: [String: Any] = lock.withLock {
+        lock.withLock {
             values[key] = value
-            return values
+            dirty = true
+            pendingWrite?.cancel()
+            let item = DispatchWorkItem { [weak self] in self?.flush() }
+            pendingWrite = item
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.writeDelay, execute: item)
         }
-        if let data = try? PropertyListSerialization.data(fromPropertyList: snapshot, format: .xml, options: 0) {
+    }
+
+    /// Writes any change still waiting for its debounce, now. Cheap when nothing is waiting.
+    func flush() {
+        guard let fileURL else { return }
+        // One write at a time, and the snapshot is taken inside the write lock, so an older snapshot never lands last.
+        writeLock.withLock {
+            let snapshot: [String: Any]? = lock.withLock {
+                pendingWrite?.cancel()
+                pendingWrite = nil
+                guard dirty else { return nil }
+                dirty = false
+                return values
+            }
+            guard let snapshot,
+                  let data = try? PropertyListSerialization.data(fromPropertyList: snapshot, format: .xml, options: 0) else { return }
             try? data.write(to: fileURL, options: .atomic)
         }
     }

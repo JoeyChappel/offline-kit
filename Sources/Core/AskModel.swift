@@ -14,7 +14,7 @@ enum EngineChoice: String, CaseIterable, Identifiable {
     }
 }
 
-struct Turn: Identifiable {
+struct Turn: Identifiable, Equatable {
     enum Status { case searching, answering, done, failed, stopped }
     let id = UUID()
     let question: String
@@ -36,6 +36,8 @@ struct Turn: Identifiable {
     var noted: [Memory] = []
     /// When the first search missed and a corrected or reworded search was used instead.
     var searchedFor: String?
+    /// True while the built-in answer model is still loading into memory, before the first words arrive.
+    var waking = false
 }
 
 @MainActor @Observable
@@ -155,7 +157,7 @@ final class AskModel {
     /// The answer model Ask will use, in plain words, with its technical name for a tooltip.
     func engineLabel(libraryFolders: [URL]) -> (name: String, detail: String) {
         let ollamaReady = !(ollamaModels ?? []).isEmpty
-        let builtIn = LocalModels.selected(libraryFolders: libraryFolders, id: builtInModel)
+        let builtIn = LocalModels.selected(in: installedBuiltIn(libraryFolders: libraryFolders), id: builtInModel)
         let larger = ("Answer model (larger)", "Ollama · \(ollamaModel)")
         let apple = ("Apple Intelligence", "Apple Intelligence on-device model")
         let mine = builtIn.map { ("Answer model", "Offline Kit answer model · \($0.shortName)") }
@@ -170,19 +172,57 @@ final class AskModel {
         }
     }
 
-    func refreshOllama() async {
+    /// Installed model files are listed from disk; a label redrawn on every keystroke shouldn't do that each time.
+    private var installedCache: (folders: [URL], at: Date, models: [InstalledModel])?
+
+    private func installedBuiltIn(libraryFolders: [URL]) -> [InstalledModel] {
+        if let cache = installedCache, cache.folders == libraryFolders, Date().timeIntervalSince(cache.at) < 5 {
+            return cache.models
+        }
+        let models = LocalModels.installed(libraryFolders: libraryFolders)
+        installedCache = (libraryFolders, Date(), models)
+        return models
+    }
+
+    /// The last look at what Ollama has installed, so a question doesn't wait on a probe (up to 2 seconds
+    /// when the home computer is away) every time.
+    private var ollamaProbe: (host: String, models: [String]?, at: Date)?
+    private static let ollamaProbeLifetime: TimeInterval = 30
+
+    private func probeOllama(host: URL, force: Bool) async -> [String]? {
+        if !force, let probe = ollamaProbe, probe.host == host.absoluteString,
+           Date().timeIntervalSince(probe.at) < Self.ollamaProbeLifetime {
+            return probe.models
+        }
+        let models = await OllamaEngine.installedModels(host: host)
+        ollamaProbe = (host.absoluteString, models, Date())
+        return models
+    }
+
+    /// Looks for Ollama. `force: false` accepts a result from the last 30 seconds; Check Again always asks.
+    func refreshOllama(force: Bool = true) async {
         guard let url = URL(string: ollamaHost) else { ollamaModels = nil; return }
-        ollamaModels = await OllamaEngine.installedModels(host: url)
+        ollamaModels = await probeOllama(host: url, force: force)
         if let models = ollamaModels, !models.isEmpty, !models.contains(ollamaModel) {
             ollamaModel = models[0]
         }
     }
 
+    /// Loads the built-in answer model in the background when Ask would use it, so the first question
+    /// doesn't wait for it. Call once Ollama has been looked for.
+    func preloadIfNeeded(libraryFolders: [URL]) {
+        guard choice == .builtIn || (choice == .auto && (ollamaModels ?? []).isEmpty),
+              let installed = LocalModels.selected(in: installedBuiltIn(libraryFolders: libraryFolders), id: builtInModel)
+        else { return }
+        LlamaEngine(model: installed).preload(instructions: Self.instructions)
+    }
+
     /// Picks an engine. Automatic prefers Ollama (bigger model and context) when it's running.
     func resolveEngine() async -> AnswerEngine? {
+        // Only Automatic and Ollama look for Ollama; the other choices never wait on it.
         let ollama: AnswerEngine? = await {
-            guard let url = URL(string: ollamaHost),
-                  let models = await OllamaEngine.installedModels(host: url), !models.isEmpty else { return nil }
+            guard choice == .auto || choice == .ollama, let url = URL(string: ollamaHost),
+                  let models = await probeOllama(host: url, force: false), !models.isEmpty else { return nil }
             let model = models.contains(ollamaModel) ? ollamaModel : models[0]
             return OllamaEngine(host: url, model: model)
         }()
@@ -263,7 +303,12 @@ final class AskModel {
 
         task = Task { [weak self] in
             guard let self else { return }
-            defer { if self.requestID == request { self.task = nil } }
+            // The answer index builds in the background; it waits while a question is answered.
+            AnswerIndex.shared.beginAsk()
+            defer {
+                AnswerIndex.shared.endAsk()
+                if self.requestID == request { self.task = nil }
+            }
 
             // Asked while the library is still opening (a big USB drive takes a while): wait, then search all of it.
             while library.isLoading {
@@ -291,7 +336,12 @@ final class AskModel {
             turns[index].engine = engine.displayName
             turns[index].engineDetail = engine.technicalName
             turns[index].runsOnDevice = engine.runsOnDevice
+            // Start loading the built-in model now, and evaluating the instructions, while the library is searched.
+            (engine as? LlamaEngine)?.preload(instructions: Self.instructions)
 
+            // The household loads just after launch; a question asked in that moment waits for it.
+            await household?.ensureLoaded()
+            guard !Task.isCancelled, self.requestID == request else { return }
             let data = household?.data ?? HouseholdData(privacy: AskPrivacy(personalize: false))
             let context = AskContext.build(data, kit: kit, limit: engine.contextBudget)
             // Big models keep most of the conversation, so a scenario built up over several turns stays intact.
@@ -304,23 +354,24 @@ final class AskModel {
             var budget = max(2_000, engine.sourceBudget - (small ? context.count + earlier.count : 0))
             // Questions about the kit itself are answered from the kit description; a keyword search only adds noise.
             var sources: [Source] = []
+            // What the searches for this exact question found, per archive: a later pass reuses it.
+            var searched: [String: Retriever.Gathered] = [:]
             if !aboutKit, !medical.isEmpty {
-                sources = await Task.detached(priority: .userInitiated) { [budget] in
-                    Retriever.retrieve(question: retrievalQuestion, archives: medical, budgetChars: budget)
-                }.value
+                let result = await Retriever.retrieveConcurrently(question: retrievalQuestion, archives: medical, budgetChars: budget)
+                sources = result.sources
+                searched = result.gathered
             }
             if !aboutKit, Retriever.strength(sources, question: question) == 0 {
-                sources = await Task.detached(priority: .userInitiated) { [budget] in
-                    Retriever.retrieve(question: retrievalQuestion, archives: archives, budgetChars: budget)
-                }.value
+                let result = await Retriever.retrieveConcurrently(question: retrievalQuestion, archives: archives,
+                                                                  budgetChars: budget, reusing: searched)
+                sources = result.sources
+                searched = result.gathered
             }
             if Task.isCancelled { return }
             // A follow-up the bare question didn't answer: search it together with the question before it.
             if !aboutKit, searchText != question, Retriever.strength(sources, question: question) == 0 {
                 let merged = scope.map { "\($0.title): \(searchText)" } ?? searchText
-                let found = await Task.detached(priority: .userInitiated) { [budget] in
-                    Retriever.retrieve(question: merged, archives: archives, budgetChars: budget)
-                }.value
+                let found = await Retriever.retrieveConcurrently(question: merged, archives: archives, budgetChars: budget).sources
                 if Retriever.strength(found, question: searchText) > 0 { sources = found }
             }
             if Task.isCancelled { return }
@@ -333,9 +384,7 @@ final class AskModel {
                 var best = 0
                 for alternative in alternatives where !Task.isCancelled {
                     let query = scope.map { "\($0.title): \(alternative)" } ?? alternative
-                    let found = await Task.detached(priority: .userInitiated) { [budget] in
-                        Retriever.retrieve(question: query, archives: archives, budgetChars: budget)
-                    }.value
+                    let found = await Retriever.retrieveConcurrently(question: query, archives: archives, budgetChars: budget).sources
                     let strength = Retriever.strength(found, question: alternative)
                     if strength > best {
                         best = strength
@@ -354,9 +403,9 @@ final class AskModel {
                     guard !Task.isCancelled, self.requestID == request else { return }
                     waited += 1
                 }
-                let found = await Task.detached(priority: .userInitiated) { [budget] in
-                    Retriever.retrieve(question: retrievalQuestion, archives: archives, budgetChars: budget)
-                }.value
+                // Same question as the first search: only the PDF pages and guide are new, so reuse the archive searches.
+                let found = await Retriever.retrieveConcurrently(question: retrievalQuestion, archives: archives,
+                                                                 budgetChars: budget, reusing: searched).sources
                 if Task.isCancelled { return }
                 if Retriever.strength(found, question: question) > 0 { sources = found }
             }
@@ -365,14 +414,28 @@ final class AskModel {
 
             var current = sources
             var history = earlier
+            // The built-in model may still be loading: say so instead of looking stuck.
+            if let llama = engine as? LlamaEngine { turns[index].waking = !llama.isReady }
             for attempt in 0..<3 {
+                // The answer is shown about ten times a second, not on every token: each change redraws the answer.
+                var lastShown = Date.distantPast
+                var unshown: String?
                 do {
                     let prompt = Self.prompt(question: question, sources: current, context: context, history: history)
                     for try await text in engine.stream(instructions: instructions, prompt: prompt) {
                         if Task.isCancelled { break }
-                        turns[index].answer = text
+                        if turns[index].waking { turns[index].waking = false }
+                        let now = Date()
+                        if now.timeIntervalSince(lastShown) >= Self.answerRefresh {
+                            turns[index].answer = text
+                            lastShown = now
+                            unshown = nil
+                        } else {
+                            unshown = text
+                        }
                     }
                     guard !Task.isCancelled else { return }
+                    if let unshown { turns[index].answer = unshown }
                     turns[index].status = .done
                     turns[index].finished = Date()
                     household?.log(question: question, answer: turns[index].answer, sources: current.map(\.ref.title))
@@ -402,6 +465,7 @@ final class AskModel {
                     }
                 } catch {
                     if Task.isCancelled { break }
+                    if let unshown, turns.indices.contains(index) { turns[index].answer = unshown }
                     if AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error) {
                         fail(index, Self.tooLongMessage)
                     } else {
@@ -415,6 +479,9 @@ final class AskModel {
         }
         return true
     }
+
+    /// Seconds between redraws of a streaming answer.
+    private static let answerRefresh: TimeInterval = 0.1
 
     private static let tooLongMessage = "That conversation got too long for the answer model. Start a new conversation and ask again."
 

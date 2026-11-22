@@ -184,7 +184,10 @@ final class KitRefresh {
                 return (try? ZimArchive(path: newURL.path)) != nil
             }.value
             pending.removeAll { $0 == item }
-            if opens {
+            if opens && !Self.isReplaceable(old: URL(fileURLWithPath: item.oldPath), new: newURL) {
+                // The saved list can come from a drive's settings file, so it's never trusted to name what to delete.
+                log.append("\(item.title): updated to \(newURL.lastPathComponent). The old version was left in place.")
+            } else if opens {
                 let removed = await Task.detached { KitCheckup.remove([URL(fileURLWithPath: item.oldPath)]) }.value
                 log.append(removed.failed.isEmpty
                            ? "\(item.title): updated to \(newURL.lastPathComponent). The old version was deleted."
@@ -195,6 +198,17 @@ final class KitRefresh {
             onReplaced?()
         }
         savePending()
+    }
+
+    /// Only an ordinary archive file beside the new download may be deleted: never a folder, a link or anything elsewhere.
+    nonisolated static func isReplaceable(old: URL, new: URL) -> Bool {
+        let old = old.standardizedFileURL, new = new.standardizedFileURL
+        guard old.path != new.path,
+              old.pathExtension.lowercased() == "zim",
+              old.deletingLastPathComponent().path == new.deletingLastPathComponent().path,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: old.path),   // doesn't follow links
+              attributes[.type] as? FileAttributeType == .typeRegular else { return false }
+        return true
     }
 
     private func savePending() {

@@ -61,6 +61,34 @@ final class EPUBSchemeHandler: NSObject, WKURLSchemeHandler {
     func webView(_ webView: WKWebView, stop task: any WKURLSchemeTask) {}
 }
 
+/// Runs the last thing it was given a moment after the calls stop, or right away on `flush()`.
+/// Page turns and scrolling come in bursts; only where they ended up needs saving.
+@MainActor
+final class DebouncedAction {
+    private var task: Task<Void, Never>?
+    private var action: (@MainActor () -> Void)?
+
+    func schedule(after seconds: Double = 0.8, _ action: @escaping @MainActor () -> Void) {
+        self.action = action
+        task?.cancel()
+        task = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard !Task.isCancelled else { return }
+            self?.flush()
+        }
+    }
+
+    func cancel() { task?.cancel(); task = nil; action = nil }
+
+    func flush() {
+        task?.cancel()
+        task = nil
+        let pending = action
+        action = nil
+        pending?()
+    }
+}
+
 @MainActor @Observable
 final class EPUBReaderModel {
     let item: MediaItem
@@ -75,6 +103,7 @@ final class EPUBReaderModel {
     var theme: ReaderTheme { didSet { KitSettings.shared.set(theme.rawValue, forKey: "readerTheme") } }
     var textScale: Double { didSet { KitSettings.shared.set(String(textScale), forKey: "readerTextScale") } }
     @ObservationIgnored weak var media: MediaLibrary?
+    @ObservationIgnored private let saver = DebouncedAction()
 
     init(item: MediaItem) {
         self.item = item
@@ -109,7 +138,11 @@ final class EPUBReaderModel {
     }
 
     /// Saves the chapter and how far down it they are. Reaching the end of the last chapter marks the book read.
-    func save() {
+    /// Scrolling reports many times a second, so the save waits for it to settle (and happens at once when the book closes).
+    func save() { saver.schedule { [weak self] in self?.saveNow() } }
+
+    func saveNow() {
+        saver.cancel()
         guard let media, let book else { return }
         let done = chapter == book.chapters.count - 1 && fraction > 0.97
         media.saveProgress(MediaProgress(track: chapter, seconds: done ? 0 : fraction, finished: done), for: item)
@@ -174,7 +207,7 @@ private struct EPUBReaderView: View {
             }
         }
         .onAppear { model.start(media: media) }
-        .onDisappear { model.save() }
+        .onDisappear { model.saveNow() }
         // ⌘= is the same key as ⌘+ without Shift; both make the text larger.
         .background {
             Button("Larger Text") { model.textScale = min(2.2, model.textScale + 0.1) }
@@ -233,7 +266,9 @@ private struct EPUBWebView: PlatformViewRepresentable {
         web.isOpaque = false
         #endif
         context.coordinator.web = web
-        context.coordinator.load()
+        // Books are read offline: images, fonts or scripts in a book never load from the internet.
+        let coordinator = context.coordinator
+        OfflineContentBlocker.apply(to: web) { coordinator.ready = true; coordinator.load() }
         return web
     }
 
@@ -265,7 +300,11 @@ private struct EPUBWebView: PlatformViewRepresentable {
         }
 
         /// Follows chapter changes from the bar and menu, and restyles when the theme or text size changes.
+        /// False until the offline blocker is in place; nothing loads before then.
+        var ready = false
+
         func sync() {
+            guard ready else { return }
             if model.chapter != loadedChapter { load() } else if model.css != appliedCSS { applyStyle() }
         }
 
@@ -348,11 +387,13 @@ private struct PDFBookView: View {
     @State private var document: PDFDocument?
     @State private var loaded = false
     @State private var state = PDFReaderState()
+    @State private var saver = DebouncedAction()
     var body: some View {
         Group {
             if let document {
                 PDFBookKitView(document: document, startPage: media.progress[item.progressKey].map { $0.finished ? 0 : $0.track } ?? 0, state: state) { page, count in
-                    media.saveProgress(MediaProgress(track: page, seconds: 0, finished: page >= count - 1 && count > 1), for: item)
+                    // Flipping through pages saves where it stops, not every page on the way.
+                    saver.schedule { media.saveProgress(MediaProgress(track: page, seconds: 0, finished: page >= count - 1 && count > 1), for: item) }
                 }
                 .overlay(alignment: .bottom) {
                     if state.count > 0 {
@@ -388,6 +429,7 @@ private struct PDFBookView: View {
             Button("Zoom In") { state.zoomIn() }
                 .keyboardShortcut("=", modifiers: .command).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
         }
+        .onDisappear { saver.flush() }
         .task(id: item.id) {
             let url = item.tracks[0]
             // Read off the main thread: a big PDF takes a moment to open.

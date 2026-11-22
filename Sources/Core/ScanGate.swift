@@ -48,5 +48,5 @@ final class KitChanges {
     private(set) var models = 0
 
     func documentsChanged() { documents += 1 }
-    func modelsChanged() { models += 1 }
+    func modelsChanged() { LocalModels.invalidateInstalledCache(); models += 1 }
 }

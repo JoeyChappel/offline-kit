@@ -23,17 +23,31 @@ struct MediaForestBackground: View {
         }
         .task {
             guard image == nil else { return }
-            let result = await Task.detached(priority: .utility) { () -> CGImage? in
-                guard let url = Bundle.main.url(forResource: "watch-forest", withExtension: "jpg"),
-                      let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
-                return CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                                                                       kCGImageSourceThumbnailMaxPixelSize: 1920,
-                                                                       kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
-            }.value
+            let result = await ForestImage.load()
             guard !Task.isCancelled else { return }
             image = result
         }
         .accessibilityHidden(true)
         .allowsHitTesting(false)
+    }
+}
+
+/// The forest picture, decoded once and shared by every screen. Each visit to Watch, Listen or Books used to decode its
+/// own copy (about 6 MB each) and the old ones stayed in memory, so browsing grew the app by that much per visit.
+private enum ForestImage {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var shared: CGImage?
+
+    static func load() async -> CGImage? {
+        if let hit = lock.withLock({ shared }) { return hit }
+        let decoded = await Task.detached(priority: .utility) { () -> CGImage? in
+            guard let url = Bundle.main.url(forResource: "watch-forest", withExtension: "jpg"),
+                  let source = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+            return CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                                                   kCGImageSourceThumbnailMaxPixelSize: 1920,
+                                                                   kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
+        }.value
+        if let decoded { lock.withLock { shared = decoded } }
+        return decoded
     }
 }

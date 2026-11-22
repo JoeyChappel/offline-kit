@@ -127,6 +127,8 @@ enum GameSystem: String, CaseIterable, Codable, Identifiable {
         }
     }
     var hasShoulderButtons: Bool { self == .gameBoyAdvance }
+    /// Consoles whose emulator reads a second controller (libretro port 1), so a phone can join as player 2.
+    var supportsSecondPlayer: Bool { self == .nes || self == .pcEngine }
     /// "a Game Boy game", "an NES game", for sentences.
     var aGame: String { [.nes, .atari2600].contains(self) ? "an \(name) game" : "a \(name) game" }
 
@@ -185,11 +187,14 @@ struct Game: Identifiable, Hashable {
     /// A saved place or an autosave exists, so Resume can pick the game up again.
     var canResume: Bool { system.hasSaveStates && resumeStateURL != nil }
     /// The newer of the saved place and the autosave.
-    var resumeStateURL: URL? {
-        [stateURL, autosaveURL].compactMap { url -> (URL, Date)? in
+    var resumeStateURL: URL? { resumeState?.url }
+    /// The newer save and when it was written, from one look at the disk (shelves need both for every game).
+    var resumeState: (url: URL, date: Date)? {
+        guard system.hasSaveStates else { return nil }
+        return [stateURL, autosaveURL].compactMap { url -> (url: URL, date: Date)? in
             guard let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { return nil }
             return (url, date)
-        }.max { $0.1 < $1.1 }?.0
+        }.max { $0.date < $1.date }
     }
 
     /// Saves from before they were named after the whole file name ("Tetris.srm") move to the new names. When two
@@ -352,14 +357,54 @@ final class GameLibrary {
     /// Bumped by favorites and play history saved here, so a scan that read the files before the change
     /// doesn't put the old values back.
     @ObservationIgnored private var edits = 0
+    /// What the Games folders looked like at the last scan (see reloadIfChanged).
+    @ObservationIgnored private var lastSignature: [String]?
 
     /// Rescans every Games folder. When it returns, `games` reflects the folders as they were after this call was made.
     func reload(library: Library) async {
         await scans.run { [weak self] in await self?.scan(library: library) }
     }
 
+    /// Rescans only when a Games folder (or a folder directly inside one) has changed since the last scan.
+    /// The check is a handful of stat calls, so it is cheap enough for window activation.
+    func reloadIfChanged(library: Library) async {
+        let folders = folders(from: library)
+        let signature = await Task.detached(priority: .utility) { Self.folderSignature(folders) }.value
+        guard signature != lastSignature else { return }
+        await reload(library: library)
+    }
+
+    /// Folder paths with the modification dates of each folder, its console subfolders and ScummVM game folders.
+    /// Adding, removing or renaming a game changes the date of the folder that holds it.
+    nonisolated static func folderSignature(_ folders: [URL]) -> [String] {
+        let fm = FileManager.default
+        func stamp(_ url: URL) -> String {
+            let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            return "\(url.path)@\(date?.timeIntervalSinceReferenceDate ?? 0)"
+        }
+        var result: [String] = []
+        for folder in folders {
+            result.append(stamp(folder))
+            guard let children = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey, .contentModificationDateKey],
+                                                             options: [.skipsHiddenFiles]) else { continue }
+            for child in children.sorted(by: { $0.path < $1.path }) where child.lastPathComponent != "Saves" {
+                guard (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { continue }
+                result.append(stamp(child))
+                guard child.lastPathComponent.caseInsensitiveCompare("ScummVM") == .orderedSame,
+                      let inner = try? fm.contentsOfDirectory(at: child, includingPropertiesForKeys: [.isDirectoryKey],
+                                                              options: [.skipsHiddenFiles]) else { continue }
+                for item in inner.sorted(by: { $0.path < $1.path }) where (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                    result.append(stamp(item))
+                }
+            }
+        }
+        return result
+    }
+
     private func scan(library: Library) async {
         let folders = folders(from: library)
+        // Taken before reading, so a change made during the scan makes the next check scan again.
+        let signature = await Task.detached(priority: .userInitiated) { Self.folderSignature(folders) }.value
         let editsBefore = edits
         let result = await Task.detached(priority: .userInitiated) {
             let games = Self.scan(folders)
@@ -373,6 +418,7 @@ final class GameLibrary {
             return (games, favorites, recent)
         }.value
         games = result.0
+        lastSignature = signature
         if edits == editsBefore {
             favorites = result.1
             lastPlayed = result.2
@@ -644,13 +690,31 @@ final class GameLibrary {
 
 // MARK: - Session
 
+/// Where a streamed game's picture and sound go instead of a window and the speakers (Share on Wi-Fi plays games on a
+/// phone's browser this way). Both are called on the emulation thread and must return quickly.
+protocol GameStreamSink: AnyObject, Sendable {
+    func streamFrame(_ image: CGImage)
+    /// Interleaved stereo 16-bit samples at the core's sample rate.
+    func streamAudio(_ samples: UnsafePointer<Int16>, frames: Int)
+}
+
 /// Thread-safe flags shared with the emulation thread.
 private final class SessionControl: @unchecked Sendable {
-    private let lock = NSLock()
+    private let lock = NSCondition()
     private var _running = true
     private var _paused = false
-    var running: Bool { get { lock.withLock { _running } } set { lock.withLock { _running = newValue } } }
-    var paused: Bool { get { lock.withLock { _paused } } set { lock.withLock { _paused = newValue } } }
+    var running: Bool {
+        get { lock.withLock { _running } }
+        set { lock.withLock { _running = newValue; lock.broadcast() } }
+    }
+    var paused: Bool {
+        get { lock.withLock { _paused } }
+        set { lock.withLock { _paused = newValue; lock.broadcast() } }
+    }
+    /// Blocks the emulation thread while the game is paused; returns when it resumes or stops.
+    func waitWhilePaused() {
+        lock.withLock { while _paused && _running { lock.wait() } }
+    }
     let done = DispatchSemaphore(value: 0)
 
     /// Whether the audio engine is actually running. The emulation thread only paces itself by how much audio is
@@ -792,10 +856,17 @@ final class GameSession {
     /// The autosave from before this session is kept once as ".prev" before the first time it's replaced.
     @ObservationIgnored private var backedUpAutosave = false
     @ObservationIgnored private var resumeSavedState: Bool
+    /// Set for a game streamed to another device: frames and sound go here, and nothing plays on this Mac's speakers.
+    let streamSink: GameStreamSink?
+    /// Told about each message shown over the game ("Saved your place"), for a streamed game's device.
+    @ObservationIgnored var onToast: ((String) -> Void)?
+    /// Told when the game stops, with the reason when it stopped by itself (it ended, or another game started).
+    @ObservationIgnored var onStop: ((Ending?) -> Void)?
 
-    init(game: Game, resumeSavedState: Bool = false) {
+    init(game: Game, resumeSavedState: Bool = false, streamSink: GameStreamSink? = nil) {
         self.game = game
         self.resumeSavedState = resumeSavedState
+        self.streamSink = streamSink
         #if DEBUG
         // Test hook: -autoResume YES opens -autoPlay games at their saved place, as Resume does.
         if UserDefaults.standard.bool(forKey: "autoResume") { self.resumeSavedState = true }
@@ -860,7 +931,8 @@ final class GameSession {
             }
             backedUpAutosave = false
             savesFailing = false
-            startAudio(core)
+            // A streamed game's sound goes to the device playing it (see startThread), not this Mac's speakers.
+            if streamSink == nil { startAudio(core) }
             startThread(core)
             autosave = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.writeBatterySave() }
@@ -916,6 +988,7 @@ final class GameSession {
         core?.messageHandler = nil
         core = nil
         if GameSession.current === self { GameSession.current = nil }
+        onStop?(reason)
     }
 
     /// Starts again from the beginning (after the game ended, or with new DOS controls).
@@ -940,8 +1013,18 @@ final class GameSession {
     func setPaused(_ paused: Bool) {
         isPaused = paused
         autoPaused = false
-        control.paused = paused
-        if paused { core?.releaseAllButtons() }
+        if paused {
+            control.paused = true
+            core?.releaseAllButtons()
+            // Nothing is drawn or heard while paused, so the sound engine rests too.
+            engine?.pause()
+            control.audioRunning = false
+        } else {
+            // Anything left in the queue is from before the pause; the engine used to drain it while paused.
+            core?.clearAudio()
+            restartAudio()
+            control.paused = false
+        }
     }
 
     /// The window went to the back (paused) or came forward again (carries on, unless the player paused it).
@@ -958,6 +1041,15 @@ final class GameSession {
     func reset() { withCore { $0.reset() } }
 
     func set(_ button: RetroButton, _ pressed: Bool) { core?.setButton(button, pressed: pressed) }
+    /// A button for player 1 or 2 (a phone used as a second controller; see GameSystem.supportsSecondPlayer).
+    func set(_ button: RetroButton, _ pressed: Bool, player: Int) {
+        core?.setButton(button, pressed: pressed, port: player == 2 ? 1 : 0)
+    }
+    /// Lets go of one player's buttons (their controller went away).
+    func releasePlayer(_ player: Int) { core?.releaseButtons(onPort: player == 2 ? 1 : 0) }
+    /// The core's sound rate and frame rate, once the game has started.
+    var sampleRate: Double { core?.sampleRate ?? 0 }
+    var framesPerSecond: Double { core?.framesPerSecond ?? 0 }
 
     // Keyboard and mouse (DOS and ScummVM). RetroCore queues these for the emulation thread.
     func key(_ keycode: UInt32, down: Bool, character: UInt32 = 0, modifiers: UInt16 = 0) {
@@ -1091,6 +1183,7 @@ final class GameSession {
 
     private func flash(_ text: String) {
         toast = text
+        onToast?(text)
         #if DEBUG
         // Test hook: -toastLog <path> keeps every message shown over the game, one per line.
         if let path = UserDefaults.standard.string(forKey: "toastLog"),
@@ -1109,6 +1202,7 @@ final class GameSession {
     /// Called on the emulation thread; drops frames rather than queueing if the main thread is busy.
     /// Only the newest picture is kept, and at most one hop to the main thread is waiting at a time.
     nonisolated private func present(_ image: CGImage) {
+        streamSink?.streamFrame(image)
         guard control.submit(image) else { return }
         Task { @MainActor [weak self] in
             guard let self, let image = control.takeLatest() else { return }
@@ -1133,23 +1227,36 @@ final class GameSession {
     private func startThread(_ core: RetroCore) {
         let control = self.control, lock = coreLock
         let rate = core.sampleRate
+        let sink = streamSink
+        // The core is used only by this thread from here on (UI calls go through RetroCore's own locks and atomics).
+        nonisolated(unsafe) let core = core
         let thread = Thread { [weak self] in
+            // Streaming: each frame's sound is handed straight to the device's connection. The game is paced by the
+            // clock alone (audioRunning stays false), and the device keeps its own small buffer.
+            let scratchFrames = 16_384
+            let scratch = sink == nil ? nil : UnsafeMutablePointer<Int16>.allocate(capacity: scratchFrames * 2)
+            defer { scratch?.deallocate() }
             var next = CACurrentMediaTime()
             while control.running {
                 if control.paused {
-                    Thread.sleep(forTimeInterval: 0.02)
+                    control.waitWhilePaused()
                     next = CACurrentMediaTime()
                     continue
                 }
                 lock.lock()
                 core.runFrame()
                 lock.unlock()
-                control.addPlayed(1.0 / max(1, core.framesPerSecond))
+                if let sink, let scratch {
+                    let queued = min(core.queuedAudioFrames, scratchFrames)
+                    if queued > 0 { sink.streamAudio(scratch, frames: core.readAudio(scratch, frames: queued)) }
+                }
+                let frameTime = 1.0 / max(1, core.framesPerSecond)   // DOS games change frame rate with video mode
+                control.addPlayed(frameTime)
                 if core.shutdownRequested {
                     Task { @MainActor in self?.coreFinished() }
                     break
                 }
-                next += 1.0 / max(1, core.framesPerSecond)   // DOS games change frame rate with video mode
+                next += frameTime
                 // Keep about 60 ms of audio queued so sound neither stutters nor lags.
                 // Only when the engine is draining the queue: with no sound running it would never empty.
                 if control.audioRunning {
@@ -1198,7 +1305,7 @@ final class GameSession {
     }
 
     private func restartAudio() {
-        guard let engine else { return }
+        guard let engine, !isPaused else { return }
         if !engine.isRunning {
             do { try engine.start() } catch {
                 control.audioRunning = false

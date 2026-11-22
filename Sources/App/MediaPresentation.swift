@@ -28,14 +28,14 @@ struct MediaArtwork: View {
     @State private var image: CGImage?
     /// True while the picture is being read, so the poster gradient shimmers until it fades in.
     @State private var decoding = false
+    @State private var shownPath: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// A chosen or folder cover wins over the automatic video still or embedded art.
     private var path: String? { item.cover?.path ?? info?.thumb }
     /// Changes when a cover file is replaced in place, so the new picture loads.
     private var reloadKey: String {
         guard let path else { return "" }
-        let modified = (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-        return "\(path)|\(modified?.timeIntervalSince1970 ?? 0)|\(CoverStamp.shared.value)"
+        return "\(path)|\(ImageCache.shared.stamp(path))|\(CoverStamp.shared.value)"
     }
     var body: some View {
         GeometryReader { geo in
@@ -60,19 +60,26 @@ struct MediaArtwork: View {
             // clipped() only trims what's drawn. A cover scaled to fill (a tall book cover across a wide banner) still
             // takes clicks far outside its frame, which made the Books genre tiles above the banner unclickable.
             .contentShape(Rectangle())
-        }
-        .task(id: reloadKey) {
-            image = nil
-            guard let path else { decoding = false; return }
-            decoding = true
-            let result = await Task.detached(priority: .utility) { () -> CGImage? in
-                guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
-                return CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 960, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
-            }.value
-            guard !Task.isCancelled else { return }
-            withAnimation(Motion.gentle(reduceMotion)) { image = result; decoding = false }
+            // Reloads when the file or the size bucket changes; the shared cache makes a repeat a lookup, not a decode.
+            .task(id: "\(reloadKey)|\(ImageCache.pixels(forPoints: max(geo.size.width, geo.size.height)))|\(geo.size.width > 0)") {
+                await load(pixels: ImageCache.pixels(forPoints: max(geo.size.width, geo.size.height)), laidOut: geo.size.width > 0)
+            }
         }
         .accessibilityHidden(true)
+    }
+
+    private func load(pixels: Int, laidOut: Bool) async {
+        guard let path else { image = nil; decoding = false; return }
+        // Not measured yet: wait for the real size rather than decode twice.
+        guard laidOut else { return }
+        if let hit = ImageCache.shared.cached(path, pixels: pixels) { image = hit; decoding = false; return }
+        // Keep what's showing while a different size loads; a different picture starts from the poster.
+        if shownPath != path { image = nil }
+        decoding = true
+        let result = await ImageCache.shared.image(path, pixels: pixels)
+        guard !Task.isCancelled else { return }
+        shownPath = path
+        withAnimation(Motion.gentle(reduceMotion)) { image = result; decoding = false }
     }
 }
 

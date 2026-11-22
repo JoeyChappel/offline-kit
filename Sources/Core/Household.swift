@@ -102,7 +102,16 @@ struct HouseholdData: Codable {
 
 @MainActor @Observable
 final class Household {
-    var data: HouseholdData { didSet { scheduleSave() } }
+    var data: HouseholdData {
+        didSet {
+            scheduleSave()
+            // Badges read this instead of `data`, so typing in a household field doesn't redraw them.
+            let attention = data.extra.suppliesNeedingAttention()
+            if attention != suppliesAttention { suppliesAttention = attention }
+        }
+    }
+    /// How many supplies are expired or close to it (for the Prepare badge). Changes only when the count does.
+    private(set) var suppliesAttention = 0
     private(set) var saveError: String?
     @ObservationIgnored private var saveTask: Task<Void, Never>?
     /// True from an edit until its debounced write lands, so quitting can tell there is something to flush.
@@ -122,13 +131,45 @@ final class Household {
     @ObservationIgnored private var savesPaused = false
     @ObservationIgnored private var changedWhilePaused = false
 
+    /// False until the sealed details have been read (see `ensureLoaded`). Reading means a Keychain lookup and a decrypt,
+    /// so it happens after the first frame, off the main thread. Until then `data` is an empty household and nothing is saved.
+    private(set) var isLoaded = false
+    @ObservationIgnored private var loadTask: Task<Void, Never>?
+
     init() {
-        let locked = PrivateStore.isLocked
-        var loaded = (locked ? nil : PrivateStore.load(HouseholdData.self)) ?? HouseholdData()
-        Preparedness.addMissingDefaults(to: &loaded.checklist)
-        data = loaded
+        // Nothing here touches the Keychain or the disk: the first frame must not wait on them.
+        data = HouseholdData()
         Household.shared = self
+    }
+
+    /// Reads and decrypts the stored details off the main thread, once. Safe to call from several places: they all wait
+    /// for the same read. Views that need the details (the passphrase prompt, Prepare, Ask) call this first.
+    func ensureLoaded() async {
+        if isLoaded { return }
+        if let loadTask { await loadTask.value; return }
+        let task = Task { [weak self] in
+            let (locked, loaded) = await Task.detached(priority: .userInitiated) { () -> (Bool, HouseholdData?) in
+                let locked = PrivateStore.isLocked
+                return (locked, locked ? nil : PrivateStore.load(HouseholdData.self))
+            }.value
+            self?.finishLoading(locked: locked, loaded: loaded)
+        }
+        loadTask = task
+        await task.value
+    }
+
+    private func finishLoading(locked: Bool, loaded: HouseholdData?) {
+        guard !isLoaded else { return }
+        // A reload (passphrase change) that ran first has already read the store: keep its result.
+        var loaded = loaded ?? HouseholdData()
+        Preparedness.addMissingDefaults(to: &loaded.checklist)
+        isLoaded = true
         isLocked = locked
+        data = loaded
+        saveTask?.cancel()   // the assignment above isn't a change worth writing back
+        hasPendingSave = false
+        storeChanges += 1
+        loadTask = nil
     }
 
     // MARK: Passphrase (Mac, running from a drive; see PrivateStore)
@@ -186,6 +227,8 @@ final class Household {
     /// Writes any pending change now.
     private func flush() throws {
         guard !isLocked else { throw PrivateStore.PassphraseError.locked }
+        // Details not read yet: `data` is a placeholder and there is nothing to write.
+        guard isLoaded else { return }
         saveTask?.cancel()
         hasPendingSave = false
         try PrivateStore.save(data)
@@ -202,6 +245,7 @@ final class Household {
     private func reload() {
         saveTask?.cancel()
         hasPendingSave = false
+        isLoaded = true
         isLocked = PrivateStore.isLocked
         var loaded = (isLocked ? nil : PrivateStore.load(HouseholdData.self)) ?? HouseholdData()
         Preparedness.addMissingDefaults(to: &loaded.checklist)
@@ -257,7 +301,8 @@ final class Household {
 
     private func scheduleSave() {
         saveTask?.cancel()
-        guard !isLocked else { return }
+        // Before the stored details are read, `data` is a placeholder: writing it would erase the real ones.
+        guard isLoaded, !isLocked else { return }
         if savesPaused { changedWhilePaused = true; return }
         let snapshot = data
         hasPendingSave = true

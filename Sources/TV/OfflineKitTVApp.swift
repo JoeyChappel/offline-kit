@@ -8,6 +8,9 @@ struct OfflineKitTVApp: App {
         WindowGroup {
             TVRootView()
                 .environment(store)
+                #if DEBUG
+                .onAppear { LaunchTiming.firstAppear() }
+                #endif
                 .task { await store.start() }
         }
     }

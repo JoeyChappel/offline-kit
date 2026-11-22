@@ -131,9 +131,12 @@ final class DownloadManager {
     }
 
     /// Picks up partial downloads left in these folders (app quit, Mac slept, drive unplugged).
-    func restore(from folders: [URL]) {
-        for folder in folders + folders.map(LocalModels.folder(forLibrary:)) {
-            for saved in ChunkedDownload.saved(in: folder)
+    /// The folders are read off the main thread (each partial download has a small state file to decode).
+    func restore(from folders: [URL]) async {
+        let all = folders + folders.map(LocalModels.folder(forLibrary:))
+        let found = await Task.detached(priority: .utility) { all.map { ($0, ChunkedDownload.saved(in: $0)) } }.value
+        for (folder, savedStates) in found {
+            for saved in savedStates
             where !jobs.contains(where: { $0.fileName == saved.meta.fileName && $0.folder == folder }) {
                 let model = LocalModels.all.first { $0.fileName == saved.meta.fileName }
                 // Single-file downloads (AI models) resume only from the app's own list of models, never from
@@ -152,13 +155,21 @@ final class DownloadManager {
         }
     }
 
+    @ObservationIgnored private var volumeIDs: [String: (id: AnyObject?, at: Date)] = [:]
+
     /// Bytes that queued, running and paused downloads still have to write to the same drive as `folder`.
     /// Free space only shrinks as they arrive, so the space check subtracts this up front.
     func bytesStillNeeded(on folder: URL) -> Int64 {
+        // Which drive a folder is on rarely changes, and finding it touches the disk: it's remembered for a while, since
+        // this runs on every download progress tick while the Get Resources screen is open.
         func volume(_ url: URL) -> AnyObject? {
+            let key = url.path
+            if let hit = volumeIDs[key], -hit.at.timeIntervalSinceNow < 30 { return hit.id }
             var probe = url
             while !FileManager.default.fileExists(atPath: probe.path) && probe.path != "/" { probe.deleteLastPathComponent() }
-            return (try? probe.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as AnyObject?
+            let id = (try? probe.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as AnyObject?
+            volumeIDs[key] = (id, Date())
+            return id
         }
         let target = volume(folder)
         return jobs.filter { job in

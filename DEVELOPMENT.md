@@ -99,6 +99,7 @@ Sidebar › Share on Wi-Fi turns the Mac into a small web server for phones, tab
   - The page in iPhone simulator Safari over the LAN address.
   - Not yet tested from a separate physical phone. The Mac's firewall prompt (if the firewall is on) hasn't been seen yet.
 - **Debug hooks:** `-shareOnLaunch YES` starts sharing without changing the saved setting, and `-sharePIN 1234` sets a PIN for that run.
+- **Connected Devices** (`ShareDevices.swift`, `ShareDevicesView.swift`, `NeighborTable.swift`; Share › Connected Devices…, ⇧⌘J): every client gets an HttpOnly `okdev` cookie and is told apart by MAC (neighbor tables), cookie, sign-in token, then IP + client kind. Blocking and "Ask before new devices connect" are checked in `ShareDevices.admit`, right after the Host check on both ports; refusals are 403 with `{"error": "blocked"|"waiting"}`, which the iPhone and Apple TV apps show (and poll while waiting). Approvals and the ask-first choice live in this Mac's own settings; a drive's settings can only add blocks or turn asking on. Debug hooks (test home): `-openDevices YES`, `-shareAskFirst YES`, `-devicesSelect <text>`, `-shareDeviceActions "20:block:Edge,30:signout:iPhone,40:allow:Android"`, `-neighborCheck YES` (logs neighbor counts and a digest to compare with `arp -an`/`ndp -an`).
 
 ## Drive mode
 

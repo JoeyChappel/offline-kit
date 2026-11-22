@@ -2,6 +2,7 @@
 #import <dlfcn.h>
 #import <os/lock.h>
 #import <stdatomic.h>
+#import <Accelerate/Accelerate.h>
 #import "libretro.h"
 
 // libretro callbacks have no context pointer, so they route through the one loaded core.
@@ -40,6 +41,69 @@ typedef struct {
 #define KEY_COUNT 512                 // covers RETROK_LAST
 #define KEY_QUEUE 256
 
+/// Pixel memory handed to a CGImage and taken back when the image is released, so a frame needs no allocation
+/// once a few are in flight (the main thread keeps the last one for as long as it's on screen).
+@class FramePool;
+@interface FrameBuffer : NSObject {
+@public
+    void *bytes;
+    size_t capacity;
+    FramePool *pool;
+}
+@end
+@interface FramePool : NSObject
+- (FrameBuffer *)takeBytes:(size_t)size;
+- (void)giveBack:(FrameBuffer *)buffer;
+- (void)close;
+@end
+
+@implementation FrameBuffer
+- (void)dealloc { free(bytes); }
+@end
+
+@implementation FramePool {
+    os_unfair_lock _lock;
+    NSMutableArray<FrameBuffer *> *_free;
+    BOOL _closed;
+}
+- (instancetype)init {
+    if ((self = [super init])) { _lock = OS_UNFAIR_LOCK_INIT; _free = [NSMutableArray array]; }
+    return self;
+}
+- (FrameBuffer *)takeBytes:(size_t)size {
+    FrameBuffer *found = nil;
+    os_unfair_lock_lock(&_lock);
+    while (_free.count > 0) {
+        FrameBuffer *candidate = _free.lastObject;
+        [_free removeLastObject];
+        if (candidate->capacity == size) { found = candidate; break; }   // wrong size (the core changed mode): let it go
+    }
+    os_unfair_lock_unlock(&_lock);
+    if (found) return found;
+    FrameBuffer *buffer = [FrameBuffer new];
+    buffer->bytes = malloc(size);
+    buffer->capacity = size;
+    buffer->pool = self;
+    return buffer->bytes ? buffer : nil;
+}
+- (void)giveBack:(FrameBuffer *)buffer {
+    os_unfair_lock_lock(&_lock);
+    if (!_closed && _free.count < 4) [_free addObject:buffer];
+    os_unfair_lock_unlock(&_lock);
+}
+- (void)close {
+    os_unfair_lock_lock(&_lock);
+    _closed = YES;
+    [_free removeAllObjects];
+    os_unfair_lock_unlock(&_lock);
+}
+@end
+
+static void ReleaseFrameBuffer(void *info, const void *data, size_t size) {
+    FrameBuffer *buffer = (__bridge_transfer FrameBuffer *)info;
+    [buffer->pool giveBack:buffer];
+}
+
 typedef struct { unsigned keycode; uint32_t character; uint16_t modifiers; bool down; } KeyEvent;
 
 @implementation RetroCore {
@@ -52,6 +116,7 @@ typedef struct { unsigned keycode; uint32_t character; uint16_t modifiers; bool 
     NSData *_gameData;
     NSDictionary<NSString *, NSData *> *_options;   // NUL-terminated values, so the core can keep the pointers
     atomic_uint _buttons;
+    atomic_uint _buttons2;             // player 2 (port 1), for a phone used as a second controller
     retro_keyboard_event_t _keyboardEvent;
     // Keyboard and mouse: written by the UI thread under _inputLock, taken by the emulation thread once per frame.
     os_unfair_lock _inputLock;
@@ -66,8 +131,7 @@ typedef struct { unsigned keycode; uint32_t character; uint16_t modifiers; bool 
     atomic_uint _mouseButtons;
     atomic_int _pointerX, _pointerY;
     atomic_bool _pointerPressed, _pointerActive;
-    uint32_t *_frame;
-    size_t _frameCapacity;
+    FramePool *_framePool;
     int16_t _audio[AUDIO_CAPACITY * 2];
     NSInteger _audioRead, _audioWrite, _audioCount;   // in frames
     os_unfair_lock _audioLock;
@@ -191,7 +255,13 @@ static void InputPollCallback(void) {}
 
 static int16_t InputStateCallback(unsigned port, unsigned device, unsigned index, unsigned id) {
     RetroCore *core = gCore;
-    if (!core || port != 0) return 0;
+    if (!core) return 0;
+    if (port == 1 && (device & RETRO_DEVICE_MASK) == RETRO_DEVICE_JOYPAD) {
+        unsigned mask = atomic_load(&core->_buttons2);
+        if (id == RETRO_DEVICE_ID_JOYPAD_MASK) return (int16_t)mask;
+        return (mask >> id) & 1;
+    }
+    if (port != 0) return 0;
     switch (device & RETRO_DEVICE_MASK) {
         case RETRO_DEVICE_JOYPAD: {
             unsigned mask = atomic_load(&core->_buttons);
@@ -298,6 +368,7 @@ static NSError *CoreError(NSString *message) {
         _audioLock = OS_UNFAIR_LOCK_INIT;
         _inputLock = OS_UNFAIR_LOCK_INIT;
         _colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        _framePool = [FramePool new];
 
         struct retro_system_info info = {0};
         _api.get_system_info(&info);
@@ -322,7 +393,7 @@ static NSError *CoreError(NSString *message) {
         _api.deinit();
         dlclose(_handle);
     }
-    free(_frame);
+    [_framePool close];
     if (_colorSpace) CGColorSpaceRelease(_colorSpace);
 }
 
@@ -389,8 +460,22 @@ static NSError *CoreError(NSString *message) {
     else atomic_fetch_and(&_buttons, ~bit);
 }
 
+- (void)setButton:(RetroButton)button pressed:(BOOL)pressed port:(unsigned)port {
+    if (port == 0) { [self setButton:button pressed:pressed]; return; }
+    if (port != 1) return;
+    unsigned bit = 1u << (unsigned)button;
+    if (pressed) atomic_fetch_or(&_buttons2, bit);
+    else atomic_fetch_and(&_buttons2, ~bit);
+}
+
+- (void)releaseButtonsOnPort:(unsigned)port {
+    if (port == 0) atomic_store(&_buttons, 0);
+    else if (port == 1) atomic_store(&_buttons2, 0);
+}
+
 - (void)releaseAllButtons {
     atomic_store(&_buttons, 0);
+    atomic_store(&_buttons2, 0);
     atomic_store(&_mouseButtons, 0);
     atomic_store(&_pointerPressed, false);
     // Lift held keys at the next frame (the key state belongs to the emulation thread).
@@ -485,48 +570,41 @@ static NSError *CoreError(NSString *message) {
 - (void)deliverFrame:(const void *)data width:(unsigned)width height:(unsigned)height pitch:(size_t)pitch {
     void (^handler)(CGImageRef) = self.frameHandler;
     if (!handler) return;
-    size_t needed = (size_t)width * height;
-    if (needed > _frameCapacity) {
-        free(_frame);
-        _frame = malloc(needed * 4);
-        _frameCapacity = needed;
+    size_t rowBytes = (size_t)width * 4;
+    FrameBuffer *buffer = [_framePool takeBytes:rowBytes * height];
+    if (!buffer) return;
+    // One pass from the core's memory into the buffer the image will own. 16-bit formats become ARGB8888 (big-endian
+    // byte order); the core's own XRGB8888 is already BGRA in memory on little-endian CPUs.
+    vImage_Buffer src = { (void *)data, height, width, pitch };
+    vImage_Buffer dst = { buffer->bytes, height, width, rowBytes };
+    CGBitmapInfo info = kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaNoneSkipFirst;
+    switch (_format) {
+        case RETRO_PIXEL_FORMAT_XRGB8888:
+            if (pitch == rowBytes) memcpy(buffer->bytes, data, rowBytes * height);
+            else vImageCopyBuffer(&src, &dst, 4, kvImageDoNotTile);
+            break;
+        case RETRO_PIXEL_FORMAT_RGB565:
+            vImageConvert_RGB565toARGB8888(255, &src, &dst, kvImageDoNotTile);
+            info = kCGBitmapByteOrder32Big | (CGBitmapInfo)kCGImageAlphaNoneSkipFirst;
+            break;
+        default:   // 0RGB1555
+            vImageConvert_ARGB1555toARGB8888(&src, &dst, kvImageDoNotTile);
+            info = kCGBitmapByteOrder32Big | (CGBitmapInfo)kCGImageAlphaNoneSkipFirst;
+            break;
     }
-    for (unsigned y = 0; y < height; y++) {
-        const uint8_t *row = (const uint8_t *)data + y * pitch;
-        uint32_t *out = _frame + (size_t)y * width;
-        switch (_format) {
-            case RETRO_PIXEL_FORMAT_XRGB8888:
-                memcpy(out, row, width * 4);
-                break;
-            case RETRO_PIXEL_FORMAT_RGB565: {
-                const uint16_t *px = (const uint16_t *)row;
-                for (unsigned x = 0; x < width; x++) {
-                    uint16_t p = px[x];
-                    uint32_t r = (p >> 11) & 0x1F, g = (p >> 5) & 0x3F, b = p & 0x1F;
-                    out[x] = 0xFF000000u | ((r << 3 | r >> 2) << 16) | ((g << 2 | g >> 4) << 8) | (b << 3 | b >> 2);
-                }
-                break;
-            }
-            default: {   // 0RGB1555
-                const uint16_t *px = (const uint16_t *)row;
-                for (unsigned x = 0; x < width; x++) {
-                    uint16_t p = px[x];
-                    uint32_t r = (p >> 10) & 0x1F, g = (p >> 5) & 0x1F, b = p & 0x1F;
-                    out[x] = 0xFF000000u | ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
-                }
-                break;
-            }
-        }
-    }
-    CFDataRef bytes = CFDataCreate(NULL, (const UInt8 *)_frame, (CFIndex)(needed * 4));
-    CGDataProviderRef provider = CGDataProviderCreateWithCFData(bytes);
-    CGImageRef image = CGImageCreate(width, height, 8, 32, width * 4, _colorSpace,
-                                     kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaNoneSkipFirst,
+    CGDataProviderRef provider = CGDataProviderCreateWithData((__bridge_retained void *)buffer, buffer->bytes,
+                                                              rowBytes * height, ReleaseFrameBuffer);
+    CGImageRef image = CGImageCreate(width, height, 8, 32, rowBytes, _colorSpace, info,
                                      provider, NULL, false, kCGRenderingIntentDefault);
     if (image) handler(image);
     CGImageRelease(image);
     CGDataProviderRelease(provider);
-    CFRelease(bytes);
+}
+
+- (void)clearAudio {
+    os_unfair_lock_lock(&_audioLock);
+    _audioRead = _audioWrite = _audioCount = 0;
+    os_unfair_lock_unlock(&_audioLock);
 }
 
 #pragma mark Audio

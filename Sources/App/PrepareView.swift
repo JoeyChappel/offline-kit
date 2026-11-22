@@ -84,6 +84,7 @@ struct PrepareView: View {
     /// A person whose Family plan card People asked to open.
     @State private var focusPerson: UUID?
     @State private var power = PowerOut.shared
+    @State private var showingSupplyPrivacy = false
 
     private static var startTab: PrepareTab {
         if PowerOut.shared.isActive { return .powerOut }
@@ -95,9 +96,17 @@ struct PrepareView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
                     if !Self.compactForTests {
-                        KitHeading(eyebrow: "PREPARE", title: "Get ready before you need it.",
-                                   subtitle: "Tell Offline Kit about your household and supplies so Ask can give answers that fit you.")
-                        PrivacyNote { open(.privacy) }
+                        if tab == .supplies {
+                            DisclosureGroup(isExpanded: $showingSupplyPrivacy) {
+                                PrivacyNote { open(.privacy) }.padding(.top, 8)
+                            } label: {
+                                Label("Private supply inventory", systemImage: "lock.fill").font(.callout).foregroundStyle(.secondary)
+                            }
+                        } else {
+                            KitHeading(eyebrow: "PREPARE", title: "Get ready before you need it.",
+                                       subtitle: "Tell Offline Kit about your household and supplies so Ask can give answers that fit you.")
+                            PrivacyNote { open(.privacy) }
+                        }
                     }
                     PowerOutBanner(onPowerOut: tab == .powerOut) { open(.powerOut) }
                     picker
@@ -105,7 +114,7 @@ struct PrepareView: View {
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 28)
-                .frame(maxWidth: 860, alignment: .leading)
+                .frame(maxWidth: tab == .supplies ? 1100 : 860, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
             .onChange(of: focusPerson) {

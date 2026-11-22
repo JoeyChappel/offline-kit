@@ -2,6 +2,7 @@ import Foundation
 
 // Test harness for the shared core: same retrieval and engines as the app.
 // usage: okit [--engine apple|ollama|builtIn|auto] [--model <id>] [--sources-only] "question"
+//        okit --bench <questions.txt> [--ttfw] [--out results.json]   retrieval and first-word timings
 //        okit --models                      list answer models (Models folders + ones used in place)
 //        okit --add-model <file.gguf> [place]  check and add a GGUF (copies into the library unless "place")
 
@@ -17,6 +18,15 @@ func run() async {
         case "--engine": choice = EngineChoice(rawValue: args.removeFirst()) ?? .auto
         case "--sources-only": sourcesOnly = true
         case "--model": builtInModel = args.removeFirst()
+        case "--prefix-check":
+            await Bench.prefixCheck(questionsFile: args.removeFirst())
+            return
+        case "--bench":
+            let file = args.removeFirst()
+            let ttfw = args.contains("--ttfw")
+            let out = args.firstIndex(of: "--out").map { args[$0 + 1] }
+            await Bench.run(questionsFile: file, ttfw: ttfw, out: out)
+            return
         case "--models":
             let library = Library(); await library.reload()
             let chosen = KitSettings.shared.string(forKey: "builtInModel") ?? ""
@@ -151,8 +161,7 @@ func run() async {
     if let builtInModel { model.builtInModel = builtInModel }
     if sourcesOnly {
         // Wait for PDF libraries to be read (first run builds the cache).
-        try? await Task.sleep(for: .milliseconds(200))
-        while PDFIndex.shared.isBuilding { try? await Task.sleep(for: .milliseconds(200)) }
+        await Bench.prepare(library: library)
         let start = Date()
         let sources = Retriever.retrieve(question: question, archives: library.books.map(\.archive), budgetChars: 5000)
         print(String(format: "Retrieved %d sources in %.2fs", sources.count, Date().timeIntervalSince(start)))

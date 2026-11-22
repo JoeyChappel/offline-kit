@@ -18,6 +18,24 @@ struct SaveLocation: Identifiable, Hashable {
         return max(values?.volumeAvailableCapacityForImportantUsage ?? 0, Int64(values?.volumeAvailableCapacity ?? 0))
     }
 
+    /// `freeSpace`, remembered for a few seconds. Get Resources asks on every redraw (each download progress tick),
+    /// and reading it touches the disk. `refreshFreeSpace()` drops it, for example when a download finishes.
+    var cachedFreeSpace: Int64 {
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["OFFLINEKIT_FAKE_FREE_GB"] != nil { return freeSpace }
+        #endif
+        let now = Date()
+        if let hit = Self.freeSpaceLock.withLock({ Self.freeSpaceValues[folder.path] }), now.timeIntervalSince(hit.at) < 5 { return hit.bytes }
+        let bytes = freeSpace
+        Self.freeSpaceLock.withLock { Self.freeSpaceValues[folder.path] = (bytes, now) }
+        return bytes
+    }
+
+    private static let freeSpaceLock = NSLock()
+    nonisolated(unsafe) private static var freeSpaceValues: [String: (bytes: Int64, at: Date)] = [:]
+
+    static func refreshFreeSpace() { freeSpaceLock.withLock { freeSpaceValues.removeAll() } }
+
     /// FAT32 can't hold files over 4 GB (many archives are bigger).
     var isFAT32: Bool {
         #if DEBUG
@@ -89,6 +107,7 @@ struct GetResourcesView: View {
     @State private var showingEncyclopedia = false
     @State private var reviewing = false
     @State private var format: ContentFormat?
+    @State private var query = ""
 
     // Ticked choices live in KitNavigation, so they survive a look at another section.
     private var selected: Set<String> {
@@ -101,9 +120,46 @@ struct GetResourcesView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                header
+        GeometryReader { geometry in
+            let wide = geometry.size.width >= 1000
+            HStack(alignment: .top, spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 22) {
+                        header
+                        if !wide { destinationControls }
+                        resourceContent
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 24)
+                    .frame(maxWidth: wide ? 1100 : 860, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+                }
+                if wide, catalog != nil {
+                    ScrollView { selectionInspector.padding(20) }
+                        .frame(width: 320)
+                        .background(Design.surface)
+                        .overlay(alignment: .leading) { Rectangle().fill(Design.border).frame(width: 1) }
+                }
+            }
+            .safeAreaInset(edge: .bottom) { if !wide && catalog != nil { footer } }
+        }
+        .background(Design.canvas)
+        .sheet(isPresented: $reviewing) { review }
+        .onAppear {
+            area = navigation.resourceArea
+            #if DEBUG
+            // Test hook: -getFormat maps opens the Get screen filtered to one format.
+            if let raw = UserDefaults.standard.string(forKey: "getFormat") { format = ContentFormat(rawValue: raw) }
+            #endif
+        }
+        .onChange(of: navigation.resourceArea) { area = navigation.resourceArea; showingEncyclopedia = false }
+        .navigationTitle("Get Resources")
+        .task { await load() }
+        .onChange(of: pictures) { KitSettings.shared.set(pictures.rawValue, forKey: "pictures") }
+    }
+
+    private var resourceContent: some View {
+        VStack(alignment: .leading, spacing: 22) {
                 #if os(iOS)
                 FromMacCard()   // Send to iPhone: download what the Mac picked, over home Wi-Fi
                 #endif
@@ -112,14 +168,19 @@ struct GetResourcesView: View {
                     DownloadsCard()
                 }
                 if let catalog {
+                    resourceSearch
                     FormatChips(selection: $format, formats: [.reference, .books, .video, .maps, .interactive])
-                    if format != nil {
+                    if format != nil || !searchText.isEmpty {
                         // A format filter shows every matching pack, across all areas.
-                        if format == .reference { encyclopediaCard(catalog) }
+                        if (format == nil || format == .reference) && (searchText.isEmpty || Interests.encyclopedia.contains(where: matches)) { encyclopediaCard(catalog) }
                         ForEach(Interests.all) { interest in
                             if interest.packs.contains(where: matches) { interestCard(interest, catalog: catalog) }
                         }
-                        if format == .maps { mapRegions(catalog) }
+                        if searchText.isEmpty && format == .maps { mapRegions(catalog) }
+                        if !searchText.isEmpty && !matchingMaps(catalog).isEmpty { mapSearchResults(catalog) }
+                        if !searchText.isEmpty && matchingMaps(catalog).isEmpty && !Interests.all.contains(where: { $0.packs.contains(where: matches) }) && !Interests.encyclopedia.contains(where: matches) {
+                            ContentUnavailableView.search(text: searchText)
+                        }
                     } else if showingEncyclopedia {
                         breadcrumb
                         encyclopediaCard(catalog)
@@ -180,45 +241,99 @@ struct GetResourcesView: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel("Loading the download list")
                 }
-            }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 28)
-            .frame(maxWidth: 860, alignment: .leading)
-            .frame(maxWidth: .infinity)
         }
-        .background(Design.canvas)
-        .safeAreaInset(edge: .bottom) { if catalog != nil { footer } }
-        .sheet(isPresented: $reviewing) { review }
-        .onAppear {
-            area = navigation.resourceArea
-            #if DEBUG
-            // Test hook: -getFormat maps opens the Get screen filtered to one format.
-            if let raw = UserDefaults.standard.string(forKey: "getFormat") { format = ContentFormat(rawValue: raw) }
-            #endif
-        }
-        .onChange(of: navigation.resourceArea) { area = navigation.resourceArea; showingEncyclopedia = false }
-        .navigationTitle("Get Resources")
-        .task { await load() }
-        .onChange(of: pictures) { KitSettings.shared.set(pictures.rawValue, forKey: "pictures") }
     }
 
     // MARK: Header
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            KitHeading(eyebrow: "BUILD YOUR LIBRARY", title: "Choose what to keep offline.",
-                       subtitle: "Choose an area, then tick the references you want. Downloading needs internet; after that, everything works offline.")
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 18) { locationMenu; sizePicker }
-                VStack(alignment: .leading, spacing: 12) { locationMenu; sizePicker }
-            }
+        VStack(alignment: .leading, spacing: 12) {
+            Text("BUILD YOUR LIBRARY").font(.caption.weight(.bold)).tracking(1.4).foregroundStyle(.tint)
+            Text("Choose what to keep offline.").font(.title.bold())
+            Text("Browse an area and choose the references you want.")
+                .font(.callout).foregroundStyle(.secondary)
             #if os(macOS)
-            HStack(spacing: 10) {
-                Text("Already have movies, music, audiobooks or games on this Mac?").font(.callout).foregroundStyle(.secondary)
-                FindMyMediaButton().buttonStyle(.bordered)
-            }
+            FindMyMediaButton().buttonStyle(.bordered)
+                .help("Add movies, music, audiobooks and games already on this Mac.")
             #endif
         }
+    }
+
+    private var resourceSearch: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Search resources", text: $query).textFieldStyle(.plain)
+            if !query.isEmpty {
+                Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("Clear resource search")
+            }
+        }
+        .padding(10)
+        .background(Design.surface, in: RoundedRectangle(cornerRadius: 9))
+        .overlay { RoundedRectangle(cornerRadius: 9).stroke(Design.border) }
+    }
+
+    private var destinationControls: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            locationMenu
+            sizePicker
+        }
+    }
+
+    private var selectionInspector: some View {
+        let items = chosenEntries
+        let total = items.reduce(Int64(0)) { $0 + $1.size }
+        let free = spaceLeft
+        let fits = total < free - (1 << 30)
+        return VStack(alignment: .leading, spacing: 20) {
+            HStack {
+                Text("Your selection").font(.title2.bold())
+                Spacer()
+                Text("\(items.count)").font(.callout.bold()).foregroundStyle(.tint)
+            }
+            if items.isEmpty {
+                Text("Choose resources from any area to build your kit.").font(.callout).foregroundStyle(.secondary)
+            } else {
+                ForEach(SubjectArea.allCases) { item in
+                    let count = item.packs.filter { pack in items.contains { $0.name == pack.name } }.count + (item == .world ? items.filter { $0.name.hasPrefix("maps_") }.count : 0)
+                    if count > 0 {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: item.symbol).foregroundStyle(.tint).frame(width: 22)
+                            Text(item.title).font(.callout)
+                            Spacer(minLength: 4)
+                            Text("\(count)").font(.callout).monospacedDigit()
+                        }
+                    }
+                }
+                if encyclopedia != nil { Label("General encyclopedia", systemImage: "book.closed").font(.callout) }
+                Text("Shared resources download once. The total includes only new downloads.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Storage destination").font(.subheadline.weight(.semibold))
+                locationMenu.controlSize(.large)
+                Text("\(bytes(free)) available").font(.caption).foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Reference detail").font(.subheadline.weight(.semibold))
+                Picker("Reference detail", selection: $pictures) {
+                    ForEach(PictureChoice.allCases) { Text($0.label).tag($0) }
+                }.labelsHidden().pickerStyle(.menu)
+                Text(pictures.explanation).font(.caption).foregroundStyle(.secondary)
+                Label("Uses the closest available edition.", systemImage: "info.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Selected download").font(.subheadline.weight(.semibold))
+                Text(bytes(total)).font(.largeTitle.bold()).monospacedDigit()
+                if !fits && !items.isEmpty { Text("Not enough space at this destination.").foregroundStyle(.orange).font(.callout) }
+            }
+            reviewButton(items: items, fits: fits).frame(maxWidth: .infinity)
+            Text("Nothing downloads until you confirm.").font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 6)
     }
 
     private var locationMenu: some View {
@@ -229,7 +344,7 @@ struct GetResourcesView: View {
                     // Downloads and anything added later (games, movies, PDFs) go to the same place.
                     KitStorage.remember(location.folder)
                 } label: {
-                    Label("\(location.name) · \(bytes(location.freeSpace)) free", systemImage: location.symbol)
+                    Label("\(location.name) · \(bytes(location.cachedFreeSpace)) free", systemImage: location.symbol)
                 }
             }
         } label: {
@@ -268,12 +383,12 @@ struct GetResourcesView: View {
             CardHeader(symbol: "book.closed", title: "General encyclopedia",
                        subtitle: "Pick one, or none. These include celebrities and sports. For science only, choose None and pick references in Science & learning.")
             Divider()
-            EncyclopediaRow(label: "None", note: "Only the subjects you pick below.", size: nil,
-                            isOn: encyclopedia == nil, status: nil) { encyclopedia = nil }
-            ForEach(Interests.encyclopedia) { pack in
+            EncyclopediaRow(name: nil, label: "None", note: "Only the subjects you pick below.", size: nil,
+                            isOn: encyclopedia == nil, installed: false) { encyclopedia = nil }
+            ForEach(Interests.encyclopedia.filter { searchText.isEmpty || matches($0) }) { pack in
                 let entry = catalog.entry(for: pack.name, pictures: pictures)
-                EncyclopediaRow(label: pack.label, note: pack.note, size: entry?.size,
-                                isOn: encyclopedia == pack.name, status: status(pack.name)) {
+                EncyclopediaRow(name: pack.name, label: pack.label, note: pack.note, size: entry?.size,
+                                isOn: encyclopedia == pack.name, installed: isInstalled(pack.name)) {
                     encyclopedia = pack.name
                 }
                 .disabled(entry == nil)
@@ -283,7 +398,7 @@ struct GetResourcesView: View {
     }
 
     private func interestCard(_ interest: Interest, catalog: Catalog) -> some View {
-        let available = interest.packs.filter { catalog.entry(for: $0.name, pictures: pictures) != nil && !isInstalled($0.name) }
+        let available = interest.packs.filter(matches).filter { catalog.entry(for: $0.name, pictures: pictures) != nil && !isInstalled($0.name) }
         let chosen = available.filter { selected.contains($0.name) }
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
@@ -303,7 +418,7 @@ struct GetResourcesView: View {
             Divider()
             ForEach(interest.packs.filter(matches)) { pack in
                 let entry = catalog.entry(for: pack.name, pictures: pictures)
-                PackRow(pack: pack, entry: entry, isOn: selected.contains(pack.name), status: status(pack.name)) {
+                PackRow(pack: pack, entry: entry, isOn: selected.contains(pack.name), installed: isInstalled(pack.name)) {
                     if selected.contains(pack.name) { selected.remove(pack.name) } else { selected.insert(pack.name) }
                 }
             }
@@ -312,42 +427,42 @@ struct GetResourcesView: View {
     }
 
     private func mapRegions(_ catalog: Catalog) -> some View {
+        // `status` runs inside the card's own body, so only the card redraws on a progress tick.
         MapRegionsCard(catalog: catalog, selected: Bindable(navigation).resourceSelection, status: status)
     }
 
+    private func matchingMaps(_ catalog: Catalog) -> [CatalogEntry] {
+        guard !searchText.isEmpty, format == nil || format == .maps else { return [] }
+        return MapRegions.entries(in: catalog).filter {
+            ($0.title + " map maps").localizedCaseInsensitiveContains(searchText)
+        }
+    }
+
+    private func mapSearchResults(_ catalog: Catalog) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            CardHeader(symbol: "map", title: "Maps", subtitle: "Street maps to browse offline.")
+            Divider()
+            ForEach(matchingMaps(catalog)) { entry in
+                PackRow(pack: Pack(name: entry.name, label: entry.title), entry: entry,
+                        isOn: selected.contains(entry.name), installed: isInstalled(entry.name)) {
+                    if selected.contains(entry.name) { selected.remove(entry.name) } else { selected.insert(entry.name) }
+                }
+            }
+            Text("Maps come from OpenStreetMap through the Kiwix library. © OpenStreetMap contributors.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.card(padding: 18)
+    }
+
     // MARK: Footer
-
-    private var footer: some View {
-        let items = chosenEntries
-        let total = items.reduce(Int64(0)) { $0 + $1.size }
-        let free = spaceLeft
-        let fits = total < free - (1 << 30)
-        return ViewThatFits(in: .horizontal) {
-            HStack(spacing: 14) { footerSummary(items: items, total: total, free: free, fits: fits); Spacer(); reviewButton(items: items, fits: fits) }
-            VStack(alignment: .leading, spacing: 12) { footerSummary(items: items, total: total, free: free, fits: fits); reviewButton(items: items, fits: fits) }
-        }
-        .padding(.horizontal, 24).padding(.vertical, 12)
-        .frame(maxWidth: 860).frame(maxWidth: .infinity).background(.bar)
-    }
-
-    private func footerSummary(items: [CatalogEntry], total: Int64, free: Int64, fits: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(items.isEmpty ? "Nothing selected" : "\(items.count) \(items.count == 1 ? "item" : "items") · \(bytes(total))").font(.headline)
-                .help("Items that appear in more than one area are counted once.")
-            if items.count > 0 && SubjectArea.allCases.reduce(0, { sum, area in sum + area.packs.filter { selected.contains($0.name) }.count }) > items.count {
-                Text("Some items appear in more than one area; they download once.").font(.caption).foregroundStyle(.secondary)
-            }
-            if let destination {
-                Text("\(bytes(free)) free on \(destination.name)" + (!fits && !items.isEmpty ? " · Not enough space" : ""))
-                    .font(.caption).foregroundStyle(!fits && !items.isEmpty ? Color.orange : .secondary)
-            }
-        }
-    }
 
     private func reviewButton(items: [CatalogEntry], fits: Bool) -> some View {
         Button("Review selection", systemImage: "checklist") { reviewing = true }
             .buttonStyle(.borderedProminent).controlSize(.large)
             .disabled(items.isEmpty || !fits || destination == nil)
+    }
+
+    private var footer: some View {
+        ResourcesFooter(items: chosenEntries, destination: destination, selected: selected, reviewing: $reviewing)
     }
 
     private var review: some View {
@@ -386,13 +501,11 @@ struct GetResourcesView: View {
     }
 
     /// Free space on the chosen drive after what queued, running and paused downloads still have to write there.
-    private var spaceLeft: Int64 {
-        guard let destination else { return 0 }
-        return max(0, destination.freeSpace - downloads.bytesStillNeeded(on: destination.folder))
-    }
+    private var spaceLeft: Int64 { ResourcesFooter.spaceLeft(destination, downloads) }
 
     private func startDownloads() {
         guard let destination else { return }
+        SaveLocation.refreshFreeSpace()   // the check that matters reads the disk fresh
         let items = chosenEntries
         let total = items.reduce(Int64(0)) { $0 + $1.size }
         guard !items.isEmpty, total < spaceLeft - (1 << 30) else { return }
@@ -413,8 +526,11 @@ struct GetResourcesView: View {
             .sorted { $0.size < $1.size }   // small ones finish first
     }
 
+    private var searchText: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+
     private func matches(_ pack: Pack) -> Bool {
-        format.map { ContentFormat(archiveName: pack.name) == $0 } ?? true
+        let matchesFormat = format.map { ContentFormat(archiveName: pack.name) == $0 } ?? true
+        return matchesFormat && (searchText.isEmpty || (pack.label + " " + pack.note + " " + pack.name).localizedCaseInsensitiveContains(searchText))
     }
 
     private func isInstalled(_ name: String) -> Bool {
@@ -429,6 +545,7 @@ struct GetResourcesView: View {
 
     private func load() async {
         loadError = nil
+        SaveLocation.refreshFreeSpace()
         locations = SaveLocation.available()
         if destination == nil || !locations.contains(where: { $0 == destination }) { destination = SaveLocation.preferred(locations) }
         let cache = (KitLocation.portableRoot ?? URL.cachesDirectory.appending(path: "OfflineKit"))
@@ -443,6 +560,60 @@ struct GetResourcesView: View {
         } catch {
             loadError = error.localizedDescription
         }
+    }
+
+    private func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
+}
+
+/// The bar under the list: what's ticked, how big it is and whether it fits. It reads download progress and free space
+/// itself, so those changing every moment redraw only this bar, not the whole Get Resources screen.
+private struct ResourcesFooter: View {
+    @Environment(DownloadManager.self) private var downloads
+    let items: [CatalogEntry]
+    let destination: SaveLocation?
+    let selected: Set<String>
+    @Binding var reviewing: Bool
+    /// Bumped when a download starts or ends, so the free space is read fresh and shown.
+    @State private var spaceRevision = 0
+
+    /// Free space on the chosen drive after what queued, running and paused downloads still have to write there.
+    static func spaceLeft(_ destination: SaveLocation?, _ downloads: DownloadManager) -> Int64 {
+        guard let destination else { return 0 }
+        return max(0, destination.cachedFreeSpace - downloads.bytesStillNeeded(on: destination.folder))
+    }
+
+    var body: some View {
+        let _ = spaceRevision
+        let total = items.reduce(Int64(0)) { $0 + $1.size }
+        let free = Self.spaceLeft(destination, downloads)
+        let fits = total < free - (1 << 30)
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 14) { summary(total: total, free: free, fits: fits); Spacer(); reviewButton(fits: fits) }
+            VStack(alignment: .leading, spacing: 12) { summary(total: total, free: free, fits: fits); reviewButton(fits: fits) }
+        }
+        .padding(.horizontal, 24).padding(.vertical, 12)
+        .frame(maxWidth: 860).frame(maxWidth: .infinity).background(.bar)
+        .onChange(of: downloads.activeCount) { SaveLocation.refreshFreeSpace(); spaceRevision += 1 }
+    }
+
+    private func summary(total: Int64, free: Int64, fits: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(items.isEmpty ? "Nothing selected" : "\(items.count) \(items.count == 1 ? "item" : "items") · \(bytes(total))").font(.headline)
+                .help("Items that appear in more than one area are counted once.")
+            if items.count > 0 && SubjectArea.allCases.reduce(0, { sum, area in sum + area.packs.filter { selected.contains($0.name) }.count }) > items.count {
+                Text("Some items appear in more than one area; they download once.").font(.caption).foregroundStyle(.secondary)
+            }
+            if let destination {
+                Text("\(bytes(free)) free on \(destination.name)" + (!fits && !items.isEmpty ? " · Not enough space" : ""))
+                    .font(.caption).foregroundStyle(!fits && !items.isEmpty ? Color.orange : .secondary)
+            }
+        }
+    }
+
+    private func reviewButton(fits: Bool) -> some View {
+        Button("Review selection", systemImage: "checklist") { reviewing = true }
+            .buttonStyle(.borderedProminent).controlSize(.large)
+            .disabled(items.isEmpty || !fits || destination == nil)
     }
 
     private func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
@@ -470,11 +641,18 @@ private struct CardHeader: View {
 }
 
 private struct PackRow: View {
+    @Environment(DownloadManager.self) private var downloads
     let pack: Pack
     let entry: CatalogEntry?
     let isOn: Bool
-    let status: PackStatus?
+    let installed: Bool
     let toggle: () -> Void
+
+    /// Read here, not by the screen, so a progress tick redraws this row and not the whole list.
+    private var status: PackStatus? {
+        if installed { return .installed }
+        return downloads.job(named: pack.name).map { .downloading($0.fraction, $0.state == .paused) }
+    }
 
     var body: some View {
         Button(action: toggle) {
@@ -524,12 +702,19 @@ private struct PackRow: View {
 }
 
 private struct EncyclopediaRow: View {
+    @Environment(DownloadManager.self) private var downloads
+    let name: String?
     let label: String
     let note: String
     let size: Int64?
     let isOn: Bool
-    let status: PackStatus?
+    let installed: Bool
     let pick: () -> Void
+
+    private var status: PackStatus? {
+        if installed { return .installed }
+        return name.flatMap { downloads.job(named: $0) }.map { .downloading($0.fraction, $0.state == .paused) }
+    }
 
     var body: some View {
         Button(action: pick) {

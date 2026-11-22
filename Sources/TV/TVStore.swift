@@ -205,6 +205,9 @@ final class TVStore {
         } catch TVError.needsPIN {
             phase = .needsPIN
             return true
+        } catch TVError.refused(let message, let waiting) {
+            refused(message, waiting: waiting, server: server)
+            return true
         } catch {
             if quietly { self.server = nil; return false }
             phase = .failed("Couldn’t reach Offline Kit on \(server.name). Check that the Mac is awake, the app is open and Share on Wi-Fi is on.")
@@ -218,10 +221,13 @@ final class TVStore {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode(["pin": pin])
-        let status = (try? await session.data(for: request)).flatMap { ($0.1 as? HTTPURLResponse)?.statusCode }
+        let reply = try? await session.data(for: request)
+        let status = (reply?.1 as? HTTPURLResponse)?.statusCode
         if status == 200 {
             pinError = nil
             await connect(server)
+        } else if status == 403, let refusal = reply.flatMap({ Self.refusal($0.0) }) {
+            pinError = refusal.message
         } else {
             pinError = "That PIN didn’t work. It’s on the Mac in Offline Kit › Share on Wi-Fi."
         }
@@ -238,7 +244,31 @@ final class TVStore {
 
     // MARK: Library
 
-    enum TVError: Error { case needsPIN, server }
+    enum TVError: Error { case needsPIN, server, refused(String, waiting: Bool) }
+
+    /// The Mac's Connected Devices refusal: {"error": "waiting" | "blocked", "message": "..."} with status 403.
+    nonisolated static func refusal(_ data: Data) -> (message: String, waiting: Bool)? {
+        guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = body["error"] as? String, kind == "waiting" || kind == "blocked" else { return nil }
+        let fallback = kind == "waiting" ? "Waiting for the Mac to allow this device…" : "This device has been blocked on the Mac."
+        return ((body["message"] as? String).map { String($0.prefix(200)) } ?? fallback, kind == "waiting")
+    }
+
+    /// Shows why the Mac refused, and while it's waiting for someone at the Mac to click Allow, checks again every few seconds.
+    private func refused(_ message: String, waiting: Bool, server: TVServer) {
+        phase = .failed(message)
+        guard waiting else { return }
+        // Checks quietly (no loading screen in between) until the Mac answers differently.
+        Task { @MainActor [weak self] in
+            while true {
+                try? await Task.sleep(for: .seconds(4))
+                guard let self, self.phase == .failed(message), self.server?.baseURL == server.baseURL else { return }
+                do { try await self.load(); return }
+                catch TVError.refused(let now, true) where now == message { continue }
+                catch { await self.connect(server); return }
+            }
+        }
+    }
 
     func load() async throws {
         guard let server else { return }
@@ -247,6 +277,7 @@ final class TVStore {
         let (data, response) = try await session.data(from: components.url!)
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 401 { throw TVError.needsPIN }
+        if status == 403, let refusal = Self.refusal(data) { throw TVError.refused(refusal.message, waiting: refusal.waiting) }
         guard status == 200 else { throw TVError.server }
         let decoded = try JSONDecoder().decode(MediaResponse.self, from: data)
         items = decoded.items
@@ -261,7 +292,9 @@ final class TVStore {
     }
 
     func refresh() async {
-        do { try await load() } catch TVError.needsPIN { phase = .needsPIN } catch {}
+        do { try await load() } catch TVError.needsPIN { phase = .needsPIN } catch TVError.refused(let message, let waiting) {
+            if let server { refused(message, waiting: waiting, server: server) }
+        } catch {}
     }
 
     func url(_ path: String) -> URL? {

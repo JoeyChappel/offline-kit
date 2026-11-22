@@ -14,6 +14,9 @@ struct WatchListenView: View {
     @State private var genre: String?
     @State private var sort: MediaSort = .title
     @State private var query = ""
+    /// `query` after the typing has paused for a moment: the lists are worked out from this one.
+    @State private var appliedQuery = ""
+    @State private var derivedCache = WatchListenCache()
     @State private var unfinished = false
     @State private var musicBrowse: MusicBrowse = .albums
     @State private var artist: String?
@@ -47,11 +50,18 @@ struct WatchListenView: View {
         }
     }
 
-    private var filtered: [MediaItem] {
-        MediaCatalog.select(media.items, info: media.info, progress: media.progress, filter: filter,
-                            genre: genre, query: query, sort: sort, unfinished: unfinished)
+    /// Everything worked out from the library and the current filter, search and sort: done once per change of those
+    /// (see WatchListenDerived), not once per row, tile or section that reads it.
+    private var d: WatchListenDerived {
+        let key = WatchListenCache.Key(revision: media.revision, filter: filter, genre: genre, query: appliedQuery, sort: sort,
+                                       unfinished: unfinished, artist: artist, collectionID: collection?.id)
+        return derivedCache.derived(key) {
+            WatchListenDerived(items: media.items, info: media.info, progress: media.progress, filter: filter, genre: genre,
+                               query: appliedQuery, sort: sort, unfinished: unfinished, artist: artist, collection: collection)
+        }
     }
-    private var browsing: Bool { genre != nil || !query.isEmpty || sort != .title || unfinished || filter == .music || artist != nil || collection != nil }
+    private var filtered: [MediaItem] { d.filtered }
+    private var browsing: Bool { genre != nil || !appliedQuery.isEmpty || sort != .title || unfinished || filter == .music || artist != nil || collection != nil }
 
     var body: some View {
         NavigationStack {
@@ -66,7 +76,16 @@ struct WatchListenView: View {
             }
             #endif
         }
-        .onChange(of: filter) { genre = nil; artist = nil; collection = nil; selected = nil; sort = .title; query = "" }
+        .onChange(of: filter) { genre = nil; artist = nil; collection = nil; selected = nil; sort = .title; query = ""; appliedQuery = "" }
+        // Search waits for a pause in the typing; clearing it shows everything at once.
+        .task(id: query) {
+            guard query != appliedQuery else { return }
+            if !query.isEmpty {
+                try? await Task.sleep(for: .milliseconds(200))
+                guard !Task.isCancelled else { return }
+            }
+            appliedQuery = query
+        }
         .onChange(of: nowPlaying.expandRequest) { openRequested() }
         .onAppear(perform: openRequested)
         .task {
@@ -220,11 +239,11 @@ struct WatchListenView: View {
 
     /// Nothing of this section's kind in the kit yet (the starter books don't count for Watch, Audiobooks or Music).
     private var sectionIsEmpty: Bool {
-        filter == .all ? media.items.isEmpty : !media.items.contains { MediaCatalog.category($0, media.info[$0.progressKey]) == filter }
+        d.sectionIsEmpty
     }
 
     /// Nothing of this kind yet and nothing being searched for: the collection card is the whole screen.
-    private var showingWelcome: Bool { sectionIsEmpty && query.isEmpty && genre == nil }
+    private var showingWelcome: Bool { sectionIsEmpty && appliedQuery.isEmpty && genre == nil }
     private var firstScan: Bool { media.scanning || !media.hasScanned }
 
     private var home: some View {
@@ -252,7 +271,7 @@ struct WatchListenView: View {
                 } else if browsing {
                     results
                 } else {
-                    let catalog = media.catalog(filter: filter)
+                    let catalog = d.catalog
                     if let featured = catalog.featured {
                         MediaFeaturedBanner(item: featured, play: { start(featured, $0, nil) }, detail: { selected = featured })
                             .padding(.horizontal, 24)
@@ -261,8 +280,8 @@ struct WatchListenView: View {
                         MediaShelfRow(shelf: shelf, open: { selected = $0 }, seeAll: { collection = shelf })
                     }
                 }
-                if !showingWelcome && filtered.isEmpty && (!query.isEmpty || genre != nil) {
-                    ContentUnavailableView.search(text: query.isEmpty ? genre ?? "" : query).padding()
+                if !showingWelcome && filtered.isEmpty && (!appliedQuery.isEmpty || genre != nil) {
+                    ContentUnavailableView.search(text: appliedQuery.isEmpty ? genre ?? "" : appliedQuery).padding()
                 } else if !showingWelcome && filtered.isEmpty && unfinished {
                     ContentUnavailableView("Nothing unfinished", systemImage: "checkmark.circle",
                                            description: Text("Everything here is either finished or not started yet.")).padding()
@@ -426,9 +445,9 @@ struct WatchListenView: View {
                     .pickerStyle(.segmented).onChange(of: musicBrowse) { artist = nil; genre = nil }
             }
             if filter != .all {
-                let names = MediaCatalog.genres(media.items, info: media.info, filter: filter)
+                let names = d.genreNames
                 if !names.isEmpty {
-                    let counts = MediaCatalog.genreCounts(media.items, info: media.info, filter: filter)
+                    let counts = d.genreCounts
                     ScrollView(.horizontal, showsIndicators: false) {
                         LazyHStack(spacing: 12) {
                             ForEach(names, id: \.self) { name in
@@ -449,7 +468,7 @@ struct WatchListenView: View {
     }
     /// Tiles are the way to pick a genre wherever they show (every section but All); the menu only stands in for them there.
     @ViewBuilder private var genrePicker: some View {
-        let names = MediaCatalog.genres(media.items, info: media.info, filter: filter)
+        let names = d.genreNames
         if filter == .all && !names.isEmpty {
             Menu {
                 Button("All genres") { setGenre(nil) }
@@ -472,10 +491,7 @@ struct WatchListenView: View {
             .accessibilityLabel("Sort by \(sort.label)")
         }
     }
-    private var visibleItems: [MediaItem] {
-        let source = collection?.items ?? filtered
-        return artist.map { name in source.filter { MediaCatalog.creator(media.info[$0.progressKey]) == name } } ?? source
-    }
+    private var visibleItems: [MediaItem] { d.visibleItems }
     private var results: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
@@ -492,14 +508,13 @@ struct WatchListenView: View {
         }.padding(.horizontal, 24)
     }
     private var artists: some View {
-        let names = Set(filtered.map { MediaCatalog.creator(media.info[$0.progressKey]) }).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         return LazyVStack(spacing: 10) {
-            ForEach(names, id: \.self) { name in
-                let albums = filtered.filter { MediaCatalog.creator(media.info[$0.progressKey]) == name }
+            ForEach(d.artists) { group in
+                let name = group.name
                 Button { artist = name } label: {
                     HStack(spacing: 16) {
-                        if let item = albums.first { MediaArtwork(item: item, info: media.info[item.progressKey]).frame(width: 64, height: 64).clipShape(Circle()) }
-                        VStack(alignment: .leading) { Text(name).font(.headline); Text("\(albums.count) albums · \(albums.reduce(0) { $0 + $1.tracks.count }) songs").font(.caption).foregroundStyle(MediaTheme.muted) }
+                        if let item = group.albums.first { MediaArtwork(item: item, info: media.info[item.progressKey]).frame(width: 64, height: 64).clipShape(Circle()) }
+                        VStack(alignment: .leading) { Text(name).font(.headline); Text("\(group.albums.count) albums · \(group.songCount) songs").font(.caption).foregroundStyle(MediaTheme.muted) }
                         Spacer(); Image(systemName: "chevron.right")
                     }.padding(14).background(MediaTheme.surface, in: RoundedRectangle(cornerRadius: 14))
                 }.buttonStyle(.plain)
@@ -508,7 +523,7 @@ struct WatchListenView: View {
     }
     private var songList: some View {
         LazyVStack(spacing: 0) {
-            ForEach(MediaCatalog.songs(filtered, info: media.info, query: query, sort: sort)) { song in
+            ForEach(d.songs) { song in
                 let item = song.item
                 let index = song.index
                 Button { start(item, false, index) } label: {
@@ -525,9 +540,9 @@ struct WatchListenView: View {
         }.padding(.horizontal, 24)
     }
     private var genreGrid: some View {
-        let counts = MediaCatalog.genreCounts(media.items, info: media.info, filter: filter)
+        let counts = d.genreCounts
         return LazyVGrid(columns: [GridItem(.adaptive(minimum: 160), spacing: 14)], spacing: 14) {
-            ForEach(MediaCatalog.genres(media.items, info: media.info, filter: filter), id: \.self) { name in
+            ForEach(d.genreNames, id: \.self) { name in
                 GenreTile(name: name, count: counts[name] ?? 0, noun: "album", selected: genre == name, width: nil) { toggleGenre(name) }
             }
         }.padding(.horizontal, 24)
@@ -612,6 +627,83 @@ struct WatchListenView: View {
             }
         }
     }
+}
+
+/// Remembers the last result of the library work for the current inputs, so a redraw that changes none of them
+/// (hovering, scrolling, a progress tick elsewhere) costs a comparison, not a filter and sort of every item.
+@MainActor
+private final class WatchListenCache {
+    struct Key: Equatable {
+        let revision: Int
+        let filter: MediaFilter
+        let genre: String?
+        let query: String
+        let sort: MediaSort
+        let unfinished: Bool
+        let artist: String?
+        let collectionID: String?
+    }
+    private var key: Key?
+    private var value: WatchListenDerived?
+
+    func derived(_ key: Key, make: () -> WatchListenDerived) -> WatchListenDerived {
+        if let value, self.key == key { return value }
+        let made = make()
+        self.key = key
+        value = made
+        return made
+    }
+}
+
+struct ArtistGroup: Identifiable {
+    let name: String
+    let albums: [MediaItem]
+    let songCount: Int
+    var id: String { name }
+}
+
+/// The lists Watch & Listen shows, each worked out the first time a screen asks for it and then kept.
+@MainActor
+private final class WatchListenDerived {
+    private let items: [MediaItem]
+    private let info: [String: MediaInfo]
+    private let progress: [String: MediaProgress]
+    private let filter: MediaFilter
+    private let genre: String?
+    private let query: String
+    private let sort: MediaSort
+    private let unfinished: Bool
+    private let artist: String?
+    private let collection: MediaShelf?
+
+    init(items: [MediaItem], info: [String: MediaInfo], progress: [String: MediaProgress], filter: MediaFilter, genre: String?,
+         query: String, sort: MediaSort, unfinished: Bool, artist: String?, collection: MediaShelf?) {
+        self.items = items; self.info = info; self.progress = progress; self.filter = filter; self.genre = genre
+        self.query = query; self.sort = sort; self.unfinished = unfinished; self.artist = artist; self.collection = collection
+    }
+
+    /// The filtered and sorted library.
+    lazy var filtered: [MediaItem] = MediaCatalog.select(items, info: info, progress: progress, filter: filter, genre: genre,
+                                                         query: query, sort: sort, unfinished: unfinished)
+    /// The featured banner and shelves of the home screen.
+    lazy var catalog: (featured: MediaItem?, shelves: [MediaShelf]) = MediaCatalog.build(items: items, progress: progress, info: info, filter: filter)
+    lazy var genreNames: [String] = MediaCatalog.genres(items, info: info, filter: filter)
+    lazy var genreCounts: [String: Int] = MediaCatalog.genreCounts(items, info: info, filter: filter)
+    lazy var sectionIsEmpty: Bool = filter == .all ? items.isEmpty : !items.contains { MediaCatalog.category($0, info[$0.progressKey]) == filter }
+    lazy var visibleItems: [MediaItem] = {
+        let source = collection?.items ?? filtered
+        guard let artist else { return source }
+        return source.filter { MediaCatalog.creator(info[$0.progressKey]) == artist }
+    }()
+    /// Artists with their albums, one pass over the albums (not one per artist).
+    lazy var artists: [ArtistGroup] = {
+        let groups = Dictionary(grouping: filtered) { MediaCatalog.creator(info[$0.progressKey]) }
+        return groups.keys.sorted { $0.localizedStandardCompare($1) == .orderedAscending }.map { name in
+            let albums = groups[name] ?? []
+            return ArtistGroup(name: name, albums: albums, songCount: albums.reduce(0) { $0 + $1.tracks.count })
+        }
+    }()
+    lazy var songs: [MediaSong] = MediaCatalog.songs(filtered, info: info, query: query, sort: sort)
 }
 
 /// A genre or category tile: its symbol, name and count on the poster gradient. The chosen one gets an accent edge and a check.

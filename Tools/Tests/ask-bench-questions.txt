@@ -1,0 +1,16 @@
+# Ask benchmark questions (okit --bench). Health, repair and food topics in the synthetic test archives.
+How do I treat heat stroke?
+What should I do for a burn from boiling water?
+How do I stop a nosebleed?
+What are the signs of dehydration in a baby?
+How should I treat a sprained ankle?
+How can I purify water without power?
+How long does food last in the fridge during a power outage?
+How do I can tomatoes safely?
+How do I fix a leaking faucet?
+How do I reset a tripped circuit breaker?
+How do I unclog a drain without chemicals?
+How do I patch a hole in drywall?
+What are the symptoms of carbon monoxide poisoning?
+How do I store rice long term?
+How do I warm up someone with hypothermia?

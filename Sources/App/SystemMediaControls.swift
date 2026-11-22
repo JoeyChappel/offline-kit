@@ -128,12 +128,7 @@ final class SystemMediaControls {
         artwork = nil
         guard let path else { return }
         Task {
-            let image = await Task.detached(priority: .utility) { () -> CGImage? in
-                guard let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
-                return CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                                                                       kCGImageSourceThumbnailMaxPixelSize: 600,
-                                                                       kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary)
-            }.value
+            let image = await ImageCache.shared.image(path, pixels: 600)
             guard let image, artworkPath == path else { return }
             #if os(macOS)
             let picture = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))

@@ -124,7 +124,9 @@ final class DropImporter {
     var items: [ImportItem] = []
     /// Move instead of copy: originals go to the Trash once their copy is complete. Off again for every new drop.
     var moveOriginals = false
-    var isPresented = false
+    var isPresented = false {
+        didSet { if !isPresented { lookTask?.cancel(); looking = false } }
+    }
     var destination: SaveLocation? { didSet { if oldValue != destination { checkDuplicates() } } }
     var locations: [SaveLocation] = []
     private(set) var copying = false
@@ -134,18 +136,51 @@ final class DropImporter {
     private(set) var done = false
     /// True while the kit is being checked for files it already has.
     private(set) var checking = false
+    /// True while the dropped files are being looked at (typed and sized), before the sheet can list them.
+    private(set) var looking = false
     @ObservationIgnored private var checkTask: Task<Void, Never>?
+    @ObservationIgnored private var lookTask: Task<Void, Never>?
 
     /// Folders of loose files are opened up; folders of audio stay together as an audiobook or album.
     /// `section` is set when files come from a section's + button, so they land in that section.
+    /// Sizing folders can take a while on a big drive, so it happens off the main thread while the sheet says it's looking.
     func receive(_ urls: [URL], section: ImportKind? = nil) {
-        guard !copying else { return }
+        guard !copying, !urls.isEmpty else { return }
+        lookTask?.cancel()
+        items = []
+        moveOriginals = false
+        copying = false; finished = 0; failures = []; done = false
+        looking = true
+        isPresented = true
+        lookTask = Task { [weak self] in
+            let list = await Task.detached(priority: .userInitiated) { Self.inspect(urls, section: section) }.value
+            guard let self, !Task.isCancelled else { return }
+            self.looking = false
+            guard !list.isEmpty else { self.isPresented = false; return }
+            self.items = list
+            self.locations = SaveLocation.available()
+            // Always offer, and pre-select, the library location they chose, even a custom folder.
+            let primary = KitStorage.primaryLibrary
+            if !self.locations.contains(where: { $0.folder.standardizedFileURL.path == primary.standardizedFileURL.path }) {
+                let parts = primary.pathComponents
+                let onDrive = parts.count > 2 && parts[1] == "Volumes"
+                self.locations.insert(SaveLocation(folder: primary, name: onDrive ? parts[2] : primary.lastPathComponent,
+                                                   symbol: onDrive ? "externaldrive" : "folder"), at: 0)
+            }
+            self.destination = self.locations.first { $0.folder.standardizedFileURL.path == primary.standardizedFileURL.path }
+            self.checkDuplicates()
+        }
+    }
+
+    /// Classifies and sizes what was dropped (the slow part: a dropped folder is walked to add up its size).
+    nonisolated private static func inspect(_ urls: [URL], section: ImportKind?) -> [ImportItem] {
         var list: [ImportItem] = []
         func item(_ url: URL) -> ImportItem {
             let isFolder = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
             return ImportItem(url: url, kind: ImportKind.classify(url).preferring(section, isFolder: isFolder), size: KitTransfer.size(of: url))
         }
         for url in urls {
+            if Task.isCancelled { break }
             let kind = ImportKind.classify(url)
             let isFolder = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
             if isFolder && kind == .unsupported {
@@ -155,22 +190,7 @@ final class DropImporter {
                 list.append(item(url))
             }
         }
-        guard !list.isEmpty else { return }
-        items = list
-        moveOriginals = false
-        locations = SaveLocation.available()
-        // Always offer, and pre-select, the library location they chose, even a custom folder.
-        let primary = KitStorage.primaryLibrary
-        if !locations.contains(where: { $0.folder.standardizedFileURL.path == primary.standardizedFileURL.path }) {
-            let parts = primary.pathComponents
-            let onDrive = parts.count > 2 && parts[1] == "Volumes"
-            locations.insert(SaveLocation(folder: primary, name: onDrive ? parts[2] : primary.lastPathComponent,
-                                          symbol: onDrive ? "externaldrive" : "folder"), at: 0)
-        }
-        copying = false; finished = 0; failures = []; done = false
-        destination = locations.first { $0.folder.standardizedFileURL.path == primary.standardizedFileURL.path }
-        checkDuplicates()
-        isPresented = true
+        return list
     }
 
     var addable: [ImportItem] { items.filter { $0.kind != .unsupported } }
@@ -453,12 +473,20 @@ private struct DropImportSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             header
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach($importer.items) { $item in row($item) }
+            if importer.looking {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Looking…").foregroundStyle(.secondary)
                 }
+                .frame(maxWidth: .infinity, minHeight: 120)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach($importer.items) { $item in row($item) }
+                    }
+                }
+                .frame(minHeight: 120, maxHeight: 360)
             }
-            .frame(minHeight: 120, maxHeight: 360)
             footer
         }
         .padding(24)
@@ -468,14 +496,14 @@ private struct DropImportSheet: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(importer.done ? "Added to your kit" : "Add \(importer.toCopy.count) \(importer.toCopy.count == 1 ? "item" : "items") to your kit?")
+            Text(importer.done ? "Added to your kit" : importer.looking ? "Looking at what you dropped" : "Add \(importer.toCopy.count) \(importer.toCopy.count == 1 ? "item" : "items") to your kit?")
                 .font(.title2.bold())
-            if !importer.done {
+            if !importer.done && !importer.looking {
                 Text("Each file goes where it belongs. Change anything that looks wrong.")
                     .foregroundStyle(.secondary)
                 Picker("Save to", selection: $importer.destination) {
                     ForEach(importer.locations) { location in
-                        Label("\(location.name) · \(ByteCountFormatter.string(fromByteCount: location.freeSpace, countStyle: .file)) free",
+                        Label("\(location.name) · \(ByteCountFormatter.string(fromByteCount: location.cachedFreeSpace, countStyle: .file)) free",
                               systemImage: location.symbol).tag(Optional(location))
                     }
                 }
@@ -532,7 +560,7 @@ private struct DropImportSheet: View {
     }
 
     @ViewBuilder private var footer: some View {
-        let free = importer.destination?.freeSpace ?? 0
+        let free = importer.destination?.cachedFreeSpace ?? 0
         let fits = importer.totalBytes < free - 200_000_000
         let tooBigForFAT = importer.destination?.isFAT32 == true && importer.toCopy.contains { $0.size >= 4_294_967_295 }
         VStack(alignment: .leading, spacing: 10) {
@@ -561,7 +589,7 @@ private struct DropImportSheet: View {
                 }
             }
             HStack {
-                Text(importer.done ? "" : importer.checking ? "Checking what’s already in your kit…" : "\(ByteCountFormatter.string(fromByteCount: importer.totalBytes, countStyle: .file)) to copy")
+                Text(importer.done || importer.looking ? "" : importer.checking ? "Checking what’s already in your kit…" : "\(ByteCountFormatter.string(fromByteCount: importer.totalBytes, countStyle: .file)) to copy")
                     .font(.callout).foregroundStyle(.secondary)
                 Spacer()
                 if importer.done {
@@ -574,7 +602,7 @@ private struct DropImportSheet: View {
                     }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .disabled(importer.copying || importer.checking || importer.toCopy.isEmpty || !fits || tooBigForFAT || importer.destination == nil)
+                    .disabled(importer.copying || importer.looking || importer.checking || importer.toCopy.isEmpty || !fits || tooBigForFAT || importer.destination == nil)
                 }
             }
         }

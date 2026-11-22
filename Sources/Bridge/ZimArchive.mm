@@ -19,6 +19,9 @@ static NSString *S(const std::string &s) {
 @implementation ZimContent
 @end
 
+@implementation ZimArticle
+@end
+
 @implementation ZimArchive {
     std::unique_ptr<zim::Archive> _archive;
 }
@@ -42,6 +45,7 @@ static NSString *S(const std::string &s) {
         _language = [self metadata:@"Language"] ?: @"";
         _creator = [self metadata:@"Creator"] ?: @"";
         _articleCount = _archive->getArticleCount();
+        _entryCount = _archive->getEntryCount();
         _hasFullTextIndex = _archive->hasFulltextIndex();
         try {
             if (_archive->hasMainEntry()) {
@@ -106,6 +110,28 @@ static NSString *S(const std::string &s) {
     return out;
 }
 
+- (NSArray<ZimArticle *> *)articlesFrom:(NSUInteger)start count:(NSUInteger)count maxBytes:(NSUInteger)maxBytes {
+    NSMutableArray *out = [NSMutableArray array];
+    if (start >= _entryCount || count == 0) return out;
+    try {
+        for (const auto &entry : _archive->iterEfficient().offset((int)start, (int)count)) {
+            if (entry.isRedirect()) continue;
+            try {
+                zim::Item item = entry.getItem();
+                if (item.getMimetype().rfind("text/html", 0) != 0) continue;
+                zim::size_type size = item.getSize();
+                zim::Blob blob = item.getData(0, MIN(size, (zim::size_type)maxBytes));
+                ZimArticle *a = [ZimArticle new];
+                a.path = S(item.getPath());
+                a.title = S(entry.getTitle());
+                a.html = [NSData dataWithBytes:blob.data() length:blob.size()];
+                [out addObject:a];
+            } catch (...) { continue; }
+        }
+    } catch (...) {}
+    return out;
+}
+
 - (NSArray<ZimHit *> *)entriesWithMimePrefix:(NSString *)mimePrefix limit:(NSInteger)limit {
     NSMutableArray *out = [NSMutableArray array];
     std::string prefix(mimePrefix.UTF8String);
@@ -136,7 +162,37 @@ static NSString *S(const std::string &s) {
         c.data = [NSData dataWithBytes:blob.data() length:blob.size()];
         c.mimeType = S(item.getMimetype());
         c.path = S(item.getPath());
+        c.totalSize = blob.size();
         return c;
+    } catch (...) {
+        return nil;
+    }
+}
+
+- (nullable ZimContent *)infoAtPath:(NSString *)path {
+    try {
+        zim::Entry entry = _archive->getEntryByPath(std::string(path.UTF8String));
+        zim::Item item = entry.getItem(true);
+        ZimContent *c = [ZimContent new];
+        c.data = [NSData data];
+        c.mimeType = S(item.getMimetype());
+        c.path = S(item.getPath());
+        c.totalSize = item.getSize();
+        return c;
+    } catch (...) {
+        return nil;
+    }
+}
+
+- (nullable NSData *)dataAtPath:(NSString *)path offset:(NSUInteger)offset length:(NSUInteger)length {
+    try {
+        zim::Entry entry = _archive->getEntryByPath(std::string(path.UTF8String));
+        zim::Item item = entry.getItem(true);
+        zim::size_type total = item.getSize();
+        if (offset >= total) return [NSData data];
+        zim::size_type count = MIN((zim::size_type)length, total - (zim::size_type)offset);
+        zim::Blob blob = item.getData((zim::offset_type)offset, count);
+        return [NSData dataWithBytes:blob.data() length:blob.size()];
     } catch (...) {
         return nil;
     }

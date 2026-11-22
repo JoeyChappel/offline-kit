@@ -19,6 +19,8 @@ final class KitNavigation {
     var resourcesPreselected = false
     /// Set by Settings › Copy Offline Kit to a Drive: Kit Care opens Copy my kit when it appears.
     var wantsKitCopy = false
+    /// Ask’s first-run import action opens the existing reference-file picker.
+    var wantsReferenceImport = false
 
     func prepare(_ tab: PrepareTab) {
         prepareTab = tab
@@ -28,6 +30,11 @@ final class KitNavigation {
     func getResources(_ area: SubjectArea? = nil) {
         selection = .resources
         resourceArea = area
+    }
+
+    func importReferences() {
+        selection = .library
+        wantsReferenceImport = true
     }
 
     func ask(about topic: SubjectTopic) {
@@ -133,6 +140,12 @@ struct LibraryBrowser: View {
                 case .topic(let topic): SubjectTopicView(topic: topic)
                 case .archives: ArchiveListView()
                 }
+            }
+        }
+        .onAppear {
+            if navigation.wantsReferenceImport {
+                navigation.wantsReferenceImport = false
+                importing = true
             }
         }
         .onChange(of: path) {

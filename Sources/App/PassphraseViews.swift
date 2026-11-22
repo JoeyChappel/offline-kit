@@ -245,6 +245,8 @@ struct PrivateUnlockPresentation: ViewModifier {
             }
             .onChange(of: asking) { household.unlockPrompting = asking }
             .task {
+                // The details are read after the first frame; whether the drive is locked is known once they are.
+                await household.ensureLoaded()
                 guard household.isLocked, !asked else { return }
                 asked = true
                 try? await Task.sleep(for: .seconds(1))   // let the window settle first
@@ -254,6 +256,7 @@ struct PrivateUnlockPresentation: ViewModifier {
             #if DEBUG
             // Test hook: -setPassphrase "…" turns the passphrase on at launch (drive mode only).
             .task {
+                await household.ensureLoaded()
                 guard let pass = UserDefaults.standard.string(forKey: "setPassphrase"), !household.isLocked else { return }
                 // -editWhileSettingPassphrase "fact" notes a fact while the key is being derived (checks nothing is lost).
                 if let fact = UserDefaults.standard.string(forKey: "editWhileSettingPassphrase") {
@@ -262,6 +265,7 @@ struct PrivateUnlockPresentation: ViewModifier {
                 try? await household.setPassphrase(pass)
             }
             .task {
+                await household.ensureLoaded()
                 guard UserDefaults.standard.bool(forKey: "removePassphrase"), !household.isLocked else { return }
                 try? household.removePassphrase()
             }

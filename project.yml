@@ -12,8 +12,8 @@ settings:
     SWIFT_VERSION: "5.0"
     CLANG_CXX_LANGUAGE_STANDARD: gnu++20
     SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge/Bridging.h
-    MARKETING_VERSION: "0.2.7"
-    CURRENT_PROJECT_VERSION: "9"
+    MARKETING_VERSION: "0.2.8"
+    CURRENT_PROJECT_VERSION: "10"
     GENERATE_INFOPLIST_FILE: YES
     INFOPLIST_KEY_CFBundleDisplayName: Offline Kit
     OTHER_LDFLAGS: ["-lc++"]
@@ -45,6 +45,8 @@ targets:
       - path: THIRD-PARTY-NOTICES.md
         buildPhase: resources
     dependencies:
+      - sdk: Accelerate.framework
+      - sdk: libsqlite3.tbd
       - framework: Vendor/CoreKiwix.xcframework
         embed: false
       - framework: Vendor/llama.xcframework
@@ -121,7 +123,8 @@ targets:
       - Sources/App
       - Sources/iOS
       - path: Resources
-        excludes: ["StarterBooks/**", "Licenses/**"]
+        # The Share on Wi-Fi Home Screen icons are only served by the Mac.
+        excludes: ["StarterBooks/**", "Licenses/**", "WebIcons/**"]
       # Public-domain classics copied into the kit on first launch (kept as a folder in the app).
       - path: Resources/StarterBooks
         type: folder
@@ -133,6 +136,8 @@ targets:
       - path: THIRD-PARTY-NOTICES.md
         buildPhase: resources
     dependencies:
+      - sdk: Accelerate.framework
+      - sdk: libsqlite3.tbd
       - framework: Vendor/CoreKiwix.xcframework
         embed: false
       - framework: Vendor/llama.xcframework
@@ -191,6 +196,7 @@ targets:
     sources:
       - Sources/TV
       - Sources/App/MediaForestBackground.swift
+      - Sources/Core/LaunchTiming.swift
       - Resources/watch-forest.jpg
     settings:
       base:
@@ -222,6 +228,8 @@ targets:
       - Sources/Core
       - Tools/okit
     dependencies:
+      - sdk: Accelerate.framework
+      - sdk: libsqlite3.tbd
       - framework: Vendor/CoreKiwix.xcframework
         embed: false
       - framework: Vendor/llama.xcframework

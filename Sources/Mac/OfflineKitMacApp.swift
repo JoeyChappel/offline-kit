@@ -14,10 +14,15 @@ struct OfflineKitMacApp: App {
     @State private var starterFilms = StarterFilms()
 
     init() {
+        #if DEBUG
+        LaunchTiming.mark("app state created")
+        #endif
         // Release the built-in AI model while the app is still fully alive.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
             // Household saves are debounced; write any edit still waiting so quitting right after a change keeps it.
             MainActor.assumeIsolated { Household.shared?.flushPendingSave() }
+            // Settings in drive mode are written after a short pause; write any still waiting.
+            KitSettings.shared.flush()
             LlamaRuntime.shared.shutdown()
         }
     }
@@ -39,6 +44,7 @@ struct OfflineKitMacApp: App {
 
     /// Rescans the shelves whose folders changed. Each library coalesces overlapping requests (see ScanGate).
     private func rescan(_ shelves: Set<LibraryWatcher.Shelf>) async {
+        library.refreshFolders()
         if shelves.contains(.documents) { KitChanges.shared.documentsChanged() }
         if shelves.contains(.models) { KitChanges.shared.modelsChanged() }
         if shelves.contains(.references) {
@@ -119,6 +125,12 @@ struct OfflineKitMacApp: App {
                 .task {
                     guard !Self.didStartUp else { return }
                     Self.didStartUp = true
+                    #if DEBUG
+                    LaunchTiming.mark("startup task begins")
+                    #endif
+                    // The private details (Keychain + decrypt) are read now, off the main thread, not before the first frame.
+                    Task { await household.ensureLoaded() }
+                    OfflineContentBlocker.prepare()
                     // Opened straight from the disk image: offer to move into Applications first.
                     AppMover.offerMoveIfNeeded()
                     // Downloads can be archives, maps, answer models or media: show whichever it was.
@@ -127,12 +139,19 @@ struct OfflineKitMacApp: App {
                         Task { await library.reload(); await media.reload(library: library); watchLibrary() }
                     }
                     share.attach(library: library, model: model, media: media)
+                    share.attach(games: games)
+                    #if DEBUG
+                    LaunchTiming.mark("before library.reload")
+                    #endif
                     await library.reload()
+                    #if DEBUG
+                    LaunchTiming.mark("library loaded")
+                    #endif
                     // First launch: copy the bundled classic books into the kit.
                     if await StarterBooks.installIfNeeded() { await media.reload(library: library) }
                     LibraryWatcher.shared.onChange = { shelves in Task { await rescan(shelves) } }
                     watchLibrary()
-                    downloads.restore(from: library.folders)
+                    await downloads.restore(from: library.folders)
                     downloads.resumeOwn()
                     AppUpdater.shared.startAutomaticChecks()
                     #if DEBUG
@@ -150,6 +169,8 @@ struct OfflineKitMacApp: App {
                 .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willUnmountNotification)) { note in
                     // Let go of the drive's folders before it goes, so watching never holds up ejecting it.
                     if let volume = note.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL { LibraryWatcher.shared.stop(volume: volume) }
+                    // Settings kept on that drive (drive mode) must not be left waiting to be written after it's gone.
+                    KitSettings.shared.flush()
                 }
                 .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
                     Task { await rescan([.references, .media, .games, .documents, .models]) }
@@ -180,6 +201,7 @@ struct OfflineKitMacApp: App {
                     .keyboardShortcut(".", modifiers: .command)
                     .disabled(nowPlaying.playback == nil)
             }
+            ShareDevicesCommands(share: share)   // Share › Connected Devices…
         }
 
         WindowGroup("Game", for: GameRef.self) { $ref in

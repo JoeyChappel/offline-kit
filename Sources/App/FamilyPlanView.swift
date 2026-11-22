@@ -6,6 +6,7 @@ import SwiftUI
 struct FamilyPlanSection: View {
     @Environment(Household.self) private var household
     @State private var expanded: Set<UUID> = []
+    @State private var editingPlan = false
     /// A person to open and scroll to (from People).
     @Binding var focus: UUID?
     let openPeople: () -> Void
@@ -13,41 +14,24 @@ struct FamilyPlanSection: View {
     var body: some View {
         @Bindable var household = household
         VStack(alignment: .leading, spacing: 16) {
-            SectionCard(symbol: "printer", title: "Print your plan",
-                        subtitle: "Wallet cards fold to credit-card size, one per person. The full plan fits on one page for the fridge or the binder.") {
-                Label(PrintDocuments.privateWarning, systemImage: "exclamationmark.lock.fill")
-                    .font(.callout.weight(.medium)).foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Wallet cards").font(.subheadline.weight(.semibold))
-                    PrintButtons(title: "Wallet cards", filename: "Wallet cards", printLabel: "Print Cards…") {
-                        PrintDocuments.walletCards(household.data)
-                    }
-                    Text("Full plan").font(.subheadline.weight(.semibold)).padding(.top, 4)
-                    PrintButtons(title: "Family emergency plan", filename: "Family emergency plan", printLabel: "Print Plan…") {
-                        PrintDocuments.familyPlan(household.data)
-                    }
-                }
-                .disabled(household.data.people.isEmpty)
-                if household.data.people.isEmpty {
-                    Text("Add the people in your household in People to print cards.").font(.caption).foregroundStyle(.secondary)
-                }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 16) { planHeading; Spacer(); planActions }
+                VStack(alignment: .leading, spacing: 12) { planHeading; planActions }
             }
 
-            SectionCard(symbol: "figure.2.and.child.holdinghands", title: "Whole household",
-                        subtitle: "Where to go and who to call if you’re separated, and how to shut off the utilities.") {
-                PlanField("Meeting place near home", "A neighbor’s porch, the mailbox at the corner…", $household.data.home.meetingPlace)
-                PlanField("Meeting place out of area", "A relative’s house, a library in the next town…", $household.data.extra.plan.meetingOutOfArea)
-                ViewThatFits(in: .horizontal) {
-                    HStack(alignment: .bottom) { outOfAreaName; outOfAreaPhone }
-                    VStack(alignment: .leading) { outOfAreaName; outOfAreaPhone }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 16) {
+                    meetingPlaces.frame(minWidth: 380, maxWidth: .infinity)
+                    contactDetails.frame(minWidth: 250, maxWidth: .infinity)
                 }
-                Divider().padding(.vertical, 4)
-                Text("Utility shutoffs").font(.headline)
-                PlanField("Water", "Where the main valve is and how to turn it", $household.data.extra.plan.waterShutoff)
-                PlanField("Gas", "Meter location, tool needed", $household.data.extra.plan.gasShutoff)
-                PlanField("Electric", "Breaker panel location, main breaker", $household.data.extra.plan.electricShutoff)
-                PlanField("Notes", "Where the wrench is kept, anything else", $household.data.extra.plan.shutoffNotes)
+                VStack(alignment: .leading, spacing: 16) { meetingPlaces; contactDetails }
+            }
+            utilityShutoffs
+            Label(PrintDocuments.privateWarning, systemImage: "exclamationmark.lock.fill")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if household.data.people.isEmpty {
+                Text("Add the people in your household in People to print cards.").font(.caption).foregroundStyle(.secondary)
             }
 
             ForEach(household.data.people) { person in
@@ -79,15 +63,92 @@ struct FamilyPlanSection: View {
         Task { try? await Task.sleep(for: .seconds(1)); if focus == id { focus = nil } }
     }
 
-    private var outOfAreaName: some View {
-        @Bindable var household = household
-        return PlanField("Out-of-area contact", "Someone far away everyone checks in with", $household.data.home.outOfAreaContact)
+    private var planHeading: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Family plan").font(.title2.bold())
+            Text("Where to meet. Who to call. What to know.").font(.callout).foregroundStyle(.secondary)
+        }
     }
 
-    private var outOfAreaPhone: some View {
+    private var planActions: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Button(editingPlan ? "Done" : "Edit plan", systemImage: editingPlan ? "checkmark" : "pencil") {
+                withAnimation(.snappy) { editingPlan.toggle() }
+            }.buttonStyle(.borderedProminent)
+            PrintButtons(title: "Family emergency plan", filename: "Family emergency plan", printLabel: "Print full plan…",
+                         menuPresentation: true,
+                         additionalDocument: .init(title: "Wallet cards", filename: "Wallet cards", printLabel: "Print wallet cards…", pdfLabel: "Save wallet cards as PDF…", enabled: !household.data.people.isEmpty, makeHTML: { PrintDocuments.walletCards(household.data) })) {
+                PrintDocuments.familyPlan(household.data)
+            }
+        }
+    }
+
+    private var meetingPlaces: some View {
         @Bindable var household = household
-        return PlanField("Their phone", "Number", $household.data.extra.plan.outOfAreaPhone, phone: true)
-            .frame(maxWidth: 220)
+        return SectionCard(symbol: "mappin.and.ellipse", title: "Meeting places", subtitle: nil) {
+            if editingPlan {
+                PlanField("Near home", "A neighbor’s porch, the mailbox at the corner…", $household.data.home.meetingPlace)
+                PlanField("Out of the area", "A relative’s house, a library in the next town…", $household.data.extra.plan.meetingOutOfArea)
+            } else {
+                planDetail("Near home", value: household.data.home.meetingPlace, placeholder: "Add a meeting place near home…", symbol: "mappin")
+                Divider()
+                planDetail("Out of the area", value: household.data.extra.plan.meetingOutOfArea, placeholder: "Add an out-of-area meeting place…", symbol: "mappin.and.ellipse")
+            }
+        }
+    }
+
+    private var contactDetails: some View {
+        @Bindable var household = household
+        return SectionCard(symbol: "person.crop.circle", title: "Out-of-area contact", subtitle: "Someone far away everyone checks in with.") {
+            if editingPlan {
+                PlanField("Contact", "Name and location", $household.data.home.outOfAreaContact)
+                PlanField("Their phone", "Number", $household.data.extra.plan.outOfAreaPhone, phone: true)
+            } else {
+                planDetail("Contact", value: household.data.home.outOfAreaContact, placeholder: "Add a contact…", symbol: "person")
+                planDetail("Phone", value: household.data.extra.plan.outOfAreaPhone, placeholder: "Add their phone…", symbol: "phone")
+            }
+        }
+    }
+
+    private var utilityShutoffs: some View {
+        @Bindable var household = household
+        return SectionCard(symbol: "wrench.and.screwdriver", title: "Utility shutoffs", subtitle: nil) {
+            if editingPlan {
+                PlanField("Water", "Where the main valve is and how to turn it", $household.data.extra.plan.waterShutoff)
+                PlanField("Gas", "Meter location, tool needed", $household.data.extra.plan.gasShutoff)
+                PlanField("Electricity", "Breaker panel location, main breaker", $household.data.extra.plan.electricShutoff)
+                PlanField("Notes", "Where the wrench is kept, anything else", $household.data.extra.plan.shutoffNotes)
+            } else {
+                planDetail("Water", value: household.data.extra.plan.waterShutoff, placeholder: "Add location…", symbol: "drop")
+                Divider()
+                planDetail("Gas", value: household.data.extra.plan.gasShutoff, placeholder: "Add location…", symbol: "flame")
+                Divider()
+                planDetail("Electricity", value: household.data.extra.plan.electricShutoff, placeholder: "Add location…", symbol: "bolt")
+                if !household.data.extra.plan.shutoffNotes.isBlank {
+                    Divider()
+                    planDetail("Notes", value: household.data.extra.plan.shutoffNotes, placeholder: "Add notes…", symbol: "note.text")
+                }
+            }
+        }
+    }
+
+    private func planDetail(_ title: String, value: String, placeholder: String, symbol: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol).foregroundStyle(.tint).frame(width: 24).padding(.top, 2)
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                if value.isBlank {
+                    Button(placeholder) { editingPlan = true }.buttonStyle(.borderless)
+                } else {
+                    Text(value).font(.body).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 0)
+            if !value.isBlank {
+                Button("Edit") { editingPlan = true }.buttonStyle(.borderless).font(.callout)
+                    .accessibilityLabel("Edit \(title.lowercased())")
+            }
+        }.padding(.vertical, 4)
     }
 
     /// Reads and writes the person's card, adding it the first time something is entered.

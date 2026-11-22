@@ -74,9 +74,9 @@ enum BookKind: Int, CaseIterable, Comparable {
 extension Book {
     var kind: BookKind { BookKind(name: archive.name) }
     var isOnExternalDrive: Bool { url.path.hasPrefix("/Volumes/") }
-    var volumeName: String? {
-        (try? url.resourceValues(forKeys: [.volumeLocalizedNameKey]))?.volumeLocalizedName
-    }
+    /// The drive's name. Remembered for a minute per volume: the sidebar asks for every book on every redraw,
+    /// and each ask is a disk read (slow on a busy USB drive).
+    var volumeName: String? { VolumeNames.name(for: url) }
 }
 
 extension Int {
@@ -129,5 +129,22 @@ extension View {
         #else
         self
         #endif
+    }
+}
+
+
+/// Volume names remembered briefly, keyed by the volume's root ("/Volumes/Name"), so a list of books on one drive reads it once.
+enum VolumeNames {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var known: [String: (name: String?, at: Date)] = [:]
+
+    static func name(for url: URL) -> String? {
+        let parts = url.standardizedFileURL.pathComponents
+        let root = parts.count > 2 && parts[1] == "Volumes" ? "/Volumes/" + parts[2] : "/"
+        let now = Date()
+        if let hit = lock.withLock({ known[root] }), now.timeIntervalSince(hit.at) < 60 { return hit.name }
+        let name = (try? url.resourceValues(forKeys: [.volumeLocalizedNameKey]))?.volumeLocalizedName
+        lock.withLock { known[root] = (name, now) }
+        return name
     }
 }

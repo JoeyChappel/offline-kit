@@ -29,6 +29,39 @@ enum SharePolicy {
         return real(file).hasPrefix("/Volumes/\(parts[1])/")
     }
 
+    /// Where files may come from when they leave this Mac, worked out once per request from the library folders.
+    /// A file counts only where it really lives (links followed): inside a library folder or the app's caches,
+    /// or covered by a "Keep where it is" link. Links listed in a library on this Mac are the owner's; links listed
+    /// in a library on a drive count only when they stay on that drive, so a drive someone hands you can't point
+    /// Share or Send at the rest of this Mac, and neither can a symlink inside a folder someone gave you.
+    struct Scope: Sendable {
+        private var folders: [String] = []
+        private var files: Set<String> = []
+
+        nonisolated init(libraries: [URL]) {
+            folders = [SharePolicy.real(KitLocation.caches)]
+            for library in libraries {
+                let root = SharePolicy.real(library)
+                folders.append(root)
+                let onDrive = root.hasPrefix("/Volumes/")
+                for entry in LinkedMedia.load([library]) {
+                    let paths = (entry.folder.map { [$0] } ?? []) + entry.tracks
+                    for path in paths {
+                        let url = URL(fileURLWithPath: path)
+                        guard !onDrive || SharePolicy.staysOnDrive(url, libraryRoot: library) else { continue }
+                        if path == entry.folder { folders.append(SharePolicy.real(url)) } else { files.insert(SharePolicy.real(url)) }
+                    }
+                }
+            }
+        }
+
+        nonisolated func allows(_ url: URL) -> Bool {
+            let path = SharePolicy.real(url)
+            if SharePolicy.isOffLimits(url) { return false }
+            return files.contains(path) || folders.contains { path.hasPrefix($0 + "/") }
+        }
+    }
+
     /// The full path with links followed and "..", "." removed.
     nonisolated static func real(_ url: URL) -> String {
         url.standardizedFileURL.resolvingSymlinksInPath().standardizedFileURL.path

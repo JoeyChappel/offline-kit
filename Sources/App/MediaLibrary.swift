@@ -73,10 +73,13 @@ struct MediaProgress: Codable, Equatable {
 
 @MainActor @Observable
 final class MediaLibrary {
-    private(set) var items: [MediaItem] = []
-    private(set) var progress: [String: MediaProgress] = [:]
+    private(set) var items: [MediaItem] = [] { didSet { revision &+= 1 } }
+    private(set) var progress: [String: MediaProgress] = [:] { didSet { revision &+= 1 } }
     /// Length, year, genre, date added and thumbnail for each item, by progress key.
-    private(set) var info: [String: MediaInfo] = [:]
+    private(set) var info: [String: MediaInfo] = [:] { didSet { revision &+= 1 } }
+    /// Goes up whenever items, details or progress change. Screens that work out lists from them (Watch & Listen)
+    /// compare this one number to know when to work them out again, instead of walking the dictionaries.
+    private(set) var revision = 0
     /// The frame each unfinished video was last stopped on, by progress key (see PlaybackStill).
     private var stills: [String: String] = [:]
     private var lastStill: [String: Date] = [:]
@@ -101,6 +104,29 @@ final class MediaLibrary {
            let saved = try? JSONDecoder().decode([String: MediaProgress].self, from: data) {
             progress = saved
         }
+        // Progress is written a few seconds late, so quitting or leaving the app writes whatever is waiting.
+        #if os(macOS)
+        let names = [NSApplication.willTerminateNotification]
+        #else
+        let names = [UIApplication.willTerminateNotification, UIApplication.didEnterBackgroundNotification]
+        #endif
+        for name in names {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.flushProgress() }
+            }
+        }
+    }
+
+    /// Writes waiting progress now, on this thread.
+    func flushProgress() {
+        guard persistDirty else { return }
+        persistDirty = false
+        var snapshot = progress
+        for (key, value) in unpublished { snapshot[key] = value }
+        if let data = try? JSONEncoder().encode(snapshot), let text = String(data: data, encoding: .utf8) {
+            KitSettings.shared.set(text, forKey: "mediaProgress")
+        }
+        KitSettings.shared.flush()   // drive-mode settings are written after a pause; quitting can't wait for it
     }
 
     /// Each library's "Media" folder, plus the older ~/OfflineKit/Kids folder.
@@ -152,27 +178,73 @@ final class MediaLibrary {
         #else
         let libraries: [URL] = []
         #endif
-        let found = await Task.detached(priority: .userInitiated) {
-            // Linked media (kept outside the kit, see Find my media) joins as-is; a missing drive just marks it unavailable.
+        // Walking the folders is quick: it only lists files. Linked media (kept outside the kit, see Find my media)
+        // joins as-is; a missing drive just marks it unavailable.
+        let walked = await Task.detached(priority: .userInitiated) { () -> (found: [MediaItem], links: [LinkedMediaEntry], linked: [MediaItem]) in
             let links = LinkedMedia.load(libraries)
-            return (await AudioTags.organize(Self.scan(roots)) + LinkedMedia.items(links), links)
+            return (Self.scan(roots), links, LinkedMedia.items(links))
         }.value
-        let items = found.0.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
-        var info = await MediaInfoStore.shared.infos(for: items.filter { $0.unavailable == nil })
-        let away = items.filter { $0.unavailable != nil }
-        if !away.isEmpty {
-            let links = Dictionary(found.1.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-            for item in away where info[item.progressKey] == nil {
-                let link = item.linkID.flatMap { links[$0] }
-                var value = MediaInfo(duration: nil, year: MediaCatalog.year(in: item.title), genre: nil, added: link?.added ?? .distantPast, thumb: nil)
-                if item.kind == .book { value.author = link?.creator } else { value.artist = link?.creator }
-                info[item.progressKey] = value
-            }
-        }
+        let links = Dictionary(walked.links.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         let saved = await Task.detached { PlaybackStill.saved() }.value
-        // Everything is read; publish it all at once, so the screen never shows new items with old details.
+
+        // Albums are grouped by their tags. With the tags saved from last time that takes no reading; the very first
+        // time it can take a while, so the folders are shown as found (one item per folder) until it's done.
+        let tagsKnown = await AudioTags.allCached(walked.found)
+        if !tagsKnown && items.isEmpty && !(walked.found + walked.linked).isEmpty {
+            await showItems((walked.found + walked.linked).sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending },
+                            links: links, saved: saved, library: library, readRest: false)
+        }
+        let organized = await Task.detached(priority: .userInitiated) { await AudioTags.organize(walked.found) }.value
+        let all = (organized + walked.linked).sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        let keys = await showItems(all, links: links, saved: saved, library: library, readRest: true)
+        // Details for files that are gone (and their thumbnails) can go now that this scan has seen what's there.
+        let complete = roots.allSatisfy { FileManager.default.fileExists(atPath: $0.path) }
+        await Task.detached(priority: .utility) {
+            MediaInfoStore.shared.prune(keeping: keys, complete: complete)
+            AudioTags.pruneMissing()
+        }.value
+    }
+
+    /// Puts the list on screen right away with whatever details are known (saved ones, or a stand-in for each new
+    /// file), then reads the rest in batches that fill in thumbnails, lengths and titles as they finish.
+    /// Returns the info-cache keys in use.
+    @discardableResult
+    private func showItems(_ items: [MediaItem], links: [String: LinkedMediaEntry], saved: [String: String],
+                           library: Library, readRest: Bool) async -> Set<String> {
+        let local = items.filter { $0.unavailable == nil }
+        let lookup = await MediaInfoStore.shared.lookup(local)
+        var info = lookup.found
+        // What's on screen already beats a stand-in for a file that changed.
+        for (key, stand) in lookup.provisional { info[key] = self.info[key] ?? stand }
+        for item in items where item.unavailable != nil && info[item.progressKey] == nil {
+            let link = item.linkID.flatMap { links[$0] }
+            var value = MediaInfo(duration: nil, year: MediaCatalog.year(in: item.title), genre: nil, added: link?.added ?? .distantPast, thumb: nil)
+            if item.kind == .book { value.author = link?.creator } else { value.artist = link?.creator }
+            info[item.progressKey] = value
+        }
         // Approvals and edits made during the scan are in the catalog file already, so they're applied here.
         Self.applyCatalog(library: library, items: items, info: &info)
+        publish(items: items, info: &info, saved: saved)
+        guard readRest, !lookup.missing.isEmpty else { return lookup.keys }
+        let byKey = Dictionary(items.map { ($0.progressKey, $0) }, uniquingKeysWith: { a, _ in a })
+        await MediaInfoStore.shared.read(lookup.missing) { [weak self] batch in
+            guard let self else { return }
+            var batch = batch
+            let known = batch.keys.compactMap { byKey[$0] }
+            Self.applyCatalog(items: known, info: &batch, catalog: KitCatalog.shared)
+            for (key, var value) in batch {
+                // A frame captured while the scan ran is newer than the one on disk when the scan looked.
+                if let path = self.stills[key] ?? saved[PlaybackStill.hash(key)], self.progress[key]?.finished == false,
+                   byKey[key]?.kind == .video, FileManager.default.fileExists(atPath: path) { value.thumb = path }
+                if self.info[key] != value { self.info[key] = value }
+            }
+        }
+        return lookup.keys
+    }
+
+    /// Sets the list, details and "where you left off" pictures, changing only what's different:
+    /// an unchanged rescan mustn't redraw every card.
+    private func publish(items: [MediaItem], info: inout [String: MediaInfo], saved: [String: String]) {
         var stills: [String: String] = [:]
         for item in items where item.kind == .video {
             let key = item.progressKey
@@ -183,7 +255,6 @@ final class MediaLibrary {
             stills[key] = path
             info[key]?.thumb = path
         }
-        // Only what changed is published: an unchanged rescan mustn't redraw every card.
         if self.items != items { self.items = items }
         if self.info != info { self.info = info }
         if self.stills != stills { self.stills = stills }
@@ -200,6 +271,11 @@ final class MediaLibrary {
     private static func applyCatalog(library: Library, items: [MediaItem], info: inout [String: MediaInfo]) {
         let catalog = KitCatalog.shared
         catalog.reload(library)
+        applyCatalog(items: items, info: &info, catalog: catalog)
+    }
+
+    /// The same overlay without reading the catalog file again, for batches that arrive during a scan.
+    private static func applyCatalog(items: [MediaItem], info: inout [String: MediaInfo], catalog: KitCatalog) {
         for item in items {
             let key = KitCatalog.mediaKey(item)
             guard catalog.details[key] != nil, var value = info[item.progressKey] else { continue }
@@ -266,8 +342,13 @@ final class MediaLibrary {
                     audioByFolder[url.deletingLastPathComponent(), default: []].append(url)
                 } else if bookExtensions.contains(ext) {
                     guard seen.insert(url.standardizedFileURL.path).inserted else { continue }
-                    let title = ext == "epub" ? (EPUBBook.open(url)?.0.title ?? prettyTitle(url.deletingPathExtension().lastPathComponent))
-                                              : prettyTitle(url.deletingPathExtension().lastPathComponent)
+                    let plain = prettyTitle(url.deletingPathExtension().lastPathComponent)
+                    // An EPUB's own title is kept with its details, so only a new or changed book is opened here.
+                    var title = plain
+                    if ext == "epub" {
+                        if let known = MediaInfoStore.shared.cachedBookTitle(url) { title = known.isEmpty ? plain : known }
+                        else { title = EPUBBook.open(url)?.0.title ?? plain }
+                    }
                     items.append(MediaItem(kind: .book, title: title, tracks: [url], root: root, cover: MediaCover.sidecar(for: url)))
                 }
             }
@@ -318,13 +399,54 @@ final class MediaLibrary {
             .trimmingCharacters(in: .whitespaces)
     }
 
+    /// Where saved positions that haven't been published yet wait (see saveProgress).
+    @ObservationIgnored private var unpublished: [String: MediaProgress] = [:]
+    @ObservationIgnored private var persistTask: Task<Void, Never>?
+    @ObservationIgnored private var persistDirty = false
+
+    /// Remembers where someone is. Playback calls this every few seconds, so it stays cheap:
+    /// - a save that says nothing new (same place) changes nothing and writes nothing;
+    /// - while playing, a few seconds of progress within the same chapter is held back from `progress`, so the screens
+    ///   reading it don't redraw every tick; pausing, stopping and changing chapter publish it right away;
+    /// - the settings file is written a moment later, off the main thread, and covers every save made meanwhile.
     func saveProgress(_ value: MediaProgress, for item: MediaItem, stopped: Bool = false) {
+        let key = item.progressKey
+        let known = unpublished[key] ?? progress[key]
+        let same = known.map { $0.track == value.track && $0.seconds == value.seconds && $0.finished == value.finished } ?? false
+        if item.kind == .video { updateStill(item, value, now: stopped) }
+        guard !same else { return }
         var value = value
         value.updated = Date()
-        progress[item.progressKey] = value
-        if item.kind == .video { updateStill(item, value, now: stopped) }
-        if let data = try? JSONEncoder().encode(progress), let text = String(data: data, encoding: .utf8) {
-            KitSettings.shared.set(text, forKey: "mediaProgress")
+        let shown = progress[key]
+        let quiet = !stopped && item.kind != .book && !value.finished && shown != nil && shown?.finished == false && (shown?.seconds ?? 0) >= 3
+            && shown?.track == value.track && abs((shown?.seconds ?? 0) - value.seconds) < 30
+        if quiet {
+            unpublished[key] = value
+        } else {
+            unpublished[key] = nil
+            progress[key] = value
+        }
+        persist(soon: stopped)
+    }
+
+    /// Writes the progress file once a moment from now (sooner when playback has just stopped). Saves that arrive
+    /// in the meantime are covered by the same write, and encoding and writing happen off the main thread.
+    private func persist(soon: Bool) {
+        persistDirty = true
+        guard persistTask == nil else { return }
+        persistTask = Task { [weak self] in
+            try? await Task.sleep(for: soon ? .milliseconds(300) : .seconds(3))
+            while let self, self.persistDirty {
+                self.persistDirty = false
+                var snapshot = self.progress
+                for (key, value) in self.unpublished { snapshot[key] = value }
+                await Task.detached(priority: .utility) {
+                    if let data = try? JSONEncoder().encode(snapshot), let text = String(data: data, encoding: .utf8) {
+                        KitSettings.shared.set(text, forKey: "mediaProgress")
+                    }
+                }.value
+            }
+            self?.persistTask = nil
         }
     }
 
@@ -470,6 +592,7 @@ final class AudiobookDownloads {
     private static func secure(_ link: String) -> URL? {
         guard var parts = URLComponents(string: link) else { return nil }
         if parts.scheme == "http" { parts.scheme = "https" }
+        guard parts.scheme == "https", parts.host?.isEmpty == false else { return nil }   // never file:// or other schemes
         return parts.url
     }
 

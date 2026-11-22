@@ -164,8 +164,10 @@ struct GamesView: View {
             if let game = ref.game { PlayerView(game: game, resumeSavedState: ref.resume) }
         }
         #else
+        // LibraryWatcher already rescans on changes; this only catches what it can't see (a drive that came back
+        // while the app was in the back), and skips the scan when no Games folder changed.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
-            Task { await games.reload(library: library) }
+            Task { await games.reloadIfChanged(library: library) }
         }
         #endif
     }
@@ -174,8 +176,7 @@ struct GamesView: View {
 
     private var shelves: some View {
         let all = games.games
-        let continuing = all.filter(\.canResume)
-            .map { ($0, $0.resumeStateURL.flatMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate } ?? .distantPast) }
+        let continuing = all.compactMap { game in game.resumeState.map { (game, $0.date) } }
             .sorted { $0.1 > $1.1 }
         let favorites = all.filter { games.favorites.contains($0.id) }.sorted(by: byTitle)
         let recent = all.filter { games.lastPlayed[$0.id] != nil }
@@ -610,6 +611,8 @@ private struct GameTileLink: View {
 /// The game's saved picture when it has one, else its system's colors and symbol with the title set on it.
 private struct GameArtwork: View {
     let game: Game
+    @State private var loaded: CGImage?
+    private static let pixels = 768
     var body: some View {
         ZStack {
             if let thumbnail {
@@ -622,13 +625,18 @@ private struct GameArtwork: View {
         .aspectRatio(1.4, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .accessibilityHidden(true)
+        // Read and shrunk off the main thread by the shared cache, and again when a new save changes the picture.
+        .task(id: "\(game.id)|\(game.savedStamp)") {
+            let path = game.thumbnailURL.path
+            if let hit = ImageCache.shared.cached(path, pixels: Self.pixels) { loaded = hit; return }
+            let result = await ImageCache.shared.image(path, pixels: Self.pixels)
+            guard !Task.isCancelled else { return }
+            loaded = result
+        }
     }
     private var thumbnail: Image? {
-        #if os(macOS)
-        NSImage(contentsOf: game.thumbnailURL).map { Image(nsImage: $0) }
-        #else
-        UIImage(contentsOfFile: game.thumbnailURL.path).map { Image(uiImage: $0) }
-        #endif
+        let image = loaded ?? ImageCache.shared.cached(game.thumbnailURL.path, pixels: Self.pixels)
+        return image.map { Image(decorative: $0, scale: 1) }
     }
 }
 

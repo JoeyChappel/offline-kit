@@ -125,8 +125,10 @@ extension MediaCatalog {
     }
 }
 
-/// Embedded tags are read off the main thread and cached by file revision. The original files are never changed.
-struct AudioTags: Sendable {
+/// Embedded tags are read off the main thread and cached by file revision, in memory and on disk beside the info
+/// cache, so a relaunch doesn't read every song again. Artwork is never kept here: it's read on its own, once, when
+/// an album's picture is made (see MediaInfoStore), and shown through the shared ImageCache. Files are never changed.
+struct AudioTags: Sendable, Codable {
     var title: String?
     var album: String?
     var artist: String?
@@ -138,21 +140,101 @@ struct AudioTags: Sendable {
     var duration: Double?
     var artwork: Data?
 
-    private final class Cache: @unchecked Sendable {
+    private enum CodingKeys: String, CodingKey { case title, album, artist, albumArtist, genre, year, disc, number, duration }
+
+    private final class Store: @unchecked Sendable {
         let lock = NSLock()
         var values: [String: AudioTags] = [:]
+        var loaded = false
+        var addedSinceSave = 0
+        var pruned = false
+        let saving = NSLock()
+        var file: URL { MediaInfoStore.folder.appending(path: "tags.json") }
+
+        func get(_ key: String) -> AudioTags? {
+            lock.withLock {
+                if !loaded {
+                    loaded = true
+                    if let data = try? Data(contentsOf: file), let saved = try? JSONDecoder().decode([String: AudioTags].self, from: data) { values = saved }
+                }
+                return values[key]
+            }
+        }
+        func set(_ key: String, _ tag: AudioTags) {
+            let due: Bool = lock.withLock {
+                values[key] = tag
+                addedSinceSave += 1
+                return addedSinceSave >= 300
+            }
+            if due { save() }
+        }
+        func save() {
+            guard saving.try() else { return }
+            defer { saving.unlock() }
+            let snapshot: [String: AudioTags] = lock.withLock { addedSinceSave = 0; return values }
+            try? FileManager.default.createDirectory(at: MediaInfoStore.folder, withIntermediateDirectories: true)
+            try? JSONEncoder().encode(snapshot).write(to: file, options: .atomic)
+        }
     }
-    private static let cache = Cache()
-    static func read(_ url: URL) async -> AudioTags {
+    private static let store = Store()
+
+    private static func revisionKey(_ url: URL) -> String {
         let revision = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-        let key = "\(url.path)|\(revision?.fileSize ?? 0)|\(revision?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
-        if let hit = cache.lock.withLock({ cache.values[key] }) { return hit }
+        return "\(url.path)|\(revision?.fileSize ?? 0)|\(revision?.contentModificationDate?.timeIntervalSince1970 ?? 0)"
+    }
+
+    /// True when every audio file in these items already has its tags saved, so grouping them into albums reads nothing.
+    static func allCached(_ items: [MediaItem]) async -> Bool {
+        for item in items where item.kind == .audio {
+            for url in item.tracks where store.get(revisionKey(url)) == nil { return false }
+        }
+        return true
+    }
+
+    /// Forgets saved tags for files that are gone (once per launch). A file on an unplugged drive is kept.
+    static func pruneMissing() {
+        let (due, snapshot): (Bool, [String]) = store.lock.withLock { (!store.pruned, Array(store.values.keys)) }
+        guard due else { return }
+        store.lock.withLock { store.pruned = true }
+        let fm = FileManager.default
+        let gone = snapshot.filter { key in
+            let path = key.split(separator: "|", omittingEmptySubsequences: false).dropLast(2).joined(separator: "|")
+            return !path.hasPrefix("/Volumes/") && !fm.fileExists(atPath: path)
+        }
+        guard !gone.isEmpty else { return }
+        store.lock.withLock { for key in gone { store.values[key] = nil } }
+        store.save()
+    }
+
+    /// Tags without artwork: from the saved copy when the file hasn't changed, else read from the file.
+    static func read(_ url: URL) async -> AudioTags {
+        let key = revisionKey(url)
+        if let hit = store.get(key) { return hit }
+        let tag = await parse(url, withArtwork: false)
+        // A file that gave nothing at all (a drive that hiccuped) isn't remembered, so it's tried again next time.
+        if tag.title != nil || tag.album != nil || tag.duration != nil { store.set(key, tag) }
+        return tag
+    }
+
+    /// The embedded picture, if the file has one. Read on demand and not kept.
+    static func artwork(_ url: URL) async -> Data? {
+        await parse(url, withArtwork: true).artwork
+    }
+
+    /// Writes anything not saved yet.
+    static func flush() { store.save() }
+
+    private static func parse(_ url: URL, withArtwork: Bool) async -> AudioTags {
         let asset = AVURLAsset(url: url)
         var tag = AudioTags()
         for entry in (try? await asset.load(.metadata)) ?? [] {
             let common = entry.commonKey?.rawValue.lowercased() ?? ""
             let id = entry.identifier?.rawValue.lowercased() ?? ""
-            if common == "artwork", let data = try? await entry.load(.dataValue) { tag.artwork = data; continue }
+            if common == "artwork" {
+                if withArtwork, let data = try? await entry.load(.dataValue) { tag.artwork = data; break }
+                continue
+            }
+            if withArtwork { continue }
             if id.contains("trkn") || id.contains("disk"), let data = try? await entry.load(.dataValue), data.count >= 4 {
                 let number = Int(data[data.startIndex + 2]) * 256 + Int(data[data.startIndex + 3])
                 if id.contains("disk") { tag.disc = number } else { tag.number = number }
@@ -170,8 +252,8 @@ struct AudioTags: Sendable {
                 tag.year = Int(value.prefix(4))
             }
         }
+        if withArtwork { return tag }
         if let duration = try? await asset.load(.duration), duration.seconds.isFinite, duration.seconds > 0 { tag.duration = duration.seconds }
-        cache.lock.withLock { cache.values[key] = tag }
         return tag
     }
 
@@ -184,6 +266,7 @@ struct AudioTags: Sendable {
             for _ in 0..<3 { add() }
             for await (url, tag) in group { tags[url] = tag; add() }
         }
+        flush()
         var groups: [String: (MediaItem, [URL])] = [:]
         var output = items.filter { $0.kind != .audio }
         for item in items where item.kind == .audio {

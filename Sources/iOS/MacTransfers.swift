@@ -127,6 +127,9 @@ final class MacTransfers {
         } catch LoadError.needsPIN {
             phase = .needsPIN
             return true
+        } catch LoadError.refused(let message, let waiting) {
+            refused(message, waiting: waiting, server: server)
+            return true
         } catch {
             if quietly { self.server = nil; phase = .idle; return false }
             phase = .failed("Couldn’t reach Offline Kit on \(server.name). Check that the Mac is awake, the app is open and Share on Wi-Fi is on.")
@@ -149,6 +152,8 @@ final class MacTransfers {
             saved[Self.address(server.baseURL)] = token
             defaults.set(saved, forKey: "fromMacTokens")
             await connect(server)
+        } else if status == 403, let refusal = reply.flatMap({ Self.refusal($0.0) }) {
+            pinError = refusal.message
         } else if status == 429 {
             pinError = "Too many wrong tries. Wait a few minutes, then try again."
         } else {
@@ -163,13 +168,38 @@ final class MacTransfers {
         browse()
     }
 
-    enum LoadError: Error { case needsPIN, server }
+    enum LoadError: Error { case needsPIN, server, refused(String, waiting: Bool) }
+
+    /// The Mac's Connected Devices refusal: {"error": "waiting" | "blocked", "message": "..."} with status 403.
+    nonisolated static func refusal(_ data: Data) -> (message: String, waiting: Bool)? {
+        guard let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let kind = body["error"] as? String, kind == "waiting" || kind == "blocked" else { return nil }
+        let fallback = kind == "waiting" ? "Waiting for the Mac to allow this device…" : "This device has been blocked on the Mac."
+        return ((body["message"] as? String).map { String($0.prefix(200)) } ?? fallback, kind == "waiting")
+    }
+
+    /// Shows why the Mac refused, and while it's waiting for someone at the Mac to click Allow, checks again every few seconds.
+    private func refused(_ message: String, waiting: Bool, server: Server) {
+        phase = .failed(message)
+        guard waiting else { return }
+        // Checks quietly (no loading screen in between) until the Mac answers differently.
+        Task { @MainActor [weak self] in
+            while true {
+                try? await Task.sleep(for: .seconds(4))
+                guard let self, self.phase == .failed(message), self.server?.baseURL == server.baseURL else { return }
+                do { try await self.load(); return }
+                catch LoadError.refused(let now, true) where now == message { continue }
+                catch { await self.connect(server); return }
+            }
+        }
+    }
 
     func load() async throws {
         guard let server else { return }
         let (data, response) = try await URLSession.shared.data(for: request(server.baseURL.appending(path: "api/send")))
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 401 { throw LoadError.needsPIN }
+        if status == 403, let refusal = Self.refusal(data) { throw LoadError.refused(refusal.message, waiting: refusal.waiting) }
         guard status == 200 else { throw LoadError.server }
         let manifest = try JSONDecoder().decode(SendManifest.self, from: data)
         items = manifest.items.filter { $0.files.allSatisfy { SendManifest.isSafe($0.path) } }
@@ -182,7 +212,9 @@ final class MacTransfers {
     }
 
     func refresh() async {
-        do { try await load() } catch LoadError.needsPIN { phase = .needsPIN } catch {
+        do { try await load() } catch LoadError.needsPIN { phase = .needsPIN } catch LoadError.refused(let message, let waiting) {
+            if let server { refused(message, waiting: waiting, server: server) }
+        } catch {
             // Keep the list on screen while downloads are under way; their rows say what stopped.
             if server != nil, items.isEmpty { phase = .failed("Lost the connection to the Mac. Check that it’s awake and on the same Wi-Fi.") }
         }

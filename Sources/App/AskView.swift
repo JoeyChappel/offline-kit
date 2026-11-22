@@ -44,7 +44,8 @@ struct AskView: View {
                             .font(.title2.weight(.semibold)).foregroundStyle(.secondary)
                     }
                     ForEach(model.turns) { turn in
-                        TurnView(turn: turn, large: model.isFullEmergency).id(turn.id)
+                        // Equatable: finished turns don't redraw while a later answer streams in.
+                        TurnView(turn: turn, large: model.isFullEmergency).equatable().id(turn.id)
                     }
                 }
                 .padding(.horizontal, 24)
@@ -176,7 +177,11 @@ struct AskView: View {
         #if os(macOS)
         .onAppear { focused = true }   // on iPhone the keyboard would cover the welcome screen
         #endif
-        .task { await model.refreshOllama() }
+        // Look for Ollama (a result from the last 30 seconds will do), then warm up the built-in model if it will answer.
+        .task(id: model.choice) {
+            await model.refreshOllama(force: false)
+            model.preloadIfNeeded(libraryFolders: library.folders)
+        }
         #if DEBUG
         // Test hook: -startEmergency YES opens Ask with the emergency alert showing.
         .task {
@@ -357,7 +362,23 @@ private struct Suggestion: Identifiable {
 private struct WelcomeView: View {
     @Environment(Library.self) private var library
     @Environment(AskModel.self) private var model
+    @Environment(KitNavigation.self) private var navigation
+    @Environment(DownloadManager.self) private var downloads
+    #if os(macOS)
+    @Environment(\.openSettings) private var openSettings
+    #endif
+    @State private var checkingEngine = false
+    @State private var engineName: String?
+    @State private var engineDestination: String?
+    @State private var showingSettings = false
+    @State private var checkRevision = 0
     let onPick: (String) -> Void
+
+    private var firstRun: Bool { library.books.isEmpty && !library.isLoading }
+    private var availabilityKey: String {
+        [model.choice.rawValue, model.ollamaHost, model.ollamaModel, model.builtInModel,
+         library.folders.map(\.path).joined(separator: "|"), String(firstRun), String(checkRevision)].joined(separator: "|")
+    }
 
     private let suggestions = [
         Suggestion(symbol: "drop", topic: "Water", text: "How do I purify water without power?"),
@@ -377,13 +398,13 @@ private struct WelcomeView: View {
                     Text("A LITTLE KNOWLEDGE. ALWAYS WITH YOU.")
                         .font(.caption.weight(.semibold)).tracking(1.1).foregroundStyle(Color.accentColor)
                 }
-                Text("Ask your offline library")
+                Text(firstRun ? "Your first offline answer starts here" : "Ask your offline library")
                     .font(.system(.largeTitle, design: .rounded, weight: .bold))
-                Text("Trusted references, saved for the moments you need them. Browse by area or ask a question.")
+                Text(firstRun ? "Save a few references, then ask in your own words." : "Trusted references, saved for the moments you need them. Browse by area or ask a question.")
                     .font(.title3)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                FlowLayout(spacing: 6) {
+                if !firstRun { FlowLayout(spacing: 6) {
                     Pill(text: model.usesHomeNetwork ? "Answers use home Wi-Fi" : "Works offline",
                          symbol: model.usesHomeNetwork ? "wifi" : "checkmark.shield", tint: .accentColor)
                     Pill(text: "\(library.books.count) \(library.books.count == 1 ? "reference" : "references")", symbol: "books.vertical")
@@ -391,11 +412,23 @@ private struct WelcomeView: View {
                     let engine = model.engineLabel(libraryFolders: library.folders)
                     Pill(text: engine.name, symbol: "cpu").help(engine.detail)
                 }
-                .padding(.top, 2)
+                .padding(.top, 2) }
             }
 
-            if library.books.isEmpty && !library.isLoading {
-                EmptyLibraryCard()
+            if firstRun {
+                setupCard
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Once references are saved, try asking…").font(.headline).foregroundStyle(.secondary)
+                    FlowLayout(spacing: 10) {
+                        ForEach(["Water without power", "Food during an outage", "Basic home repairs"], id: \.self) { topic in
+                            Text("Example: " + topic).font(.callout).padding(.horizontal, 14).padding(.vertical, 10)
+                                .background(Design.surface, in: Capsule())
+                                .overlay { Capsule().stroke(Design.border) }
+                        }
+                    }
+                    Label("Emergency access remains available.", systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             } else {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Where would you like to start?").font(.headline).foregroundStyle(.secondary)
@@ -409,6 +442,92 @@ private struct WelcomeView: View {
             }
         }
         .padding(.top, 12)
+        .task(id: availabilityKey) {
+            guard firstRun else { return }
+            checkingEngine = true
+            engineName = nil
+            engineDestination = nil
+            await model.refreshOllama()
+            guard !Task.isCancelled else { return }
+            model.libraryFolders = library.folders
+            let engine = await model.resolveEngine()
+            guard !Task.isCancelled else { return }
+            engineName = engine?.displayName
+            if let engine {
+                engineDestination = engine.runsOnDevice ? "Answers are made on this device." : "Answers go to \(model.ollamaHost) on your home network."
+            }
+            checkingEngine = false
+        }
+        #if os(iOS)
+        .sheet(isPresented: $showingSettings) {
+            NavigationStack {
+                SettingsView().navigationTitle("Answer settings")
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingSettings = false; checkRevision += 1 } } }
+            }
+        }
+        #endif
+    }
+
+    private var setupCard: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Label("Set up Ask", systemImage: "books.vertical").font(.title2.bold())
+            setupStep("1", title: "Save trusted references") {
+                Text("Choose what matters to your household. Download once while online.")
+                    .foregroundStyle(.secondary)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 14) { referenceActions }
+                    VStack(alignment: .leading, spacing: 12) { referenceActions }
+                }
+                if downloads.summary != nil { DownloadProgressPanel { navigation.getResources() } }
+            }
+            Divider()
+            setupStep("2", title: "Check your answer engine") {
+                Text("See which engine is available and where answers are made.").foregroundStyle(.secondary)
+                if checkingEngine {
+                    HStack(spacing: 8) { ProgressView().controlSize(.small); Text("Checking available engines…") }
+                        .font(.callout).foregroundStyle(.secondary)
+                } else {
+                    let status = model.engineLabel(libraryFolders: library.folders)
+                    Label(engineName.map { "Available: " + $0 } ?? status.name, systemImage: engineName == nil ? "cpu" : "checkmark.circle")
+                        .font(.callout.weight(.semibold))
+                    Text(engineDestination ?? status.detail).font(.caption).foregroundStyle(.secondary)
+                }
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 12) { engineActions }
+                    VStack(alignment: .leading, spacing: 12) { engineActions }
+                }
+            }
+        }.card(padding: 22)
+    }
+
+    @ViewBuilder private var referenceActions: some View {
+        Button("Choose Resources", systemImage: "arrow.right") { navigation.getResources() }
+            .buttonStyle(.borderedProminent).controlSize(.large)
+        Button("Add local references…") { navigation.importReferences() }.buttonStyle(.borderless)
+            .help("Add .zim reference files you already downloaded.")
+    }
+
+    @ViewBuilder private var engineActions: some View {
+        Button("Check Again", systemImage: "arrow.clockwise") { checkRevision += 1 }
+            .buttonStyle(.bordered).disabled(checkingEngine)
+        Button("Answer settings…", systemImage: "slider.horizontal.3") {
+            #if os(macOS)
+            openSettings()
+            #else
+            showingSettings = true
+            #endif
+        }.buttonStyle(.borderless)
+    }
+
+    private func setupStep<Content: View>(_ number: String, title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .top, spacing: 16) {
+            Text(number).font(.headline).foregroundStyle(.tint)
+                .frame(width: 30, height: 30).overlay { Circle().stroke(Color.accentColor, lineWidth: 2) }
+            VStack(alignment: .leading, spacing: 12) {
+                Text(title).font(.headline)
+                content().font(.callout)
+            }.frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     private var articleCount: Int { library.books.reduce(0) { $0 + Int($1.archive.articleCount) } }
@@ -443,7 +562,8 @@ private struct SuggestionCard: View {
 
 // MARK: - Turn
 
-private struct TurnView: View {
+private struct TurnView: View, Equatable {
+    static func == (a: TurnView, b: TurnView) -> Bool { a.turn == b.turn && a.large == b.large }
     let turn: Turn
     var large = false
     @Environment(\.openArticle) private var openArticle
@@ -592,7 +712,7 @@ private struct TurnView: View {
     }
 
     private func answerText(_ text: String) -> some View {
-        Text(Self.render(text)).font(large ? .title3 : .body).lineSpacing(3).textSelection(.enabled)
+        Text(Self.cachedRender(text, finished: turn.status != .answering && turn.status != .searching)).font(large ? .title3 : .body).lineSpacing(3).textSelection(.enabled)
             .environment(\.openURL, OpenURLAction { url in
                 if url.scheme == "cite", let n = Int(url.host() ?? ""),
                    let source = turn.sources.first(where: { $0.id == n }) {
@@ -626,6 +746,11 @@ private struct TurnView: View {
         case .stopped:
             Label("Stopped by you. The answer is incomplete.", systemImage: "stop.circle")
                 .foregroundStyle(.secondary)
+        case .answering where turn.answer.isEmpty && turn.waking:
+            Label { Text("Waking the answer model…") }
+                icon: { Image(systemName: "bolt.fill") }
+                .foregroundStyle(.secondary)
+            AnswerSkeleton()
         case .answering where turn.answer.isEmpty:
             Label { Text("Reading \(turn.sources.count) source\(turn.sources.count == 1 ? "" : "s")…") }
                 icon: { Image(systemName: "text.book.closed") }
@@ -684,6 +809,24 @@ private struct TurnView: View {
     /// Markdown with [n] turned into tappable cite:// links. "[1, 2]" becomes [1][2] first.
     /// "* " and "- " list markers at the start of a line, which inline Markdown would otherwise show as typed.
     private static let listMarker = try! NSRegularExpression(pattern: "(?m)^([ \\t]*)[*-][ \\t]+")
+
+    /// Finished answers keep their rendered text, so a redraw (hover, scrolling back, a sheet opening) doesn't
+    /// parse the Markdown and run the regexes again. A streaming answer isn't kept: it changes every time.
+    private final class RenderedBox { let text: AttributedString; init(_ text: AttributedString) { self.text = text } }
+    private static let renderCache: NSCache<NSString, RenderedBox> = {
+        let cache = NSCache<NSString, RenderedBox>()
+        cache.countLimit = 60
+        return cache
+    }()
+
+    static func cachedRender(_ text: String, finished: Bool) -> AttributedString {
+        guard finished else { return render(text) }
+        let key = text as NSString
+        if let hit = renderCache.object(forKey: key) { return hit.text }
+        let rendered = render(text)
+        renderCache.setObject(RenderedBox(rendered), forKey: key)
+        return rendered
+    }
 
     static func render(_ text: String) -> AttributedString {
         let bulleted = listMarker.stringByReplacingMatches(

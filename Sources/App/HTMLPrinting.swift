@@ -194,7 +194,22 @@ struct PrintButtons: View {
     let filename: String
     var pageNumbers = false
     var printLabel = "Print…"
+    var menuPresentation = false
+    var additionalDocument: AdditionalDocument?
     let makeHTML: @MainActor () async -> String
+
+    struct AdditionalDocument {
+        let title: String
+        let filename: String
+        let printLabel: String
+        let pdfLabel: String
+        var enabled = true
+        let makeHTML: @MainActor () async -> String
+    }
+
+    @State private var usingAdditionalDocument = false
+    private var currentTitle: String { usingAdditionalDocument ? additionalDocument?.title ?? title : title }
+    private var currentFilename: String { usingAdditionalDocument ? additionalDocument?.filename ?? filename : filename }
     @State private var working = false
     @State private var failed: String?
     /// The PDF just saved, for "Saved to … (Show in Finder)".
@@ -208,12 +223,31 @@ struct PrintButtons: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Button { Task { await print() } } label: { Label(printLabel, systemImage: "printer") }
-                    .buttonStyle(.borderedProminent)
-                Button { Task { await savePDF() } } label: { Label("Save as PDF…", systemImage: "doc.richtext") }
-                    .buttonStyle(.bordered)
-                if working { ProgressView().controlSize(.small) }
+            if menuPresentation {
+                Menu {
+                    Button(printLabel, systemImage: "printer") { usingAdditionalDocument = false; Task { await print() } }
+                    Button("Save plan as PDF…", systemImage: "doc.richtext") { usingAdditionalDocument = false; Task { await savePDF() } }
+                    if let document = additionalDocument {
+                        Divider()
+                        Button(document.printLabel, systemImage: "printer") { usingAdditionalDocument = true; Task { await print() } }
+                            .disabled(!document.enabled)
+                        Button(document.pdfLabel, systemImage: "doc.richtext") { usingAdditionalDocument = true; Task { await savePDF() } }
+                            .disabled(!document.enabled)
+                    }
+                } label: { Label(working ? "Preparing…" : "Print…", systemImage: "printer") }
+                #if os(macOS)
+                .menuStyle(.borderedButton)
+                #else
+                .buttonStyle(.bordered)
+                #endif
+            } else {
+                HStack(spacing: 10) {
+                    Button { Task { await print() } } label: { Label(printLabel, systemImage: "printer") }
+                        .buttonStyle(.borderedProminent)
+                    Button { Task { await savePDF() } } label: { Label("Save as PDF…", systemImage: "doc.richtext") }
+                        .buttonStyle(.bordered)
+                    if working { ProgressView().controlSize(.small) }
+                }
             }
             if let saved {
                 HStack(spacing: 6) {
@@ -241,7 +275,7 @@ struct PrintButtons: View {
         }
         #if os(iOS)
         .fileExporter(isPresented: Binding(get: { exportFile != nil }, set: { if !$0 { exportFile = nil } }),
-                      document: exportFile, contentType: .pdf, defaultFilename: filename) { result in
+                      document: exportFile, contentType: .pdf, defaultFilename: currentFilename) { result in
             exportFile = nil
             if case .success(let url) = result { saved = url }
         }
@@ -252,8 +286,11 @@ struct PrintButtons: View {
     private func makeJob() async -> HTMLPrintJob? {
         working = true
         saved = nil
-        let job = HTMLPrintJob(title: title, pageNumbers: pageNumbers)
-        let full = await job.load(await makeHTML())
+        let job = HTMLPrintJob(title: currentTitle, pageNumbers: pageNumbers)
+        let html: String
+        if usingAdditionalDocument, let document = additionalDocument { html = await document.makeHTML() }
+        else { html = await makeHTML() }
+        let full = await job.load(html)
         if !full.isEmpty {
             let goAhead = await withCheckedContinuation { continuation in
                 tooFullAnswer = continuation
@@ -278,7 +315,7 @@ struct PrintButtons: View {
         #else
         let controller = UIPrintInteractionController.shared
         let info = UIPrintInfo.printInfo()
-        info.jobName = title
+        info.jobName = currentTitle
         info.outputType = .general
         controller.printInfo = info
         controller.printingItem = job.pdfData()
@@ -292,7 +329,7 @@ struct PrintButtons: View {
         #if os(macOS)
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.pdf]
-        panel.nameFieldStringValue = filename + ".pdf"
+        panel.nameFieldStringValue = currentFilename + ".pdf"
         panel.canCreateDirectories = true
         panel.message = "This PDF isn’t encrypted. Anyone who can open the file can read it, so save it somewhere private."
         guard await panel.begin() == .OK, let url = panel.url else { return }

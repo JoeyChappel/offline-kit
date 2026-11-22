@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import CryptoKit
 
 /// A small HTTP/1.1 server on Network.framework. One request per connection (Connection: close),
 /// which keeps it simple and is plenty for a household of phones and tablets.
@@ -30,12 +31,25 @@ final class WebServer: @unchecked Sendable {
         private var finished = false
         init(_ connection: NWConnection) { self.connection = connection }
 
+        // Connected Devices (ShareDevices): headers added to every response (the device cookie), and the bytes written
+        // and the end of the response reported back. Set before the first write.
+        var extraHeaders: [(String, String)] = []
+        var onBytes: (@Sendable (Int64) -> Void)?
+        var onFinish: (@Sendable () -> Void)?
+        private var unreported: Int64 = 0
+        private var extraHeaderLines: String {
+            extraHeaders.map { "\($0.0): \($0.1.filter { $0 != "\r" && $0 != "\n" })\r\n" }.joined()
+        }
+        deinit { if !finished { onFinish?() } }
+
         func send(status: Int, contentType: String, body: Data, headers: [String: String] = [:]) async {
+            // A type can come from inside an archive: a line break in it must not start a header of its own.
+            let contentType = contentType.filter { $0 != "\r" && $0 != "\n" }
             var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\n"
             head += "Connection: close\r\nX-Content-Type-Options: nosniff\r\n"
             if headers["Cache-Control"] == nil { head += "Cache-Control: no-store\r\n" }
-            for (k, v) in headers { head += "\(k): \(v)\r\n" }
-            head += "\r\n"
+            for (k, v) in headers { head += "\(k): \(v.filter { $0 != "\r" && $0 != "\n" })\r\n" }
+            head += extraHeaderLines + "\r\n"
             await write(Data(head.utf8) + body)
             finish()
         }
@@ -51,14 +65,30 @@ final class WebServer: @unchecked Sendable {
 
         /// Sends a file, or the requested byte range of it, reading from disk in 1 MB pieces.
         /// Open-ended ranges are capped at 16 MB so a seek never streams a whole movie in one response.
-        func sendFile(_ link: URL, contentType: String, rangeHeader: String?) async {
+        ///
+        /// `cacheControl` (for artwork and other small files that rarely change) adds ETag and Last-Modified validators and
+        /// answers a matching If-None-Match or If-Modified-Since in `requestHeaders` with 304, so a device keeps its copy.
+        /// Without it the file is sent `no-store`, as video and audio always are.
+        func sendFile(_ link: URL, contentType: String, rangeHeader: String?,
+                      cacheControl: String? = nil, requestHeaders: [String: String] = [:]) async {
             // Follow aliases and symlinks, or the size would be the link's own few bytes.
             let url = link.resolvingSymlinksInPath()
+            let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             guard let handle = try? FileHandle(forReadingFrom: url),
-                  let total = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init), total > 0 else {
+                  let total = values?.fileSize.map(Int64.init), total > 0 else {
                 await send(status: 404, text: "Not found"); return
             }
             defer { try? handle.close() }
+            var validators: [String: String] = [:]
+            if let cacheControl, rangeHeader == nil {
+                let modified = values?.contentModificationDate ?? Date(timeIntervalSince1970: 0)
+                let etag = "\"\(total)-\(Int(modified.timeIntervalSince1970))\""
+                validators = ["ETag": etag, "Last-Modified": WebServer.httpDate(modified), "Cache-Control": cacheControl]
+                if WebServer.isNotModified(requestHeaders, etag: etag, modified: modified) {
+                    await send(status: 304, contentType: contentType, body: Data(), headers: validators)
+                    return
+                }
+            }
             var lower: Int64 = 0, upper = total - 1, status = 200
             if let range = ByteRange(header: rangeHeader, total: Int(total)) {
                 lower = Int64(range.lower); upper = Int64(range.upper); status = 206
@@ -66,9 +96,11 @@ final class WebServer: @unchecked Sendable {
                 if openEnded { upper = min(upper, lower + 16 * 1024 * 1024 - 1) }
             }
             var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\nContent-Type: \(contentType)\r\nContent-Length: \(upper - lower + 1)\r\n"
-            head += "Accept-Ranges: bytes\r\nConnection: close\r\nCache-Control: no-store\r\n"
+            head += "Accept-Ranges: bytes\r\nConnection: close\r\n"
+            if validators.isEmpty { head += "Cache-Control: no-store\r\n" }
+            for (k, v) in validators { head += "\(k): \(v)\r\n" }
             if status == 206 { head += "Content-Range: bytes \(lower)-\(upper)/\(total)\r\n" }
-            head += "\r\n"
+            head += extraHeaderLines + "\r\n"
             await write(Data(head.utf8))
             do {
                 try handle.seek(toOffset: UInt64(lower))
@@ -90,7 +122,7 @@ final class WebServer: @unchecked Sendable {
 
         /// Server-sent events: the body stays open until `finish()`.
         func startEventStream() async {
-            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n"
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n" + extraHeaderLines + "\r\n"
             await write(Data(head.utf8))
         }
 
@@ -104,14 +136,51 @@ final class WebServer: @unchecked Sendable {
         /// False once the other end has gone away.
         @discardableResult
         func write(_ data: Data) async -> Bool {
-            await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
-                connection.send(content: data, completion: .contentProcessed { error in done.resume(returning: error == nil) })
+            // A device that stops reading would hold its connection forever; after a minute with no progress, close it.
+            let sent = Arrived()
+            let connection = self.connection
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 60) { if !sent.value { connection.cancel() } }
+            let ok = await withCheckedContinuation { (done: CheckedContinuation<Bool, Never>) in
+                connection.send(content: data, completion: .contentProcessed { error in
+                    sent.value = true
+                    done.resume(returning: error == nil)
+                })
             }
+            if ok, let onBytes {
+                unreported += Int64(data.count)
+                if unreported >= 2 << 20 { onBytes(unreported); unreported = 0 }   // reported every 2 MB, and at the end
+            }
+            return ok
+        }
+
+        /// Switches this connection to a WebSocket (RFC 6455), for the one route that streams games. Answers 400 and
+        /// returns nil when the request isn't a valid upgrade. The caller has already checked sign-in, Host and Origin.
+        ///
+        /// Timeouts after the switch: the 30-second request timeout no longer applies (the request has arrived); a send
+        /// that makes no progress for 60 seconds still closes the connection, but only while a send is waiting (see
+        /// WebSocket). An idle socket is closed when the device stops checking in.
+        func upgradeToWebSocket(_ request: Request) async -> WebSocket? {
+            let headers = request.headers
+            guard request.method == "GET",
+                  headers["upgrade"]?.lowercased().contains("websocket") == true,
+                  headers["connection"]?.lowercased().split(separator: ",").contains(where: { $0.trimmingCharacters(in: .whitespaces) == "upgrade" }) == true,
+                  headers["sec-websocket-version"] == "13",
+                  let key = headers["sec-websocket-key"], Data(base64Encoded: key)?.count == 16 else {
+                await send(status: 400, text: "Expected a WebSocket upgrade.")
+                return nil
+            }
+            let accept = Data(Insecure.SHA1.hash(data: Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8))).base64EncodedString()
+            let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n"
+            finished = true   // the connection now belongs to the WebSocket
+            guard await write(Data(head.utf8)) else { connection.cancel(); return nil }
+            return WebSocket(connection)
         }
 
         func finish() {
             guard !finished else { return }
             finished = true
+            if unreported > 0 { onBytes?(unreported); unreported = 0 }
+            onFinish?()
             connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [connection] _ in
                 connection.cancel()
             })
@@ -120,8 +189,10 @@ final class WebServer: @unchecked Sendable {
         static func reason(_ status: Int) -> String {
             switch status {
             case 200: "OK"
+            case 101: "Switching Protocols"
             case 206: "Partial Content"
             case 302: "Found"
+            case 304: "Not Modified"
             case 400: "Bad Request"
             case 401: "Unauthorized"
             case 403: "Forbidden"
@@ -135,6 +206,31 @@ final class WebServer: @unchecked Sendable {
     }
 
     typealias Handler = @Sendable (Request, Responder) async -> Void
+
+    // MARK: Conditional requests
+
+    private static let httpDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = TimeZone(identifier: "GMT")
+        f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        return f
+    }()
+
+    /// "Sat, 21 Nov 2026 17:00:00 GMT"
+    static func httpDate(_ date: Date) -> String { httpDateFormatter.string(from: date) }
+
+    /// True when the device's copy is still current: its If-None-Match lists this ETag, or (with no ETag sent) its
+    /// If-Modified-Since is not older than the file.
+    static func isNotModified(_ headers: [String: String], etag: String, modified: Date) -> Bool {
+        if let match = headers["if-none-match"] {
+            return match == "*" || match.split(separator: ",").contains { $0.trimmingCharacters(in: .whitespaces) == etag || $0.trimmingCharacters(in: .whitespaces) == "W/" + etag }
+        }
+        if let since = headers["if-modified-since"], let date = httpDateFormatter.date(from: since) {
+            return modified.timeIntervalSince1970.rounded(.down) <= date.timeIntervalSince1970
+        }
+        return false
+    }
 
     private let queue = DispatchQueue(label: "OfflineKit.WebServer")
     private var listener: NWListener?
@@ -156,6 +252,8 @@ final class WebServer: @unchecked Sendable {
                 // Lets the server take back its port while the last run's connections are still winding down.
                 // isPortFree has already made sure no other program is listening on it.
                 params.allowLocalEndpointReuse = true
+                // Wi-Fi, Ethernet and this Mac only: not VPN tunnels, which can reach well beyond the home.
+                params.prohibitedInterfaceTypes = [.other, .cellular]
                 let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: candidate)!)
                 // The TXT record lets the Apple TV app tell Offline Kit apart from other web servers on the network.
                 if let serviceName {
@@ -249,12 +347,19 @@ final class WebServer: @unchecked Sendable {
             connection.cancel()
             return
         }
-        // A cap on open connections, so one device can't tie up the server for everyone.
-        guard openConnections < 48 else { connection.cancel(); return }
+        // A cap on open connections, overall and per device, so one device can't tie up the server for everyone.
+        let device = ShareDeviceKey.key(remote)
+        guard openConnections < 48, connectionsByDevice[device, default: 0] < 16 else { connection.cancel(); return }
         openConnections += 1
-        connection.stateUpdateHandler = { [weak self] state in
+        connectionsByDevice[device, default: 0] += 1
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
             switch state {
-            case .cancelled, .failed: self?.openConnections -= 1
+            case .failed: connection?.cancel()   // counted once, when it reaches .cancelled
+            case .cancelled:
+                guard let self else { return }
+                self.openConnections -= 1
+                let left = self.connectionsByDevice[device, default: 1] - 1
+                self.connectionsByDevice[device] = left > 0 ? left : nil
             default: break
             }
         }
@@ -268,6 +373,7 @@ final class WebServer: @unchecked Sendable {
     private final class Arrived: @unchecked Sendable { var value = false }
     /// Changed only on `queue`, where connections are accepted and report their state.
     private var openConnections = 0
+    private var connectionsByDevice: [String: Int] = [:]
 
     private func receive(_ connection: NWConnection, buffer: Data, remote: String, arrived: Arrived) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
@@ -333,5 +439,15 @@ final class WebServer: @unchecked Sendable {
         if h.hasPrefix("::ffff:") { return isLocal(String(h.dropFirst(7))) }
         if h.hasPrefix("172."), let second = Int(h.split(separator: ".")[1]), (16...31).contains(second) { return true }
         return false
+    }
+}
+
+enum ShareDeviceKey {
+    /// One key per device address, for counting wrong PINs and open connections. Not grouped by IPv6 network:
+    /// every device on a home network shares the router's /64. Address-hopping is covered by the overall limits.
+    nonisolated static func key(_ host: String) -> String {
+        let address = (host.split(separator: "%").first.map(String.init) ?? host).lowercased()
+        if address.hasPrefix("::ffff:"), address.contains(".") { return String(address.dropFirst(7)) }   // IPv4 as IPv6
+        return address
     }
 }
