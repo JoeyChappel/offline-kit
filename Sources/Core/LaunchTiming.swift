@@ -1,4 +1,7 @@
 import Foundation
+#if DEBUG
+import Darwin
+#endif
 
 #if DEBUG
 /// Debug-only launch timing: how long from the process starting to the main window's first onAppear.
@@ -62,8 +65,25 @@ enum StallProbe {
         return ms(info.user_time) + ms(info.system_time)
     }
 
+    private static var lastInstructions: UInt64 = 0
+
+    /// Instructions retired by the whole process so far, in millions. Counts work, not time, so a run on a busy
+    /// machine compares with one on a quiet one (all threads: decoding off the main thread is included).
+    private static func instructions() -> UInt64 {
+        #if os(macOS)
+        var usage = rusage_info_v4()
+        let result = withUnsafeMutablePointer(to: &usage) {
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_V4, $0) }
+        }
+        return result == 0 ? usage.ri_instructions / 1_000_000 : 0
+        #else
+        return 0
+        #endif
+    }
+
     static func start() {
         guard timer == nil else { return }
+        lastInstructions = instructions()
         last = DispatchTime.now().uptimeNanoseconds
         mainThread = mach_thread_self()
         lastCPU = cpuMilliseconds()
@@ -85,8 +105,10 @@ enum StallProbe {
         let total = gaps.reduce(0, +), longest = gaps.max() ?? 0
         let hitches = gaps.filter { $0 > 33 }.count
         let cpu = cpuMilliseconds()
-        NSLog("STALL %@ total=%.0f ms longest=%.0f ms over33=%d cpu=%.0f", label, total, longest, hitches, cpu - lastCPU)
+        let instr = instructions()
+        NSLog("STALL %@ total=%.0f ms longest=%.0f ms over33=%d cpu=%.0f instr=%llu", label, total, longest, hitches, cpu - lastCPU, instr - lastInstructions)
         lastCPU = cpu
+        lastInstructions = instr
         gaps.removeAll()
     }
 }

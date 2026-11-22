@@ -142,6 +142,57 @@ enum Bench {
         print("Emergency instructions: \(LlamaRuntime.lastPrefill.reused) of \(LlamaRuntime.lastPrefill.total) prompt tokens reused")
     }
 
+    /// Checks that a follow-up's answer doesn't depend on whether the conversation's state was prepared: each
+    /// conversation's second question answered with greedy sampling after only the instructions were saved, and
+    /// after the conversation so far was prepared and restored.
+    /// usage: OFFLINEKIT_GREEDY=1 okit --followup-check <conversations.txt>   (okit --ask-bench's format)
+    static func followUpCheck(file: String) async {
+        let text = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
+        let conversations = text.components(separatedBy: "\n---").map {
+            $0.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        }.filter { $0.count >= 2 }
+        let library = Library()
+        await library.reload()
+        await prepare(library: library)
+        guard let model = LocalModels.selected(libraryFolders: library.folders, id: "") else { print("No model"); return }
+        let engine = LlamaEngine(model: model)
+        let tokens: Int32 = { if case .ready(let t) = model.plan { return t }; return 4096 }()
+        let archives = library.books.map(\.archive)
+        let context = AskContext.build(HouseholdData(privacy: AskPrivacy(personalize: false)), kit: AskModel.kitSummary(library),
+                                       limit: engine.contextBudget)
+        func answer(_ prompt: String, head: String?) -> (String, Double) {
+            var out = ""
+            let start = Date()
+            try? LlamaRuntime.shared.generate(file: model.url, contextTokens: tokens, custom: model.isCustom, system: AskModel.instructions,
+                                              user: prompt, head: head, maxTokens: 160, isCancelled: { false }) { out = $0 }
+            return (out, Date().timeIntervalSince(start))
+        }
+        var same = 0
+        for turns in conversations {
+            let first = AskModel.prompt(question: turns[0], sources: await retrieve(turns[0], archives: archives, budget: engine.sourceBudget),
+                                        context: context)
+            let (reply, _) = answer(first, head: AskModel.promptHead(context: context, history: ""))
+            let history = "Q: \(turns[0])\nA: \(AskModel.withoutCitations(String(reply.prefix(1_500))))"
+            let head = AskModel.promptHead(context: context, history: history)
+            let second = head + AskModel.promptQuestion(question: turns[1],
+                                                        sources: await retrieve(turns[1], archives: archives, budget: engine.sourceBudget))
+            LlamaRuntime.shared.forgetInstructions()
+            _ = answer(first, head: nil)                        // instructions saved again, nothing else
+            let (plain, plainTime) = answer(second, head: nil)
+            let plainReused = LlamaRuntime.lastPrefill.reused
+            LlamaRuntime.shared.prepareConversation(file: model.url, contextTokens: tokens, custom: model.isCustom,
+                                                    system: AskModel.instructions, head: head)
+            let (prepared, preparedTime) = answer(second, head: head)
+            let ok = plain == prepared
+            if ok { same += 1 }
+            print(String(format: "%@  instructions only %.2fs (%d tokens reused), conversation prepared %.2fs (%d of %d reused)  %@ → %@",
+                         ok ? "SAME" : "DIFFERENT", plainTime, plainReused, preparedTime, LlamaRuntime.lastPrefill.reused,
+                         LlamaRuntime.lastPrefill.total, turns[0], turns[1]))
+            if !ok { print("  instructions only: \(plain.prefix(300))\n  prepared:          \(prepared.prefix(300))") }
+        }
+        print("\(same) of \(conversations.count) follow-up answers identical")
+    }
+
     /// Anything the library needs before a fair measurement (PDF text, answer index).
     static func prepare(library: Library) async {
         try? await Task.sleep(for: .milliseconds(200))

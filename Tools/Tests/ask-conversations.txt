@@ -1,0 +1,13 @@
+# Ask conversation benchmark (okit --ask-bench): three conversations of a question and two follow-ups.
+# Topics the synthetic test archives and the real MDWiki, Stack Exchange and iFixit archives both cover.
+What should I do for a burn from boiling water?
+Should I put ice on it?
+What if it blisters?
+---
+How do I fix a leaking faucet?
+What tools do I need for that?
+What if it still drips afterward?
+---
+How can I purify water without power?
+How long should I boil it?
+Is that different at high altitude?

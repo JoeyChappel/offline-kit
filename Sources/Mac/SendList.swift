@@ -243,21 +243,15 @@ extension WebServer.Responder {
         if status == 206 { head += "Content-Range: bytes \(lower)-\(upper)/\(total)\r\n" }
         head += "\r\n"
         guard await write(Data(head.utf8)) else { finish(complete: false); return }
-        let chunkSize = throttleKBps > 0 ? 64 * 1024 : 1 << 20
-        var remaining = length
-        do {
-            try handle.seek(toOffset: UInt64(lower))
-            while remaining > 0 {
-                let chunk = try handle.read(upToCount: Int(min(remaining, Int64(chunkSize)))) ?? Data()
-                if chunk.isEmpty { break }
-                // Stop reading as soon as the phone goes away (paused, out of range), instead of reading the rest of a big file.
-                guard await write(chunk) else { break }
-                remaining -= Int64(chunk.count)
-                if throttleKBps > 0 { try? await Task.sleep(for: .seconds(Double(chunk.count) / Double(throttleKBps * 1024))) }
-            }
-        } catch {}
+        // Stops reading as soon as the phone goes away (paused, out of range), instead of reading the rest of a big file.
+        var pause: (@Sendable (Int) -> Double)?
+        if throttleKBps > 0 {
+            let bytesPerSecond = Double(throttleKBps) * 1024
+            pause = { bytes in Double(bytes) / bytesPerSecond }
+        }
+        let sent = await writeFile(handle, from: lower, length: length, chunk: throttleKBps > 0 ? 64 * 1024 : 1 << 20, pause: pause)
         // Short of the Content-Length (the phone went away, or the file changed): the connection has to close.
-        finish(complete: remaining == 0)
+        finish(complete: sent == length)
     }
 
     nonisolated static func httpDate(_ date: Date) -> String {

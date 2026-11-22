@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Writes Tests/Fixtures/tiny.zim: six short hand-written articles for the unit tests (answer index build and query).
 
-usage: make-tiny-zim.py [out.zim]
+usage: make-tiny-zim.py [out.zim] [--index]
 
 Builds the zimwrite helper (make-test-zim/zimwrite.mm, the libzim writer in Vendor/CoreKiwix.xcframework) in a temp
-folder. No downloads, no real content. The archive has no full-text index, which keeps it small.
+folder. No downloads, no real content. The archive has no full-text index, which keeps it small; --index writes
+Tests/Fixtures/tiny-indexed.zim, the same articles with one (for the libzim search tests).
 """
 import subprocess
 import sys
@@ -79,7 +80,9 @@ def html(title, sections):
 
 
 def main():
-    out = Path(sys.argv[1]) if len(sys.argv) > 1 else APP / "Tests/Fixtures/tiny.zim"
+    args = [a for a in sys.argv[1:] if a != "--index"]
+    index = "--index" in sys.argv[1:]
+    out = Path(args[0]) if args else APP / ("Tests/Fixtures/tiny-indexed.zim" if index else "Tests/Fixtures/tiny.zim")
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         writer = tmp / "zimwrite"
@@ -91,7 +94,7 @@ def main():
         records.write_text("\x1e".join(f"{p}\x1f{t}\x1f{html(t, s)}" for p, t, s in ARTICLES), encoding="utf-8")
         out.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([str(writer), str(records), str(out), "test_tiny_en", "Tiny (test)",
-                        "Six short articles for Offline Kit unit tests", "noindex"], check=True)
+                        "Six short articles for Offline Kit unit tests"] + ([] if index else ["noindex"]), check=True)
     print(f"{out}: {out.stat().st_size} bytes")
 
 

@@ -20,13 +20,25 @@ final class ImageCache: @unchecked Sendable {
     private var stamps: [String: (date: TimeInterval, checked: Date)] = [:]
 
     private init() {
+        // iPhone and Apple TV are ended by the system at far lower memory than a Mac, so they keep less decoded art
+        // (the Mac's peak is dominated by GPU text surfaces, not this cache: 128 MB vs 48 MB changed it by under 5%).
+        #if os(macOS)
         var megabytes = 128
+        #elseif os(tvOS)
+        var megabytes = 64
+        #else
+        var megabytes = 48
+        #endif
         #if DEBUG
         // Test hook: -imageCacheMB N sets the cap, for comparing memory and scrolling.
         if let value = Int(UserDefaults.standard.string(forKey: "imageCacheMB") ?? ""), value > 0 { megabytes = value }
         #endif
         cache.totalCostLimit = megabytes * 1024 * 1024
+        #if os(macOS)
         cache.countLimit = 800
+        #else
+        cache.countLimit = 300
+        #endif
     }
 
     /// The decode size for a view this many points across on a screen of this scale, rounded up to a few sizes so a

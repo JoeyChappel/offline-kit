@@ -758,6 +758,18 @@ private final class SessionControl: @unchecked Sendable {
             return latest
         }
     }
+
+    /// Streamed games: when the main thread last got a picture (see GameSession.present).
+    private var lastHandedOn: CFTimeInterval = 0
+    /// True at most once per `interval` seconds.
+    func dueForMainThread(every interval: CFTimeInterval) -> Bool {
+        let now = CACurrentMediaTime()
+        return lock.withLock {
+            guard now - lastHandedOn >= interval else { return false }
+            lastHandedOn = now
+            return true
+        }
+    }
 }
 
 /// Messages the core sent while a game was loading (ScummVM says "Game not found" when it doesn't recognize a folder).
@@ -1213,7 +1225,12 @@ final class GameSession {
     /// Called on the emulation thread; drops frames rather than queueing if the main thread is busy.
     /// Only the newest picture is kept, and at most one hop to the main thread is waiting at a time.
     nonisolated private func present(_ image: CGImage) {
-        streamSink?.streamFrame(image)
+        if let streamSink {
+            streamSink.streamFrame(image)
+            // No window shows a streamed game: the main thread only keeps the latest picture for the autosave and the
+            // shelf picture, so it gets one a few times a second instead of being woken for every frame.
+            guard control.dueForMainThread(every: 0.25) else { return }
+        }
         guard control.submit(image) else { return }
         Task { @MainActor [weak self] in
             guard let self, let image = control.takeLatest() else { return }

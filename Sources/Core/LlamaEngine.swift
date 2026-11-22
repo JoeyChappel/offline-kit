@@ -113,6 +113,13 @@ final class LlamaRuntime: @unchecked Sendable {
     private var prefixes: [(tokens: [llama_token], state: [UInt8])] = []
     /// Instructions shorter than this aren't worth keeping (the search-words and note-taking prompts).
     static let minimumPrefixTokens = 256
+    /// The current conversation's settled part evaluated (instructions, household context, earlier turns), so a
+    /// follow-up evaluates only its question and sources. One conversation; released on New Conversation, on
+    /// unload and under memory pressure. Saved and restored whole, never trimmed: Gemma's sliding-window layers
+    /// keep only the last window, so a longer state can't be cut back to a shorter one. Guarded by `lock`.
+    private var conversation: (tokens: [llama_token], state: [UInt8])?
+    /// Generations waiting for `lock`. A background warm-up stops at its next step when one arrives.
+    private let waiting = Counter()
 
     /// What is loaded and when it was last used, readable without waiting for a load or a generation to finish.
     private let stateLock = NSLock()
@@ -142,11 +149,12 @@ final class LlamaRuntime: @unchecked Sendable {
     private init() {
         Self.created.value = true
         llama_backend_init()
-        // Low memory: give the model back unless it's answering right now (it loads again on the next question).
-        let source = DispatchSource.makeMemoryPressureSource(eventMask: .critical, queue: .global(qos: .utility))
-        source.setEventHandler { [weak self] in
+        // Memory getting short: let go of the saved conversation (a follow-up just evaluates its history again).
+        // Low memory: give the model back too, unless it's answering right now (it loads again on the next question).
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .global(qos: .utility))
+        source.setEventHandler { [weak self, weak source] in
             guard let self, self.lock.try() else { return }
-            self.unload()
+            if source?.data.contains(.critical) == true { self.unload() } else { self.conversation = nil }
             self.lock.unlock()
         }
         source.resume()
@@ -172,7 +180,14 @@ final class LlamaRuntime: @unchecked Sendable {
             if let prefix = instructionTokens(system: instructions, custom: custom, vocab: vocab),
                !prefixes.contains(where: { $0.tokens == prefix }) {
                 llama_memory_clear(llama_get_memory(context), true)
-                if (try? decode(prefix[...], context: context, isCancelled: { false })) == true { keepPrefix(prefix, context: context) }
+                if (try? decode(prefix[...], context: context, isCancelled: { false })) == true {
+                    keepPrefix(prefix, context: context)
+                    // One more token on its own: the first answer otherwise waits while Metal sets up the
+                    // one-token steps answers are generated in. (Every prompt restores a saved state first.)
+                    var token = prefix[prefix.count - 1]
+                    _ = llama_decode(context, llama_batch_get_one(&token, 1))
+                    llama_synchronize(context)
+                }
             }
         }
     }
@@ -245,6 +260,7 @@ final class LlamaRuntime: @unchecked Sendable {
         model = nil
         loadedPath = nil
         prefixes = []
+        conversation = nil
         Self.readyBox.set(nil)
     }
 
@@ -317,8 +333,15 @@ final class LlamaRuntime: @unchecked Sendable {
     /// The tokens every prompt with these instructions starts with: the chat template up to where the question
     /// goes, less its last two tokens (which can merge with the question's first words). Nil when too short to keep.
     private func instructionTokens(system: String, custom: Bool, vocab: OpaquePointer?) -> [llama_token]? {
+        settledTokens(system: system, head: "", custom: custom, vocab: vocab)
+    }
+
+    /// The same for a prompt that starts with `head` (the household context and earlier turns, which the next
+    /// question in the conversation starts with too): the template up to the end of `head`, less its last two
+    /// tokens. A prompt starts with these tokens exactly when it starts with `head`, whatever follows.
+    private func settledTokens(system: String, head: String, custom: Bool, vocab: OpaquePointer?) -> [llama_token]? {
         let marker = "\u{1F}OKQ\u{1F}"
-        let formatted = format(system: system, user: marker, custom: custom)
+        let formatted = format(system: system, user: head + marker, custom: custom)
         guard let range = formatted.range(of: marker) else { return nil }
         let prefix = String(formatted[..<range.lowerBound])
         let needed = -llama_tokenize(vocab, prefix, Int32(prefix.utf8.count), nil, 0, true, true)
@@ -328,21 +351,101 @@ final class LlamaRuntime: @unchecked Sendable {
         return Array(tokens.dropLast(2))
     }
 
-    /// Saves the state the model is in right after evaluating `tokens`, for the next prompt that starts with them.
-    private func keepPrefix(_ tokens: [llama_token], context: OpaquePointer) {
+    /// The model's state right after evaluating `tokens` (all of sequence 0), or nil.
+    private func saveState(_ context: OpaquePointer) -> [UInt8]? {
         let size = llama_state_seq_get_size(context, 0)
-        guard size > 0 else { return }
+        guard size > 0 else { return nil }
         var state = [UInt8](repeating: 0, count: size)
         let written = state.withUnsafeMutableBufferPointer { llama_state_seq_get_data(context, $0.baseAddress, size, 0) }
-        guard written > 0 else { return }
+        guard written > 0 else { return nil }
+        if written < size { state.removeLast(size - written) }
+        return state
+    }
+
+    /// Keeps the state after the conversation's settled part, for the follow-up.
+    private func keepConversation(_ tokens: [llama_token], context: OpaquePointer) {
+        conversation = nil   // the old one goes first: two at once would be tens of megabytes more at the peak
+        guard let state = saveState(context) else { return }
+        conversation = (tokens, state)
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil {
+            FileHandle.standardError.write(Data("llama: kept the conversation's first \(tokens.count) tokens (\(state.count / 1_048_576) MB of state)\n".utf8))
+        }
+        #endif
+    }
+
+    /// Restores the longest saved state the prompt starts with (the conversation, or its instructions) and
+    /// returns how many of its tokens that covers; 0 with a cleared context when none fits.
+    private func restoreLongest(for tokens: [llama_token], context: OpaquePointer) -> Int {
+        let memory = llama_get_memory(context)
+        llama_memory_clear(memory, true)
+        var candidates: [(tokens: [llama_token], state: [UInt8])] = prefixes
+        if let conversation { candidates.append(conversation) }
+        for saved in candidates.sorted(by: { $0.tokens.count > $1.tokens.count })
+        where tokens.count > saved.tokens.count && tokens.starts(with: saved.tokens) {
+            let restored = saved.state.withUnsafeBufferPointer { llama_state_seq_set_data(context, $0.baseAddress, $0.count, 0) }
+            if restored > 0 { return saved.tokens.count }
+            llama_memory_clear(memory, true)
+        }
+        return 0
+    }
+
+    /// Saves the state the model is in right after evaluating `tokens`, for the next prompt that starts with them.
+    private func keepPrefix(_ tokens: [llama_token], context: OpaquePointer) {
+        guard let state = saveState(context) else { return }
         prefixes.removeAll { $0.tokens == tokens }
-        prefixes.insert((tokens, Array(state.prefix(written))), at: 0)
+        prefixes.insert((tokens, state), at: 0)
         if prefixes.count > 2 { prefixes.removeLast() }
         #if DEBUG
         if ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil {
-            FileHandle.standardError.write(Data("llama: kept \(tokens.count) instruction tokens (\(written / 1_048_576) MB of state)\n".utf8))
+            FileHandle.standardError.write(Data("llama: kept \(tokens.count) instruction tokens (\(state.count / 1_048_576) MB of state)\n".utf8))
         }
         #endif
+    }
+
+    /// Evaluates the next question's settled part ahead of time (instructions, household context and the
+    /// conversation so far), so the follow-up only evaluates its question and sources. Blocking; call off the main
+    /// thread. Does nothing when the model isn't loaded, and stops at its next step when a question arrives.
+    func prepareConversation(file: URL, contextTokens: Int32, custom: Bool, system: String, head: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard loadedPath == file.path, self.contextTokens == UInt32(contextTokens), let model, let context else { return }
+        let vocab = llama_model_get_vocab(model)
+        guard let target = settledTokens(system: system, head: head, custom: custom, vocab: vocab),
+              conversation?.tokens != target else { return }
+        let waiting = self.waiting, quitting = self.quitting
+        let abort = AbortCheck { waiting.value > 0 || quitting.value }
+        llama_set_abort_callback(context, { data in Unmanaged<AbortCheck>.fromOpaque(data!).takeUnretainedValue().check() },
+                                 Unmanaged.passUnretained(abort).toOpaque())
+        defer { llama_set_abort_callback(context, nil, nil) }
+        let stop = { waiting.value > 0 }
+        #if DEBUG
+        let began = DispatchTime.now().uptimeNanoseconds
+        #endif
+        var start = restoreLongest(for: target + [0], context: context)
+        // Same steps as a question takes: the instructions, then the rest of the settled part.
+        if let instructions = instructionTokens(system: system, custom: custom, vocab: vocab),
+           start < instructions.count, target.count > instructions.count, target.starts(with: instructions) {
+            guard (try? decode(target[start..<instructions.count], context: context, isCancelled: stop)) == true else { return }
+            keepPrefix(instructions, context: context)
+            start = instructions.count
+        }
+        if start < target.count {
+            guard (try? decode(target[start...], context: context, isCancelled: stop)) == true else { return }
+        }
+        keepConversation(target, context: context)
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil {
+            FileHandle.standardError.write(Data(String(format: "llama: prepared the follow-up's %d tokens in %.0f ms\n", target.count,
+                                                       Double(DispatchTime.now().uptimeNanoseconds - began) / 1e6).utf8))
+        }
+        #endif
+    }
+
+    /// New Conversation: the saved conversation can't be used again. Returns at once; the state is released as
+    /// soon as nothing is using the model.
+    func forgetConversation() {
+        DispatchQueue.global(qos: .utility).async { [self] in lock.withLock { conversation = nil } }
     }
 
     #if DEBUG
@@ -358,8 +461,11 @@ final class LlamaRuntime: @unchecked Sendable {
     /// Test hook: false evaluates every prompt whole, the way it was before instructions were saved.
     nonisolated(unsafe) static var reusesInstructions = true
 
-    /// Test hook: forget the saved instructions, so the next prompt evaluates and saves them again.
-    func forgetInstructions() { lock.withLock { prefixes = [] } }
+    /// Test hook: forget the saved instructions (and conversation), so the next prompt evaluates and saves them again.
+    func forgetInstructions() { lock.withLock { prefixes = []; conversation = nil } }
+
+    /// Bytes of saved model state held for reuse (instructions and conversation), for the benchmark.
+    var savedStateBytes: Int { lock.withLock { prefixes.reduce(0) { $0 + $1.state.count } + (conversation?.state.count ?? 0) } }
     #endif
 
     /// Hides a model's "thinking" from the answer, for models that think anyway:
@@ -376,10 +482,14 @@ final class LlamaRuntime: @unchecked Sendable {
 
     /// Generates a reply, calling `onText` with the full text so far. Blocking; call off the main thread.
     /// Returns true when it stopped because it reached `maxTokens` rather than finishing its answer.
+    /// `head` is the start of `user` that the next question in this conversation will start with too (household
+    /// context and earlier turns): its evaluated state is kept for that follow-up.
     @discardableResult
-    func generate(file: URL, contextTokens: Int32, custom: Bool, system: String, user: String, maxTokens: Int = 1024,
-                  isCancelled: @escaping () -> Bool, onText: (String) -> Void) throws -> Bool {
+    func generate(file: URL, contextTokens: Int32, custom: Bool, system: String, user: String, head: String? = nil,
+                  maxTokens: Int = 1024, isCancelled: @escaping () -> Bool, onText: (String) -> Void) throws -> Bool {
+        waiting.add(1)
         lock.lock()
+        waiting.add(-1)
         defer { lock.unlock(); touch() }
         try load(path: file.path, contextTokens: contextTokens, custom: custom)
         guard let model, let context else { throw LlamaError.contextFailed }
@@ -402,36 +512,41 @@ final class LlamaRuntime: @unchecked Sendable {
         let room = Int(contextTokens) - maxTokens
         guard tokens.count <= room else { throw LlamaError.tooLong(tokens.count, room) }
 
-        // Start from the instructions' saved state when this prompt begins with them; otherwise evaluate them first
-        // and save that state for the next question. Either way the same tokens are evaluated in the same two steps
-        // (instructions, then the rest), so the answer doesn't depend on whether the state was saved.
+        // Start from the longest saved state this prompt begins with: the conversation so far (prepared after the
+        // last answer), or the instructions. What isn't saved is evaluated in fixed steps (instructions, then the
+        // settled part, then the question and sources), and each step's state is kept for the next question.
         #if DEBUG
         let began = DispatchTime.now().uptimeNanoseconds
         func ms(since t: UInt64) -> Double { Double(DispatchTime.now().uptimeNanoseconds - t) / 1e6 }
         var timings = Timings()
         defer { Self.lastTimings = timings }
         #endif
-        let memory = llama_get_memory(context)
-        llama_memory_clear(memory, true)
         var start = 0
         #if DEBUG
         let reuse = Self.reusesInstructions
         #else
         let reuse = true
         #endif
-        if !reuse {
-            // Test hook (DEBUG): the old way, the whole prompt in one go.
-        } else if let saved = prefixes.first(where: { tokens.count > $0.tokens.count && tokens.starts(with: $0.tokens) }) {
-            let restored = saved.state.withUnsafeBufferPointer { llama_state_seq_set_data(context, $0.baseAddress, $0.count, 0) }
-            if restored > 0 { start = saved.tokens.count } else { llama_memory_clear(memory, true) }
+        if reuse {
+            start = restoreLongest(for: tokens, context: context)
             #if DEBUG
             timings.restoreMs = ms(since: began)
             #endif
-        } else if let prefix = instructionTokens(system: system, custom: custom, vocab: vocab),
-                  tokens.count > prefix.count, tokens.starts(with: prefix) {
-            guard try decode(tokens[..<prefix.count], context: context, isCancelled: isCancelled) else { return false }
-            keepPrefix(prefix, context: context)
-            start = prefix.count
+            if let prefix = instructionTokens(system: system, custom: custom, vocab: vocab),
+               start < prefix.count, tokens.count > prefix.count, tokens.starts(with: prefix) {
+                guard try decode(tokens[start..<prefix.count], context: context, isCancelled: isCancelled) else { return false }
+                keepPrefix(prefix, context: context)
+                start = prefix.count
+            }
+            if let head, let settled = settledTokens(system: system, head: head, custom: custom, vocab: vocab),
+               start < settled.count, tokens.count > settled.count, tokens.starts(with: settled) {
+                guard try decode(tokens[start..<settled.count], context: context, isCancelled: isCancelled) else { return false }
+                keepConversation(settled, context: context)
+                start = settled.count
+            }
+        } else {
+            // Test hook (DEBUG): the old way, the whole prompt in one go.
+            llama_memory_clear(llama_get_memory(context), true)
         }
         #if DEBUG
         Self.lastPrefill = (tokens.count, start)
@@ -498,7 +613,12 @@ final class LlamaRuntime: @unchecked Sendable {
                 let text = Self.visibleAnswer(String(decoding: bytes, as: UTF8.self))
                 if showing || text.contains(where: { !$0.isWhitespace }) {
                     #if DEBUG
-                    if !showing { timings.firstTextMs = ms(since: began) }
+                    if !showing {
+                        timings.firstTextMs = ms(since: began)
+                        if ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil {
+                            FileHandle.standardError.write(Data("llama: first text after \(timings.tokens + 1) tokens: \(String(decoding: bytes, as: UTF8.self).debugDescription)\n".utf8))
+                        }
+                    }
                     #endif
                     showing = true
                     lastEmit = now
@@ -560,16 +680,24 @@ struct LlamaEngine: AnswerEngine {
     }
     /// About 3 characters per token, leaving room for the instructions and a 1,024-token answer.
     var sourceBudget: Int { min(14_000, (Int(contextTokens) - 1_700) * 3) }
+    /// Everything but the instructions (about 1,100 tokens with the emergency ones) and a 1,024-token answer.
+    var promptBudget: Int { max(4_000, (Int(contextTokens) - 1_024 - 1_100) * 3) }
 
     /// True when the model is already in memory.
     var isReady: Bool { LlamaRuntime.isReady(file: model.url, contextTokens: contextTokens) }
 
     /// Starts loading the model in the background, so the first question doesn't wait for it. With `instructions`,
-    /// also evaluates them, so the first question starts answering sooner.
-    func preload(instructions: String? = nil) {
+    /// also evaluates them, so the first question starts answering sooner; with `head` (the household context and
+    /// any conversation so far), that too.
+    func preload(instructions: String? = nil, head: String? = nil) {
         guard case .ready = model.plan, instructions != nil || !isReady else { return }
         let url = model.url, tokens = contextTokens, custom = model.isCustom
-        let thread = Thread { LlamaRuntime.shared.preload(file: url, contextTokens: tokens, custom: custom, instructions: instructions) }
+        let thread = Thread {
+            LlamaRuntime.shared.preload(file: url, contextTokens: tokens, custom: custom, instructions: instructions)
+            if let instructions, let head {
+                LlamaRuntime.shared.prepareConversation(file: url, contextTokens: tokens, custom: custom, system: instructions, head: head)
+            }
+        }
         thread.stackSize = 8 << 20
         thread.qualityOfService = .utility
         thread.start()
@@ -580,6 +708,26 @@ struct LlamaEngine: AnswerEngine {
     }
 
     func stream(instructions: String, prompt: String, notes: StreamNotes) -> AsyncThrowingStream<String, Error> {
+        stream(instructions: instructions, prompt: prompt, notes: notes, head: nil)
+    }
+
+    func prepareFollowUp(instructions: String, head: String) {
+        guard case .ready = model.plan, isReady else { return }
+        let url = model.url, tokens = contextTokens, custom = model.isCustom
+        let thread = Thread {
+            LlamaRuntime.shared.prepareConversation(file: url, contextTokens: tokens, custom: custom, system: instructions, head: head)
+        }
+        thread.stackSize = 8 << 20
+        thread.qualityOfService = .utility
+        thread.start()
+    }
+
+    func forgetConversation() {
+        guard LlamaRuntime.exists else { return }
+        LlamaRuntime.shared.forgetConversation()
+    }
+
+    func stream(instructions: String, prompt: String, notes: StreamNotes, head: String?) -> AsyncThrowingStream<String, Error> {
         let model = self.model, contextTokens = self.contextTokens
         return AsyncThrowingStream { continuation in
             // Checked before loading: an oversized model would fail partway, or push the device out of memory.
@@ -594,7 +742,7 @@ struct LlamaEngine: AnswerEngine {
             let thread = Thread {
                 do {
                     let hitLimit = try LlamaRuntime.shared.generate(file: model.url, contextTokens: contextTokens, custom: model.isCustom,
-                                                                    system: instructions, user: prompt,
+                                                                    system: instructions, user: prompt, head: head,
                                                                     isCancelled: { cancelled.value }) { continuation.yield($0) }
                     if hitLimit { notes.cutShort = true }
                     continuation.finish()
@@ -608,6 +756,14 @@ struct LlamaEngine: AnswerEngine {
             thread.start()
         }
     }
+}
+
+/// A thread-safe count.
+private final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value = 0
+    var value: Int { lock.withLock { _value } }
+    func add(_ n: Int) { lock.withLock { _value += n } }
 }
 
 private final class CancelFlag: @unchecked Sendable {

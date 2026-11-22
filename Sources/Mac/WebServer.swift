@@ -69,6 +69,7 @@ final class WebServer: @unchecked Sendable {
         var onBytes: (@Sendable (Int64) -> Void)?
         var onFinish: (@Sendable () -> Void)?
         private var unreported: Int64 = 0
+        private var reportedAt = Date()
         private var extraHeaderLines: String {
             extraHeaders.map { "\($0.0): \(WebServer.headerSafe($0.1))\r\n" }.joined()
         }
@@ -151,19 +152,42 @@ final class WebServer: @unchecked Sendable {
             if status == 206 { head += "Content-Range: bytes \(lower)-\(upper)/\(total)\r\n" }
             head += extraHeaderLines + "\r\n"
             guard await write(Data(head.utf8)) else { finish(complete: false); return }
-            var remaining = upper - lower + 1
-            do {
-                try handle.seek(toOffset: UInt64(lower))
-                while remaining > 0 {
-                    let chunk = try handle.read(upToCount: Int(min(remaining, 1 << 20))) ?? Data()
-                    if chunk.isEmpty { break }
-                    // The viewer closed the tab or seeked away: stop reading the file for nobody.
-                    if !(await write(chunk)) { break }
-                    remaining -= Int64(chunk.count)
-                }
-            } catch {}
+            // The viewer closing the tab or seeking away stops the reading too.
+            let sent = await writeFile(handle, from: lower, length: upper - lower + 1)
             // Fewer bytes than the Content-Length promised (the file shrank, a read failed): only closing can say so.
-            finish(complete: remaining == 0)
+            finish(complete: sent == upper - lower + 1)
+        }
+
+        /// Writes `length` bytes of a file from `offset` in `chunk`-sized pieces and returns how many were written. The
+        /// next piece is read while the last one is being sent, so a slow drive and the network overlap instead of taking
+        /// turns. Stops at the end of the file, a failed read, or when the device goes away.
+        /// `pause`: seconds to wait after each piece (Send to iPhone's slow-download test hook).
+        func writeFile(_ handle: FileHandle, from offset: Int64, length: Int64, chunk: Int = 1 << 20,
+                       pause: (@Sendable (Int) -> Double)? = nil) async -> Int64 {
+            let fd = handle.fileDescriptor
+            @Sendable func read(_ at: Int64, _ count: Int64) -> Data {
+                guard count > 0 else { return Data() }
+                var data = Data(count: Int(count))
+                let got = data.withUnsafeMutableBytes { pread(fd, $0.baseAddress, Int(count), off_t(at)) }
+                guard got > 0 else { return Data() }
+                if got < count { data.count = got }
+                return data
+            }
+            var written: Int64 = 0
+            var next = read(offset, min(length, Int64(chunk)))
+            while !next.isEmpty {
+                let piece = next
+                let following = offset + written + Int64(piece.count)
+                let left = length - written - Int64(piece.count)
+                // Read ahead while this piece goes out.
+                async let ahead = read(following, min(left, Int64(chunk)))
+                let ok = await write(piece)
+                next = await ahead
+                guard ok else { break }
+                written += Int64(piece.count)
+                if let pause, case let wait = pause(piece.count), wait > 0 { try? await Task.sleep(for: .seconds(wait)) }
+            }
+            return written
         }
 
         func redirect(to location: String) async {
@@ -199,7 +223,11 @@ final class WebServer: @unchecked Sendable {
             }
             if ok, let onBytes {
                 unreported += Int64(data.count)
-                if unreported >= 2 << 20 { onBytes(unreported); unreported = 0 }   // reported every 2 MB, and at the end
+                // Reported at most twice a second (each report is a hop to the main thread), and at the end. By size
+                // alone, a fast download woke the main thread dozens of times a second.
+                if unreported >= 2 << 20, -reportedAt.timeIntervalSinceNow >= 0.5 {
+                    onBytes(unreported); unreported = 0; reportedAt = Date()
+                }
             }
             return ok
         }

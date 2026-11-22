@@ -35,8 +35,12 @@ final class StreamOutput: GameStreamSink, @unchecked Sendable {
     private var lastAcked: UInt32 = 0
     private var lastSentAt = Date.distantPast
     private var sentTimes: [UInt32: Date] = [:]
-    private var lastEncoded: Data?
+    /// The last picture sent, to skip unchanged ones by comparing pixels before encoding (holding it keeps its pixel
+    /// memory from going back to the core's pool, so it stays as sent).
+    private var lastSent: CGImage?
     private var frameSize = CGSize.zero
+    /// Encoder queue only: the size of the last encoded picture, to size the next one's buffer in one go.
+    private var lastEncodedSize = 0
     // Measurements, for the device's stats line.
     private var framesSent = 0
     private var bytesSent = 0
@@ -52,7 +56,7 @@ final class StreamOutput: GameStreamSink, @unchecked Sendable {
             audioInFlight = 0
             lastAcked = seq
             sentTimes.removeAll()
-            lastEncoded = nil   // a fresh device gets the current picture even if nothing changes
+            lastSent = nil   // a fresh device gets the current picture even if nothing changes
         }
     }
 
@@ -61,9 +65,10 @@ final class StreamOutput: GameStreamSink, @unchecked Sendable {
     /// The size of the last picture, in game pixels.
     var pictureSize: CGSize { lock.withLock { frameSize } }
 
-    /// The device has drawn picture `seq`.
-    func acknowledge(_ ack: UInt32) {
+    /// The device has drawn picture `seq`. `from`: the connection it came on; only the attached device's count.
+    func acknowledge(_ ack: UInt32, from sender: WebSocket? = nil) {
         lock.withLock {
+            if let sender, sender !== socket { return }   // a device that has since been replaced or let go
             guard ack &- lastAcked < 0x8000_0000 else { return }   // older than one already acknowledged
             lastAcked = ack
             if let sent = sentTimes.removeValue(forKey: ack) {
@@ -94,17 +99,34 @@ final class StreamOutput: GameStreamSink, @unchecked Sendable {
     // MARK: GameStreamSink (emulation thread)
 
     func streamFrame(_ image: CGImage) {
-        let go = lock.withLock { () -> Bool in
+        let previous = lock.withLock { () -> CGImage?? in
             frameSize = CGSize(width: image.width, height: image.height)
-            guard socket != nil, !encoding, !videoInFlight else { return false }
+            guard socket != nil, !encoding, !videoInFlight else { return nil }
             // The device hasn't shown the frame before last: wait, unless it has gone quiet (a lost message
             // shouldn't stop the picture for good).
-            if seq &- lastAcked > 1 && -lastSentAt.timeIntervalSinceNow < 0.5 { return false }
+            if seq &- lastAcked > 1 && -lastSentAt.timeIntervalSinceNow < 0.5 { return nil }
             encoding = true
-            return true
+            return .some(lastSent)
         }
-        guard go else { return }
+        guard let previous else { return }
+        // Nothing on screen changed (a still menu, a DOS prompt): a comparison of the pixels, a few microseconds,
+        // instead of encoding the picture to find out. `lastSent` can't change while `encoding` is set.
+        if let previous, Self.samePixels(previous, image) {
+            lock.withLock { encoding = false }
+            return
+        }
         encoder.async { [weak self] in self?.encodeAndSend(image) }
+    }
+
+    /// True when two pictures from the core have the same size, layout and pixels.
+    static func samePixels(_ a: CGImage, _ b: CGImage) -> Bool {
+        guard a.width == b.width, a.height == b.height, a.bytesPerRow == b.bytesPerRow, a.bitmapInfo == b.bitmapInfo,
+              a.bitsPerPixel == b.bitsPerPixel,
+              // The core's pictures wrap plain memory: these hand it back without copying.
+              let x = a.dataProvider?.data, let y = b.dataProvider?.data else { return false }
+        let count = CFDataGetLength(x)
+        guard count == CFDataGetLength(y), let p = CFDataGetBytePtr(x), let q = CFDataGetBytePtr(y) else { return false }
+        return p == q || memcmp(p, q, count) == 0
     }
 
     func streamAudio(_ samples: UnsafePointer<Int16>, frames: Int) {
@@ -131,25 +153,25 @@ final class StreamOutput: GameStreamSink, @unchecked Sendable {
         let started = Date()
         // Small console pictures compress best (and exactly) as PNG; bigger DOS and ScummVM screens go as JPEG.
         let pixels = image.width * image.height
-        var encoded = Self.encode(image, png: pixels <= 320 * 240)
+        var encoded = Self.encode(image, png: pixels <= 320 * 240, sizeHint: lastEncodedSize)
         var type: UInt8 = pixels <= 320 * 240 ? 3 : 1
         // A busy picture that PNG can't squeeze: JPEG is several times smaller.
         if type == 3, let data = encoded, data.count > 48_000 {
-            encoded = Self.encode(image, png: false)
+            encoded = Self.encode(image, png: false, sizeHint: data.count / 2)
             type = 1
         }
+        lastEncodedSize = encoded?.count ?? 0
         let encodeMs = -started.timeIntervalSinceNow * 1000
         let send = lock.withLock { () -> (WebSocket, UInt32)? in
             defer { encoding = false }
-            guard let socket, let encoded else { return nil }
-            if encoded == lastEncoded { return nil }   // nothing on screen changed
-            lastEncoded = encoded
+            guard let socket, encoded != nil else { return nil }
+            lastSent = image
             seq &+= 1
             videoInFlight = true
             lastSentAt = Date()
             sentTimes[seq] = lastSentAt
             framesSent += 1
-            bytesSent += encoded.count
+            bytesSent += encoded?.count ?? 0
             encodeTotal += encodeMs
             return (socket, seq)
         }
@@ -167,14 +189,31 @@ final class StreamOutput: GameStreamSink, @unchecked Sendable {
         }
     }
 
-    private static func encode(_ image: CGImage, png: Bool) -> Data? {
-        let data = NSMutableData()
+    /// PNG without per-row filter choice: libpng otherwise tries every filter on every row, which was three quarters of
+    /// the encoding time, and for console pictures (flat colours, sharp edges) the result is no bigger (measured: an NES
+    /// frame 1.0 ms and 2.3 KB before, 0.27 ms and 2.1 KB after).
+    private static let pngOptions = [kCGImagePropertyPNGDictionary: [kCGImagePropertyPNGCompressionFilter: 0x08]] as CFDictionary   // IMAGEIO_PNG_FILTER_NONE
+    private static let jpegOptions = [kCGImageDestinationLossyCompressionQuality: 0.72] as CFDictionary
+
+    static func encode(_ image: CGImage, png: Bool, sizeHint: Int = 0) -> Data? {
+        // Sized for about what the last picture took, so the encoder doesn't grow the buffer step by step.
+        let data = NSMutableData(capacity: max(16_384, sizeHint + sizeHint / 4)) ?? NSMutableData()
         let type = (png ? UTType.png : UTType.jpeg).identifier as CFString
         guard let destination = CGImageDestinationCreateWithData(data, type, 1, nil) else { return nil }
-        let options: [CFString: Any] = png ? [:] : [kCGImageDestinationLossyCompressionQuality: 0.72]
-        CGImageDestinationAddImage(destination, image, options as CFDictionary)
+        CGImageDestinationAddImage(destination, image, png ? pngOptions : jpegOptions)
         guard CGImageDestinationFinalize(destination) else { return nil }
         return data as Data
+    }
+}
+
+/// Where a device's "picture shown" messages go: the output of the game it plays. Set on the main thread, read on the
+/// connection's own queue. The output also checks the message came on the connection it sends to.
+final class AckRoute: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var _output: StreamOutput?
+    var output: StreamOutput? {
+        get { lock.withLock { _output } }
+        set { lock.withLock { _output = newValue } }
     }
 }
 
@@ -207,6 +246,8 @@ final class GameStreamHub {
         /// The sign-in it connected with and its Connected Devices id: signing that device out or blocking it ends this too.
         let signIn: String?
         let deviceID: String?
+        /// The game it plays, for "picture shown" messages, which are handled where they arrive (see accept).
+        let acks = AckRoute()
         init(socket: WebSocket, device: String, signIn: String?, deviceID: String?) {
             self.socket = socket; self.device = device; self.signIn = signIn; self.deviceID = deviceID
         }
@@ -223,6 +264,8 @@ final class GameStreamHub {
         /// ScummVM's cursor, in game pixels, kept in step with the device's taps (see pointer(x:y:)).
         var cursor: CGPoint?
         var cursorFrame = CGSize.zero
+        /// Paused because the device went quiet (see checkQuiet); it carries on when the device is heard again.
+        var quietPaused = false
         init(session: GameSession, output: StreamOutput) { self.session = session; self.output = output }
     }
 
@@ -256,8 +299,18 @@ final class GameStreamHub {
         }
         let client = Client(socket: socket, device: device, signIn: signIn, deviceID: deviceID)
         clients[ObjectIdentifier(client)] = client
-        // Strictly in order (a button's press must never arrive after its release), on the main thread.
-        socket.start(onMessage: { [weak self, weak client] message in
+        let acks = client.acks
+        // Strictly in order (a button's press must never arrive after its release), on the main thread. "Picture shown"
+        // (one per frame, 60 a second) goes straight to the game's output instead: it only moves a counter there, and
+        // waking the main thread for each one was most of what streaming asked of it.
+        socket.start(onMessage: { [weak self, weak client, weak socket] message in
+            if case .binary(let data) = message, data.count >= 5, data.first == 7 {
+                if let socket, let output = acks.output {
+                    let ack = data.withUnsafeBytes { UInt32(littleEndian: $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self)) }
+                    output.acknowledge(ack, from: socket)
+                }
+                return
+            }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self, let client else { return }
@@ -342,6 +395,11 @@ final class GameStreamHub {
     // MARK: Messages
 
     private func handle(_ message: WebSocket.Message, from client: Client) {
+        // The device is back after going quiet (its page checks in every 2 seconds): the game carries on.
+        if let stream, stream.player === client, stream.quietPaused {
+            stream.quietPaused = false
+            if stream.session.isPaused { stream.session.setPaused(false) }
+        }
         switch message {
         case .binary(let data): input(data, from: client)
         case .text(let text):
@@ -437,8 +495,8 @@ final class GameStreamHub {
         case 6:
             session.releaseInput()
         case 7:
-            guard bytes.count >= 5 else { return }
-            stream.output.acknowledge(UInt32(bytes[1]) | UInt32(bytes[2]) << 8 | UInt32(bytes[3]) << 16 | UInt32(bytes[4]) << 24)
+            guard bytes.count >= 5 else { return }   // normally handled as it arrives (see accept)
+            stream.output.acknowledge(UInt32(bytes[1]) | UInt32(bytes[2]) << 8 | UInt32(bytes[3]) << 16 | UInt32(bytes[4]) << 24, from: client.socket)
         case 8:
             guard bytes.count >= 2 else { return }
             session.scroll(Int(Int8(bitPattern: bytes[1])))
@@ -545,7 +603,9 @@ final class GameStreamHub {
         updateActivity()
         if let id = client.deviceID { ShareDevices.shared.setPlaying(device: id, game: stream.session.game.title) }
         stream.cursor = nil
+        stream.quietPaused = false
         stream.output.attach(client.socket)
+        client.acks.output = stream.output
         let session = stream.session
         let system = session.game.system
         client.socket.send(json: [
@@ -630,9 +690,22 @@ final class GameStreamHub {
             MainActor.assumeIsolated {
                 let hub = GameStreamHub.shared
                 guard let stream = hub.stream, let player = stream.player else { return }
+                hub.checkQuiet(stream, player: player)
                 player.socket.send(json: ["t": "stats"].merging(stream.output.takeStats()) { $1 })
             }
         }
+    }
+
+    /// Nothing heard from the playing device for this long: its page checks in every 2 seconds, so it has gone (locked
+    /// without saying so, out of Wi-Fi range). The game pauses instead of running for nobody until the connection times
+    /// out (30 seconds), and carries on as soon as the device is heard again.
+    static let quietPause: TimeInterval = 5
+
+    private func checkQuiet(_ stream: Stream, player: Client) {
+        guard !stream.quietPaused, !stream.session.isPaused, stream.session.isRunning,
+              player.socket.quietFor > Self.quietPause else { return }
+        stream.quietPaused = true
+        stream.session.setPaused(true)
     }
 
     // MARK: Games list

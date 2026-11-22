@@ -293,7 +293,7 @@ struct WatchListenView: View {
 
     private var home: some View {
         ScrollViewReader { proxy in
-        ScrollView {
+        HitPausingScrollView {
             LazyVStack(alignment: .leading, spacing: 28) {
                 controls.padding(.horizontal, 24).padding(.top, 24)
                 if let artist {

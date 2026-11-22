@@ -20,10 +20,16 @@ enum AnswerIndexPolicy {
     static var fullArticleLimit: Int {
         #if DEBUG
         // Test hook: OFFLINEKIT_INDEX_FULL_LIMIT=10000 exercises the leads-only policy on a small archive.
-        if let forced = ProcessInfo.processInfo.environment["OFFLINEKIT_INDEX_FULL_LIMIT"].flatMap(Int.init) { return forced }
+        if let forced = forcedFullLimit { return forced }
         #endif
         return 60_000
     }
+
+    #if DEBUG
+    // Read once: building ProcessInfo's environment dictionary costs more than a chunk of leads (the builder asks often).
+    private static let forcedFullLimit = ProcessInfo.processInfo.environment["OFFLINEKIT_INDEX_FULL_LIMIT"].flatMap(Int.init)
+    private static let forcedWorkers = ProcessInfo.processInfo.environment["OFFLINEKIT_INDEX_WORKERS"].flatMap(Int.init)
+    #endif
 
     static func depth(articleCount: Int) -> Depth { articleCount <= fullArticleLimit ? .full : .leads }
 
@@ -53,15 +59,17 @@ enum AnswerIndexPolicy {
     /// The most HTML read from one article: the first part is where the passages are.
     static func maxHTMLBytes(_ depth: Depth) -> Int { depth == .full ? 200_000 : 32_000 }
     static func maxPassages(_ depth: Depth) -> Int { depth == .full ? 40 : 1 }
-    /// Articles read and written per transaction. Small enough that pausing for a question is quick.
-    static func chunk(_ depth: Depth) -> Int { depth == .full ? 60 : 400 }
+    /// Archive entries (articles, but also images, redirects and other files) read and written per transaction.
+    /// Small enough that pausing for a question is quick (tens of milliseconds of work), big enough that a stretch
+    /// of images doesn't turn into thousands of nearly empty transactions.
+    static func chunk(_ depth: Depth) -> Int { depth == .full ? 160 : 1_000 }
 
     /// Threads turning articles into passages: one on battery, a few on power (one more SQLite writer keeps up
     /// with about three; measured on an M4 Pro). iPhone and iPad stay at two to keep cool while charging.
     static func workers(plugged: Bool) -> Int {
         #if DEBUG
         // Test hook: OFFLINEKIT_INDEX_WORKERS=1 measures the battery path on power.
-        if let forced = ProcessInfo.processInfo.environment["OFFLINEKIT_INDEX_WORKERS"].flatMap(Int.init) { return max(1, forced) }
+        if let forced = forcedWorkers { return max(1, forced) }
         #endif
         guard plugged else { return 1 }
         let cores = ProcessInfo.processInfo.activeProcessorCount
@@ -103,6 +111,8 @@ final class PassageStore: @unchecked Sendable {
     /// Words found to be common or not (see `isCommon`, `isCommonTitle`). Guarded by `lock`.
     private var common: [String: Bool] = [:]
     private var commonTitle: [String: Bool] = [:]
+    /// Passages written so far, read from `meta` once and then counted here. Guarded by `lock`.
+    private var passageCount: Int?
 
     /// A full index keeps each passage's text, so a hit needs nothing from the archive. A leads-only index is
     /// contentless: it keeps the words for searching (and the path, title and position) but not the text, which
@@ -113,7 +123,7 @@ final class PassageStore: @unchecked Sendable {
         let db = try SQLiteDB(url: url)
         let content = depth == .leads ? ", content='', contentless_unindexed=1" : ""
         try db.script("""
-            PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=TRUNCATE; PRAGMA synchronous=NORMAL;
+            PRAGMA auto_vacuum=INCREMENTAL; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS passages USING fts5(title, heading, body, path UNINDEXED, lead UNINDEXED,
                 ord UNINDEXED, name UNINDEXED, tokenize='porter unicode61 remove_diacritics 2'\(content));
@@ -168,11 +178,16 @@ final class PassageStore: @unchecked Sendable {
                                    [.text(article.title), .int(first), .int(db.lastInsertRowID)])
                     }
                 }
-                var count = 0
-                try db.run("SELECT value FROM meta WHERE key = 'passages'") { count = Int($0.text(0)) ?? 0 }
-                try db.run("INSERT OR REPLACE INTO meta VALUES ('passages', ?)", [.text(String(count + added))])
+                if passageCount == nil {
+                    var count = 0
+                    try db.run("SELECT value FROM meta WHERE key = 'passages'") { count = Int($0.text(0)) ?? 0 }
+                    passageCount = count
+                }
+                let count = (passageCount ?? 0) + added
+                try db.run("INSERT OR REPLACE INTO meta VALUES ('passages', ?)", [.text(String(count))])
                 try db.run("INSERT OR REPLACE INTO meta VALUES ('cursor', ?)", [.text(String(cursor))])
-                try db.run("INSERT OR REPLACE INTO meta VALUES ('seconds', ?)", [.text(String(format: "%.2f", seconds))])
+                try db.run("INSERT OR REPLACE INTO meta VALUES ('seconds', ?)", [.text(String((seconds * 100).rounded() / 100))])
+                passageCount = count
             }
         }
     }
@@ -184,16 +199,19 @@ final class PassageStore: @unchecked Sendable {
                 INSERT INTO passages(passages) VALUES('optimize');
                 \(depth == .leads ? "INSERT INTO titles(titles) VALUES('optimize');" : "")
                 PRAGMA incremental_vacuum;
+                PRAGMA wal_checkpoint(TRUNCATE);
                 """)
         }
     }
 
     var bytes: Int64 { Self.fileBytes(url) }
 
+    /// The index's size on disk with its journal or write-ahead log. Plain stat(): FileManager's attributes also read
+    /// extended attributes, which cost more than writing a chunk of passages.
     static func fileBytes(_ url: URL) -> Int64 {
-        let fm = FileManager.default
-        return [url.path, url.path + "-journal", url.path + "-wal"].reduce(Int64(0)) { sum, path in
-            sum + ((try? fm.attributesOfItem(atPath: path)[.size] as? Int64) ?? 0)
+        [url.path, url.path + "-journal", url.path + "-wal"].reduce(Int64(0)) { sum, path in
+            var info = stat()
+            return sum + (stat(path, &info) == 0 ? Int64(info.st_size) : 0)
         }
     }
 
@@ -403,8 +421,7 @@ final class PassageStore: @unchecked Sendable {
                 heading = block.heading
                 lead = isLead
             }
-            for piece in pieces(block.text) {
-                let n = wordCount(piece)
+            for (piece, n) in pieces(block.text) {
                 if words > 0 && words + n > 200 { flush() }
                 current.append(piece)
                 words += n
@@ -466,18 +483,19 @@ final class PassageStore: @unchecked Sendable {
         return count
     }
 
-    /// A paragraph, or a long one cut at sentence ends into parts of about 150 words.
-    private static func pieces(_ paragraph: String) -> [String] {
-        guard wordCount(paragraph) > 200 else { return [paragraph] }
-        var parts: [String] = [], current = "", count = 0
+    /// A paragraph, or a long one cut at sentence ends into parts of about 150 words; each with its word count.
+    private static func pieces(_ paragraph: String) -> [(text: String, words: Int)] {
+        let total = wordCount(paragraph)
+        guard total > 200 else { return [(paragraph, total)] }
+        var parts: [(String, Int)] = [], current = "", count = 0
         paragraph.enumerateSubstrings(in: paragraph.startIndex..., options: .bySentences) { sentence, _, _, _ in
             guard let sentence = sentence?.trimmingCharacters(in: .whitespaces), !sentence.isEmpty else { return }
             let n = wordCount(sentence)
-            if count > 0 && count + n > 150 { parts.append(current); current = ""; count = 0 }
+            if count > 0 && count + n > 150 { parts.append((current, count)); current = ""; count = 0 }
             current += (current.isEmpty ? "" : " ") + sentence
             count += n
         }
-        if !current.isEmpty { parts.append(current) }
+        if !current.isEmpty { parts.append((current, count)) }
         return parts
     }
 }
@@ -774,7 +792,8 @@ final class AnswerIndex: @unchecked Sendable {
         // chunks before them; otherwise one at a time on this thread, at background priority. Written in order,
         // one transaction per chunk, so a relaunch resumes exactly where the last one ended.
         var ahead: ChunkWork?
-        defer { _ = ahead?.results() }   // workers never touch the store, but don't leave them running
+        defer { _ = ahead?.results() }
+        var bytes = store.bytes, sized = Date()   // workers never touch the store, but don't leave them running
         while cursor < total {
             guard mayContinue(uuid, generation: generation) else { return }
             let lanes = AnswerIndexPolicy.workers(plugged: condition.withLock { plugged })
@@ -804,20 +823,24 @@ final class AnswerIndex: @unchecked Sendable {
                 update(uuid, generation) { $0.state = .failed(error.localizedDescription) }
                 return
             }
-            let bytes = store.bytes
-            if bytes > budget {
-                try? store.setMeta(["state": "tooLarge"])
-                update(uuid, generation) { $0.state = .tooLarge; $0.bytes = bytes }
-                return
+            // The size every couple of seconds, not every chunk.
+            if Date().timeIntervalSince(sized) > 2 {
+                sized = Date()
+                bytes = store.bytes
+                if bytes > budget {
+                    try? store.setMeta(["state": "tooLarge"])
+                    update(uuid, generation) { [bytes] in $0.state = .tooLarge; $0.bytes = bytes }
+                    return
+                }
             }
-            update(uuid, generation) { $0.state = .building(done: cursor, total: total); $0.bytes = bytes; $0.buildSeconds = seconds }
+            update(uuid, generation) { [bytes, seconds] in $0.state = .building(done: cursor, total: total); $0.bytes = bytes; $0.buildSeconds = seconds }
         }
         let start = Date()
         store.optimize()
         seconds += Date().timeIntervalSince(start)
         try? store.setMeta(["state": "complete", "seconds": String(format: "%.2f", seconds)])
-        let bytes = store.bytes
-        condition.withLock {
+        bytes = store.bytes
+        condition.withLock { [bytes, seconds] in
             guard self.generation == generation, entries[uuid] != nil else { return }
             entries[uuid]?.state = .ready
             entries[uuid]?.bytes = bytes

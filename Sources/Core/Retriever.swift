@@ -114,6 +114,40 @@ enum Retriever {
         return (sources, all)
     }
 
+    /// Opens what the first search would otherwise wait for, once per launch, in the background: each archive's
+    /// search index (libzim's full-text and title indexes, or its answer index), the paragraph cache and the word
+    /// embeddings. Called when Ask opens.
+    static func warm(_ archives: [ZimArchive]) {
+        guard Self.warmed.claim() else { return }
+        Task.detached(priority: .utility) {
+            #if DEBUG
+            let started = Date()
+            #endif
+            _ = SemanticRanker.shared.similarities(question: "boil water", texts: ["Boiling water makes it safe to drink."])
+            _ = ParagraphCache.shared.get(archive: "", path: "")
+            await withTaskGroup(of: Void.self) { group in
+                for archive in archives {
+                    group.addTask {
+                        if let store = AnswerIndex.shared.store(for: archive) {
+                            _ = store.search(terms: ["water"], phrases: [], limit: 1)
+                        } else {
+                            if archive.hasFullTextIndex { _ = archive.search("water", limit: 1) }
+                            _ = archive.suggest("water", limit: 1)
+                        }
+                    }
+                }
+            }
+            #if DEBUG
+            if ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil {
+                FileHandle.standardError.write(Data(String(format: "retrieve: warmed %d archives in %.0f ms\n", archives.count,
+                                                           Date().timeIntervalSince(started) * 1000).utf8))
+            }
+            #endif
+        }
+    }
+
+    private static let warmed = Once()
+
     /// Searches one archive: its answer index when that's ready, else libzim (full-text first, exact phrases then
     /// broader queries, then titles).
     private static func gather(in archive: ZimArchive, terms: [String], phrases: [String], cancelled: () -> Bool) -> Gathered {
@@ -130,7 +164,7 @@ enum Retriever {
             let queries = phrases.map { ($0, 5) } + queryVariants(terms).map { ($0, 10) }
             for (query, limit) in queries {
                 if cancelled() { break }
-                for hit in archive.search(query, limit: limit)
+                for hit in archive.search(query, limit: limit, snippetsExcept: seen)
                 where seen.insert(hit.path).inserted && seenTitles.insert(hit.title.lowercased()).inserted && !isListing(hit) {
                     var (score, coverage) = relevance(title: hit.title, snippet: hit.snippet, xapian: hit.score,
                                                       terms: terms, phrases: phrases)
@@ -847,4 +881,11 @@ enum HTMLText {
         out += ns.substring(from: last)
         return out
     }
+}
+
+/// True for the first caller only.
+final class Once: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func claim() -> Bool { lock.withLock { defer { done = true }; return !done } }
 }

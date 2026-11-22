@@ -125,4 +125,85 @@ struct SharePerformanceTests {
         let done = await task.value
         #expect(done < jobs.count)
     }
+
+    @Test("The game list is kept per revision; only the running game's entry is made again")
+    func gameListCache() throws {
+        let tmp = try TempDir("game-list")
+        try tmp.file("Games/NES/Alpha.nes")
+        try tmp.file("Games/NES/Beta.nes")
+        let games = GameLibrary.scan([tmp.url.appending(path: "Games", directoryHint: .isDirectory)])
+        let alpha = try #require(games.first { $0.title == "Alpha" })
+        let played = [alpha.id: Date(timeIntervalSince1970: 1_000)]
+        let key = GameListCache.Key(revision: 3, live: nil)
+        let cache = GameListCache.build(games, played: played, for: key)
+        #expect(cache.entries.count == games.filter { $0.system != .atari2600 }.count)
+        #expect(cache.entries(for: key) != nil)
+        #expect(cache.entries(for: .init(revision: 4, live: nil)) == nil, "a scan, favorite or play makes it again")
+        #expect(cache.entries(for: .init(revision: 3, live: alpha.id)) == nil, "a game starting or stopping makes it again")
+        let first = try #require(cache.entries.first { $0["title"] as? String == "Alpha" })
+        #expect(first["canResume"] as? Bool == false)
+        #expect(first["art"] is NSNull)
+        #expect(first["lastPlayed"] as? Double == 1_000)
+        #expect(first["id"] as? String == GameStreamHub.gameID(alpha))
+
+        // Alpha is running and saves its place and picture: the kept list doesn't know, the refreshed one does.
+        try tmp.file("Games/Saves/Alpha.nes.autosave")
+        try tmp.file("Games/Saves/Alpha.nes.png")
+        #expect(cache.entries.first { $0["title"] as? String == "Alpha" }?["canResume"] as? Bool == false)
+        let refreshed = cache.refreshed(live: alpha.id, played: played)
+        let now = try #require(refreshed.first { $0["title"] as? String == "Alpha" })
+        #expect(now["canResume"] as? Bool == true)
+        #expect((now["art"] as? String)?.hasPrefix("/api/games/art/") == true)
+        // The other games' entries are the kept ones, in the same order.
+        #expect(refreshed.map { $0["id"] as? String } == cache.entries.map { $0["id"] as? String })
+        #expect(cache.refreshed(live: nil, played: played).count == cache.entries.count)
+        #expect(cache.refreshed(live: "/not/a/game.nes", played: played).count == cache.entries.count)
+    }
+
+    /// A picture laid out like the core's (32-bit, no alpha, over plain memory), from `pixel(x, y)`.
+    static func corePicture(width: Int, height: Int, _ pixel: (Int, Int) -> UInt32) -> CGImage? {
+        var bytes = [UInt32](repeating: 0, count: width * height)
+        for y in 0..<height { for x in 0..<width { bytes[y * width + x] = pixel(x, y) } }
+        let data = bytes.withUnsafeBytes { Data($0) } as CFData
+        guard let provider = CGDataProvider(data: data) else { return nil }
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: width * 4,
+                       space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                       bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue | CGImageAlphaInfo.noneSkipFirst.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    @Test("Game streaming skips a picture only when its pixels are the same as the last one sent")
+    func samePixels() throws {
+        let pattern: (Int, Int) -> UInt32 = { x, y in UInt32((x * 7 + y * 13) & 0xFF) << 16 | UInt32(x & 0xFF) << 8 | UInt32(y & 0xFF) }
+        let a = try #require(Self.corePicture(width: 256, height: 240, pattern))
+        let b = try #require(Self.corePicture(width: 256, height: 240, pattern))
+        #expect(StreamOutput.samePixels(a, b))
+        #expect(StreamOutput.samePixels(a, a))
+        let changed = try #require(Self.corePicture(width: 256, height: 240) { x, y in x == 200 && y == 239 ? 0xFFFFFF : pattern(x, y) })
+        #expect(!StreamOutput.samePixels(a, changed), "one pixel in the last row is a change")
+        let other = try #require(Self.corePicture(width: 240, height: 256, pattern))
+        #expect(!StreamOutput.samePixels(a, other), "the same bytes in another shape are a change")
+    }
+
+    @Test("Streamed PNG pictures (no row filters) are still exact")
+    func streamPNGIsLossless() throws {
+        let image = try #require(Self.corePicture(width: 256, height: 240) { x, y in
+            (x / 8 + y / 8) % 2 == 0 ? 0x00FC_7460 : UInt32((x * 3) & 0xFF) << 8 | UInt32(y & 0xFF)
+        })
+        let png = try #require(StreamOutput.encode(image, png: true))
+        #expect(png.starts(with: [0x89, 0x50, 0x4E, 0x47]))
+        let source = try #require(CGImageSourceCreateWithData(png as CFData, nil))
+        let decoded = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        func rgb(_ picture: CGImage) throws -> [UInt8] {
+            var out = [UInt8](repeating: 0, count: picture.width * picture.height * 4)
+            let context = try #require(CGContext(data: &out, width: picture.width, height: picture.height, bitsPerComponent: 8,
+                                                 bytesPerRow: picture.width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                                 bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+            context.draw(picture, in: CGRect(x: 0, y: 0, width: picture.width, height: picture.height))
+            return out
+        }
+        #expect(try rgb(decoded) == rgb(image))
+        let jpeg = try #require(StreamOutput.encode(image, png: false))
+        #expect(jpeg.starts(with: [0xFF, 0xD8]))
+    }
 }

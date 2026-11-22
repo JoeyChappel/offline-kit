@@ -222,7 +222,7 @@ struct AnswerIndexPolicyTests {
         #expect(AnswerIndexPolicy.estimatedBytes(articles: 6_800_000, depth: .leads) == 4_760_000_000)
         #expect(AnswerIndexPolicy.maxHTMLBytes(.full) == 200_000 && AnswerIndexPolicy.maxHTMLBytes(.leads) == 32_000)
         #expect(AnswerIndexPolicy.maxPassages(.full) == 40 && AnswerIndexPolicy.maxPassages(.leads) == 1)
-        #expect(AnswerIndexPolicy.chunk(.full) == 60 && AnswerIndexPolicy.chunk(.leads) == 400)
+        #expect(AnswerIndexPolicy.chunk(.full) == 160 && AnswerIndexPolicy.chunk(.leads) == 1_000)
         try #require(ProcessInfo.processInfo.environment["OFFLINEKIT_INDEX_WORKERS"] == nil)
         #expect(AnswerIndexPolicy.workers(plugged: false) == 1)
         #expect((1...3).contains(AnswerIndexPolicy.workers(plugged: true)))

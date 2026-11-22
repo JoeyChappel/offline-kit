@@ -186,7 +186,7 @@ struct AskView: View {
         // Look for Ollama (a result from the last 30 seconds will do), then warm up the built-in model if it will answer.
         .task(id: model.choice) {
             await model.refreshOllama(force: false)
-            model.preloadIfNeeded(libraryFolders: library.folders)
+            model.preloadIfNeeded(library: library, household: household)
         }
         #if DEBUG
         // Test hook: -seedHousehold YES fills an empty test household with made-up people and supplies (also seeded in Prepare).

@@ -541,9 +541,19 @@ final class MacTransfers {
 
 /// URLSession delegate. Runs on the session's queue: the downloaded file has to be moved before this returns.
 private final class TransferDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    /// When each task last reported progress to the main actor. Only touched on the session's delegate queue, which is serial.
+    private var reportedAt: [Int: CFAbsoluteTime] = [:]
+    /// Progress reaches the screen at most this often per file. The system calls in for every piece it writes (many
+    /// times a second on fast Wi-Fi), and each report redrew the downloads list.
+    static let progressInterval: CFAbsoluteTime = 0.25
+
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
                     totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
         guard let description = downloadTask.taskDescription else { return }
+        let now = CFAbsoluteTimeGetCurrent()
+        let last = reportedAt[downloadTask.taskIdentifier] ?? 0
+        guard now - last >= Self.progressInterval || totalBytesWritten >= totalBytesExpectedToWrite else { return }
+        reportedAt[downloadTask.taskIdentifier] = now
         // With a resumed download, totalBytesWritten counts from where it picked up.
         Task { @MainActor in MacTransfers.shared.progress(description, written: totalBytesWritten) }
     }
@@ -573,6 +583,7 @@ private final class TransferDelegate: NSObject, URLSessionDownloadDelegate, @unc
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        reportedAt[task.taskIdentifier] = nil
         guard let error, let description = task.taskDescription else { return }
         let resumeData = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data
         let message = (error as? URLError)?.code == .cancelled ? "Stopped." :

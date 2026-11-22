@@ -86,6 +86,11 @@ final class AskModel {
     private var task: Task<Void, Never>?
     /// The after-answer pass that notes lasting facts. Separate from `task` so it never blocks the next question.
     private var learnTask: Task<Void, Never>?
+    /// The engine that answered last, told when the conversation starts over.
+    private var lastEngine: AnswerEngine?
+    /// The oldest turn the conversation history still includes. Older turns are dropped a few at a time, so the
+    /// history keeps the same beginning for several turns (and the model's saved state of it stays usable).
+    private var historyStart: UUID?
     private var requestID = UUID()
 
     /// http(s) to localhost, a ".local" name or a private IPv4 address.
@@ -218,11 +223,38 @@ final class AskModel {
     /// Loads the built-in answer model in the background when Ask would use it, so the first question
     /// doesn't wait for it. Call once Ollama has been looked for.
     func preloadIfNeeded(libraryFolders: [URL]) {
+        guard let engine = preloadEngine(libraryFolders: libraryFolders) else { return }
+        engine.preload(instructions: Self.instructions)
+    }
+
+    /// Ask opened: gets everything the first question needs ready in the background, the main thread never
+    /// waiting on it: the answer model (loaded, with the instructions and this household's context evaluated),
+    /// and the searches (each reference's search index opened, the word embeddings loaded).
+    func preloadIfNeeded(library: Library, household: Household?) {
+        libraryFolders = library.folders
+        Retriever.warm(library.books.map(\.archive))
+        guard let engine = preloadEngine(libraryFolders: library.folders) else { return }
+        let kit = Self.kitSummary(library)
+        Task { [weak self] in
+            // The household loads just after launch; its context is part of every question's start.
+            await household?.ensureLoaded()
+            guard let self, self.task == nil else { engine.preload(instructions: Self.instructions); return }
+            let context = AskContext.build(household?.data ?? HouseholdData(privacy: AskPrivacy(personalize: false)),
+                                           kit: kit, limit: engine.contextBudget)
+            let head = Self.promptHead(context: context, history: self.conversationSoFar(engine: engine, context: context))
+            engine.preload(instructions: self.currentInstructions, head: head)
+        }
+    }
+
+    private func preloadEngine(libraryFolders: [URL]) -> LlamaEngine? {
         guard choice == .builtIn || (choice == .auto && (ollamaModels ?? []).isEmpty),
               let installed = LocalModels.selected(in: installedBuiltIn(libraryFolders: libraryFolders), id: builtInModel)
-        else { return }
-        LlamaEngine(model: installed).preload(instructions: Self.instructions)
+        else { return nil }
+        return LlamaEngine(model: installed)
     }
+
+    /// Ask's instructions for the next question: the emergency version while an alert is showing.
+    private var currentInstructions: String { Self.instructions + (alert != nil ? Self.emergencyInstructions : "") }
 
     /// Picks an engine. Automatic prefers Ollama (bigger model and context) when it's running.
     func resolveEngine() async -> AnswerEngine? {
@@ -265,6 +297,8 @@ final class AskModel {
         stop()
         if !turns.isEmpty { clearedTurns = turns; clearedAt = Date() }
         turns.removeAll()
+        historyStart = nil
+        lastEngine?.forgetConversation()
     }
 
     /// Undo for New Conversation. Does nothing if a new question has been asked since.
@@ -272,6 +306,7 @@ final class AskModel {
         guard let saved = clearedTurns, turns.isEmpty else { clearedTurns = nil; return }
         turns = saved
         clearedTurns = nil
+        historyStart = nil
     }
 
     func dismissUndo() { clearedTurns = nil }
@@ -315,8 +350,6 @@ final class AskModel {
             alert = found
         }
         let emergency = alert != nil
-        let shortHistory = conversationSoFar(turns: 2, perAnswer: 400)
-        let longHistory = conversationSoFar(turns: 6, perAnswer: 1_500)
         var turn = Turn(question: question)
         turn.scope = scope
         turn.isEmergency = emergency
@@ -363,6 +396,7 @@ final class AskModel {
                 fail(index, "No answer model is ready yet. Download the Offline Kit answer model in Get Resources, or turn on Apple Intelligence in System Settings.")
                 return
             }
+            lastEngine = engine
             turns[index].engine = engine.displayName
             turns[index].engineDetail = engine.technicalName
             turns[index].runsOnDevice = engine.runsOnDevice
@@ -374,28 +408,43 @@ final class AskModel {
             guard !Task.isCancelled, self.requestID == request else { return }
             let data = household?.data ?? HouseholdData(privacy: AskPrivacy(personalize: false))
             let context = AskContext.build(data, kit: kit, limit: engine.contextBudget)
-            // Big models keep most of the conversation, so a scenario built up over several turns stays intact.
-            let earlier = engine.sourceBudget >= 10_000 ? String(longHistory.suffix(10_000)) : String(shortHistory.suffix(engine.contextBudget / 2))
+            let earlier = conversationSoFar(engine: engine, context: context)
             turns[index].context = context
             let instructions = Self.instructions + (emergency ? Self.emergencyInstructions : "")
 
-            // On the small models, personal context and history share the window with the sources.
+            // Personal context and history share the model's window with the sources, which get the rest of it:
+            // too much text would only be refused and asked again with less.
             let small = engine.sourceBudget < 10_000
-            var budget = max(2_000, engine.sourceBudget - (small ? context.count + earlier.count : 0))
+            var budget = max(2_000, small ? engine.sourceBudget - context.count - earlier.count
+                                          : min(engine.sourceBudget, engine.promptBudget - context.count - earlier.count))
+            // A follow-up usually needs the model's keyword search below (its words lean on the question before):
+            // start writing it now, on the model, while the library is searched. Cancelled if it isn't needed.
+            let earlyKeywords: Task<String?, Never>? = !aboutKit && !emergency && searchText != question
+                ? Task { await Self.searchWords(for: searchText, engine: engine) } : nil
+            defer { earlyKeywords?.cancel() }
             // Questions about the kit itself are answered from the kit description; a keyword search only adds noise.
             var sources: [Source] = []
             // What the searches for this exact question found, per archive: a later pass reuses it.
             var searched: [String: Retriever.Gathered] = [:]
+            #if DEBUG
+            let traceStart = Date()
+            func trace(_ what: String) { AskTrace.log(String(format: "%6.0f ms  ", Date().timeIntervalSince(traceStart) * 1000) + what) }
+            trace("searching")
+            #else
+            func trace(_ what: @autoclosure () -> String) {}
+            #endif
             if !aboutKit, !medical.isEmpty {
                 let result = await Retriever.retrieveConcurrently(question: retrievalQuestion, archives: medical, budgetChars: budget)
                 sources = result.sources
                 searched = result.gathered
+                trace("medical search: \(sources.count) sources")
             }
             if !aboutKit, Retriever.strength(sources, question: question) == 0 {
                 let result = await Retriever.retrieveConcurrently(question: retrievalQuestion, archives: archives,
                                                                   budgetChars: budget, reusing: searched)
                 sources = result.sources
                 searched = result.gathered
+                trace("search: \(sources.count) sources, strength \(Retriever.strength(sources, question: question))")
             }
             if Task.isCancelled { return }
             // A follow-up the bare question didn't answer: search it together with the question before it.
@@ -403,6 +452,7 @@ final class AskModel {
                 let merged = scope.map { "\($0.title): \(searchText)" } ?? searchText
                 let found = await Retriever.retrieveConcurrently(question: merged, archives: archives, budgetChars: budget).sources
                 if Retriever.strength(found, question: searchText) > 0 { sources = found }
+                trace("follow-up search with the question before: strength \(Retriever.strength(found, question: searchText))")
             }
             if Task.isCancelled { return }
             // The search missed (a misspelling like "carpel tunel", or everyday words the articles don't use):
@@ -410,7 +460,11 @@ final class AskModel {
             if !aboutKit, Retriever.strength(sources, question: searchText) == 0 {
                 var alternatives: [String] = []
                 if let fixed = Retriever.spellCorrected(searchText) { alternatives.append(fixed) }
-                if !emergency, let keywords = await Self.searchWords(for: searchText, engine: engine) { alternatives.append(keywords) }
+                trace("spelling checked")
+                let keywords: String?
+                if let earlyKeywords { keywords = await earlyKeywords.value } else if !emergency { keywords = await Self.searchWords(for: searchText, engine: engine) } else { keywords = nil }
+                if let keywords { alternatives.append(keywords) }
+                trace("search words: \(alternatives)")
                 var best = 0
                 for alternative in alternatives where !Task.isCancelled {
                     let query = scope.map { "\($0.title): \(alternative)" } ?? alternative
@@ -423,7 +477,10 @@ final class AskModel {
                     }
                 }
                 if Task.isCancelled { return }
+                trace("alternative searches done")
             }
+            // Not needed after all: stop it now, so the answer doesn't wait for it.
+            earlyKeywords?.cancel()
             // Still nothing, but PDF and reference packs are being read for the first time: give them a moment
             // rather than answering "not in the library" about books that are about to be searchable.
             if !aboutKit, Retriever.strength(sources, question: searchText) == 0, PDFIndex.shared.isBuilding {
@@ -451,11 +508,14 @@ final class AskModel {
                 var lastShown = Date.distantPast
                 var unshown: String?
                 do {
-                    let prompt = Self.prompt(question: question, sources: current, context: context, history: history)
+                    let head = Self.promptHead(context: context, history: history)
+                    let prompt = head + Self.promptQuestion(question: question, sources: current)
                     let notes = StreamNotes()
-                    for try await text in engine.stream(instructions: instructions, prompt: prompt, notes: notes) {
+                    trace("answering: prompt \(prompt.count) chars (context \(context.count), history \(history.count))")
+                    for try await text in engine.stream(instructions: instructions, prompt: prompt, notes: notes, head: head) {
                         if Task.isCancelled { break }
                         if turns[index].waking { turns[index].waking = false }
+                        if lastShown == .distantPast { trace("first words") }
                         let now = Date()
                         if now.timeIntervalSince(lastShown) >= Self.answerRefresh {
                             turns[index].answer = text
@@ -481,7 +541,12 @@ final class AskModel {
                         // Run after this turn's task ends (the defer above), so a new question is never refused.
                         learnTask = Task(priority: .utility) { [weak self] in
                             await self?.learn(from: question, engine: engine, household: household, turn: index)
+                            // Then (with anything just noted in the context) get the follow-up's start ready.
+                            guard !Task.isCancelled else { return }
+                            self?.prepareFollowUp(engine: engine, household: household, kit: kit)
                         }
+                    } else {
+                        prepareFollowUp(engine: engine, household: household, kit: kit)
                     }
                     return
                 } catch where (AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error)) && attempt < 2 {
@@ -532,10 +597,21 @@ final class AskModel {
     }
 
     static func prompt(question: String, sources: [Source], context: String = "", history: String = "") -> String {
+        promptHead(context: context, history: history) + promptQuestion(question: question, sources: sources)
+    }
+
+    /// The start of a question's prompt that the next question in the conversation starts with too: household
+    /// context, then the conversation so far. The new question and its sources come after it.
+    static func promptHead(context: String, history: String) -> String {
         var text = ""
         if !context.isEmpty { text += "About the person and their kit (private, from this device):\n\(context)\n\n" }
         if !history.isEmpty { text += "Earlier in this conversation:\n\(history)\n\n" }
-        text += "Question: \(question)\n\n"
+        return text
+    }
+
+    /// The question and its numbered sources.
+    static func promptQuestion(question: String, sources: [Source]) -> String {
+        let text = "Question: \(question)\n\n"
         guard !sources.isEmpty else {
             return text + (isAboutKit(question)
                 ? "This is a question about Offline Kit itself. Answer from the description of their kit."
@@ -605,10 +681,47 @@ final class AskModel {
     }
 
     /// Earlier questions and answers in this conversation, newest last, so follow-ups make sense.
-    private func conversationSoFar(turns count: Int, perAnswer: Int) -> String {
-        turns.filter { $0.status == .done && !$0.answer.isEmpty }.suffix(count)
-            .map { "Q: \($0.question)\nA: \($0.answer.prefix(perAnswer))" }
-            .joined(separator: "\n")
+    /// Big models keep most of the conversation, so a scenario built up over several turns stays intact: up to six
+    /// turns, within half of what the model's window has left after the household context (the sources get the
+    /// rest). When that's full, the oldest turns go until a third is free again, so the history keeps the same
+    /// beginning for the next few turns and the model's saved state of it can be reused. Small models keep the
+    /// last two turns.
+    func conversationSoFar(engine: AnswerEngine, context: String) -> String {
+        let done = turns.filter { $0.status == .done && !$0.answer.isEmpty }
+        guard engine.sourceBudget >= 10_000 else {
+            return String(Self.historyText(done.suffix(2), perAnswer: 400).suffix(engine.contextBudget / 2))
+        }
+        let limit = min(10_000, max(1_000, (engine.promptBudget - context.count) / 2)), most = 6
+        var kept = ArraySlice(done)
+        if let start = historyStart, let i = kept.firstIndex(where: { $0.id == start }) { kept = kept[i...] }
+        if kept.count > most || Self.historyText(kept, perAnswer: 1_500).count > limit {
+            while kept.count > 1, kept.count > most * 2 / 3 || Self.historyText(kept, perAnswer: 1_500).count > limit * 2 / 3 {
+                kept = kept.dropFirst()
+            }
+        }
+        historyStart = kept.first?.id
+        return String(Self.historyText(kept, perAnswer: 1_500).suffix(limit))
+    }
+
+    /// "Q: …\nA: …" for each turn. Citation marks are left out: they point at that turn's sources, not this one's.
+    static func historyText(_ turns: ArraySlice<Turn>, perAnswer: Int) -> String {
+        turns.map { "Q: \($0.question)\nA: \(withoutCitations(String($0.answer.prefix(perAnswer))))" }.joined(separator: "\n")
+    }
+
+    private static let citation = try! NSRegularExpression(pattern: #" ?\[\d+(?:[,–-] ?\d+)*\]"#)
+
+    /// The answer without its "[1]" and "[2, 3]" citation marks.
+    static func withoutCitations(_ text: String) -> String {
+        citation.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text), withTemplate: "")
+    }
+
+    /// After an answer: evaluate the next question's start (instructions, household context and the conversation
+    /// so far, this answer included) in the background, so a follow-up only evaluates its own question and sources.
+    private func prepareFollowUp(engine: AnswerEngine, household: Household?, kit: String) {
+        let context = AskContext.build(household?.data ?? HouseholdData(privacy: AskPrivacy(personalize: false)),
+                                       kit: kit, limit: engine.contextBudget)
+        engine.prepareFollowUp(instructions: currentInstructions,
+                               head: Self.promptHead(context: context, history: conversationSoFar(engine: engine, context: context)))
     }
 
     /// What's in the kit, so Ask can point to it and knows what it can't answer.
@@ -668,3 +781,14 @@ final class AskModel {
         for i in turns.indices { turns[i].noted.removeAll { $0.id == memory.id } }
     }
 }
+
+#if DEBUG
+/// Where a question's time goes, on standard error (OFFLINEKIT_TRACE=1).
+enum AskTrace {
+    static let enabled = ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil
+    static func log(_ line: @autoclosure () -> String) {
+        guard enabled else { return }
+        FileHandle.standardError.write(Data(("ask: " + line() + "\n").utf8))
+    }
+}
+#endif

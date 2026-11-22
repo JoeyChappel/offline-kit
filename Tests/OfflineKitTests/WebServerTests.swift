@@ -8,6 +8,7 @@ struct WebServerTests {
     let tmp: TempDir
     let file: URL          // 1,000 bytes: 0, 1, 2 … 255, 0, 1 …
     let big: URL           // 17 MB, sparse
+    let patterned: URL     // 3.5 MB of a byte pattern that differs in every 1 MB piece
     let fileBytes = Data((0..<1000).map { UInt8($0 & 0xFF) })
     static let bigSize: Int64 = 17 * 1024 * 1024
     let pageTag = "\"page-\(UUID().uuidString)\""
@@ -21,10 +22,14 @@ struct WebServerTests {
         let handle = try FileHandle(forWritingTo: big)
         try handle.truncate(atOffset: UInt64(Self.bigSize))
         try handle.close()
+        patterned = tmp.url.appending(path: "big.bin")
+        try Self.patternedBytes.write(to: patterned)
     }
 
+    static let patternedBytes = Data((0..<(3 * 1024 * 1024 + 512 * 1024)).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ $0 >> 20) })
+
     func start() async throws -> LoopbackServer {
-        let file = self.file, big = self.big, tag = pageTag
+        let file = self.file, big = self.big, tag = pageTag, patterned = self.patterned
         return try await LoopbackServer { req, res in
             switch req.path {
             case "/hello":
@@ -38,6 +43,10 @@ struct WebServerTests {
                                    cacheControl: "private, max-age=60", requestHeaders: req.headers)
             case "/big":
                 await res.sendFile(big, contentType: "video/mp4", rangeHeader: req.headers["range"])
+            case "/download":
+                await res.sendDownload(patterned, rangeHeader: req.headers["range"], ifRange: req.headers["if-range"])
+            case "/patterned":
+                await res.sendFile(patterned, contentType: "video/mp4", rangeHeader: req.headers["range"])
             case "/page":
                 await res.send(status: 200, contentType: "text/html; charset=utf-8", body: GzipTests.text, headers: ["ETag": tag])
             case "/small":
@@ -169,6 +178,27 @@ struct WebServerTests {
         #expect(whole.status == 200)
         #expect(whole.body == fileBytes)
         #expect(whole.headers["connection"] == "keep-alive", "still framed by length, so the connection stays")
+    }
+
+    @Test("Files over several pieces (read ahead while sending) arrive byte for byte, whole and by range", arguments: ["/download", "/patterned"])
+    func piecesArriveInOrder(path: String) async throws {
+        let server = try await start()
+        let c = try server.client(timeout: 10)
+        c.send("GET \(path) HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        let whole = try c.readResponse()
+        #expect(whole.status == 200)
+        #expect(whole.body == Self.patternedBytes)
+        // A range across piece boundaries, on the same connection.
+        let lower = 1024 * 1024 - 7, upper = 3 * 1024 * 1024 + 99
+        c.send("GET \(path) HTTP/1.1\r\nHost: localhost\r\nRange: bytes=\(lower)-\(upper)\r\n\r\n")
+        let part = try c.readResponse()
+        #expect(part.status == 206)
+        #expect(part.headers["content-range"] == "bytes \(lower)-\(upper)/\(Self.patternedBytes.count)")
+        #expect(part.body == Self.patternedBytes.subdata(in: lower..<(upper + 1)))
+        // Open-ended from inside the last piece.
+        c.send("GET \(path) HTTP/1.1\r\nHost: localhost\r\nRange: bytes=\(Self.patternedBytes.count - 10)-\r\n\r\n")
+        let tail = try c.readResponse()
+        #expect(tail.body == Self.patternedBytes.suffix(10))
     }
 
     @Test("Open-ended ranges are capped at 16 MB")

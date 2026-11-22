@@ -6,6 +6,10 @@ import Foundation
 //        OFFLINEKIT_GREEDY=1 okit --llama-bench <questions.txt> [--tokens 128] [--out r.json]   model speed and memory
 //        okit --html-check <file.zim> [--limit N] [--articles N]   HTML-to-text against the old regular expressions
 //        okit --index-bench <file.zim> [--limit N] [--depth full|leads] [--questions q.txt] [--reuse]   index build and query timings
+//        OFFLINEKIT_GREEDY=1 okit --ask-bench <conversations.txt> [--wait 5] [--gap 3] [--out r.json]   first word per turn, from launch
+//        OFFLINEKIT_GREEDY=1 okit --followup-check <conversations.txt>   follow-up answers with and without the saved conversation
+//        okit --search-cold "query" […]       first libzim search per archive against later ones
+//        okit --index-build <file.zim> [--seconds 60]   the app's index builder: articles/s and CPU
 //        okit --models                      list answer models (Models folders + ones used in place)
 //        okit --add-model <file.gguf> [place]  check and add a GGUF (copies into the library unless "place")
 
@@ -52,6 +56,22 @@ func run() async {
             let tokens = args.firstIndex(of: "--tokens").flatMap { Int(args[$0 + 1]) } ?? 128
             let out = args.firstIndex(of: "--out").map { args[$0 + 1] }
             await LlamaBench.run(questionsFile: file, maxTokens: tokens, out: out)
+            return
+        case "--ask-bench":
+            let file = args.removeFirst()
+            let wait = args.firstIndex(of: "--wait").flatMap { Double(args[$0 + 1]) } ?? 5
+            let gap = args.firstIndex(of: "--gap").flatMap { Double(args[$0 + 1]) } ?? 3
+            await AskBench.run(file: file, wait: wait, gap: gap, out: args.firstIndex(of: "--out").map { args[$0 + 1] })
+            return
+        case "--search-cold":
+            await SearchCold.run(queries: args)
+            return
+        case "--index-build":
+            let zim = args.removeFirst()
+            await IndexBuild.run(zim: zim, seconds: args.firstIndex(of: "--seconds").flatMap { Double(args[$0 + 1]) } ?? 60)
+            return
+        case "--followup-check":
+            await Bench.followUpCheck(file: args.removeFirst())
             return
         case "--prefix-check":
             await Bench.prefixCheck(questionsFile: args.removeFirst())

@@ -558,7 +558,34 @@ enum ProfileScroller {
         }
         walk(root)
         guard let sv = best, let doc = sv.documentView else { return }
+        // -cycleHover YES parks the real pointer over the scrolling content, so hover tracking costs show up like they
+        // do for someone scrolling with a trackpad (the pointer stays still while the content moves under it).
+        if UserDefaults.standard.bool(forKey: "cycleHover"), let window = sv.window {
+            let inWindow = sv.convert(NSPoint(x: sv.bounds.midX, y: sv.bounds.midY), to: nil)
+            let onScreen = window.convertPoint(toScreen: inWindow)
+            let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+            CGWarpMouseCursorPosition(CGPoint(x: onScreen.x, y: primaryHeight - onScreen.y))
+            CGAssociateMouseAndMouseCursorPosition(1)
+        }
         let travel = min(doc.frame.height - sv.bounds.height, 2400)
+        // -cycleWheel YES: scroll with real wheel events (began, changed, ended, as a trackpad sends them) at a steady
+        // 3000 points a second, so scroll phases, hover updates and live-scroll behavior run as they do for a person.
+        if UserDefaults.standard.bool(forKey: "cycleWheel"), let window = sv.window {
+            func send(_ delta: Int32, _ phase: Int64) async {
+                guard let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 1, wheel1: delta, wheel2: 0, wheel3: 0) else { return }
+                cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+                cg.setIntegerValueField(.scrollWheelEventScrollPhase, value: phase)
+                if let event = NSEvent(cgEvent: cg) { window.sendEvent(event) }
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+            let events = Int(travel / 48)
+            for direction in [Int32(-48), 48] {
+                for i in 0..<events { await send(direction, i == 0 ? 1 : 2) }
+                await send(0, 4)
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            return
+        }
         let steps = 20
         for i in 1...steps {
             sv.contentView.scroll(to: NSPoint(x: 0, y: travel * Double(i) / Double(steps)))

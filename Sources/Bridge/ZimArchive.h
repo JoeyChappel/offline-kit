@@ -48,6 +48,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Full-text (Xapian) search. Returns an empty array if the archive has no index.
 - (NSArray<ZimHit *> *)search:(NSString *)query limit:(NSInteger)limit;
+/// Same, without snippets for hits whose paths are in `known` (their snippet is empty): making one reads the article.
+- (NSArray<ZimHit *> *)search:(NSString *)query limit:(NSInteger)limit snippetsExcept:(nullable NSSet<NSString *> *)known;
 /// Title suggestions, works on every archive.
 - (NSArray<ZimHit *> *)suggest:(NSString *)query limit:(NSInteger)limit;
 /// Every entry (not redirects) whose type starts with mimePrefix, e.g. @"application/pdf". Path and title only.

@@ -164,3 +164,35 @@ extension View {
     /// Draws this block of static text as one GPU group (see FlattenedText).
     func flattenedText() -> some View { modifier(FlattenedText()) }
 }
+
+// MARK: - Scrolling without hit testing
+
+/// A ScrollView that turns hit testing off for its content while the content is moving (Mac only).
+/// SwiftUI re-runs hit testing on every frame a stationary pointer sits over moving content, to update hover. That
+/// walks every card's responders, and was about a tenth of the main thread's time while scrolling Watch and Books.
+/// Nobody clicks a card that is flying past, and hovering is worked out again the moment the scroll ends.
+struct HitPausingScrollView<Content: View>: View {
+    var axes: Axis.Set = .vertical
+    @ViewBuilder var content: () -> Content
+    #if os(macOS)
+    @State private var scrolling = false
+    #if DEBUG
+    /// -noHitPause YES scrolls the old way, for before/after comparisons in one build.
+    private static var disabled: Bool { UserDefaults.standard.bool(forKey: "noHitPause") }
+    #else
+    private static var disabled: Bool { false }
+    #endif
+    #endif
+
+    var body: some View {
+        #if os(macOS)
+        ScrollView(axes) { content().allowsHitTesting(!scrolling || Self.disabled) }
+            .onScrollPhaseChange { _, phase in
+                let moving = phase == .interacting || phase == .decelerating || phase == .animating
+                if moving != scrolling { scrolling = moving }
+            }
+        #else
+        ScrollView(axes) { content() }
+        #endif
+    }
+}

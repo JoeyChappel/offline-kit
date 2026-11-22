@@ -96,6 +96,15 @@ final class ShareController {
                                        GameStreamHub.shared.signOutAll()
                                    })
         #if DEBUG
+        // Test hook (test home only): -shareStallReport 10 logs main-thread stalls and CPU every 10 seconds (StallProbe),
+        // for measuring how much of the main thread sharing takes under load.
+        let stallEvery = UserDefaults.standard.double(forKey: "shareStallReport")
+        if KitLocation.testHome != nil, stallEvery > 0 {
+            StallProbe.start()
+            Timer.scheduledTimer(withTimeInterval: stallEvery, repeats: true) { _ in
+                MainActor.assumeIsolated { StallProbe.report("share") }
+            }
+        }
         if UserDefaults.standard.bool(forKey: "shareOnLaunch") { start(); return }   // test hook; does not change the saved setting
         #endif
         if enabled { startIfOnSharedNetwork() }
@@ -371,7 +380,7 @@ final class ShareController {
         case ("GET", let path) where path.hasPrefix("/media/"):
             await mediaFile(path: path, range: req.headers["range"], width: ShareArtwork.bucket(req.query["w"]), requestHeaders: req.headers, res)
         case ("GET", "/api/games"):
-            await gameList(res)
+            await gameList(req, res)
         case ("GET", let path) where path.hasPrefix("/api/games/art/"):
             await gameArt(id: String(path.dropFirst("/api/games/art/".count)), req, res)
         case ("GET", "/api/play/socket"):
@@ -398,23 +407,84 @@ final class ShareController {
     // MARK: Games
 
     /// GET /api/games: {"games": [{"id", "title", "system", "systemName", "art", "lastPlayed", "canResume"}]}.
-    private func gameList(_ res: WebServer.Responder) async {
+    ///
+    /// Each game's entry needs its save files looked at (the shelf picture's date, Resume), so the entries are made once per
+    /// game-library revision (a scan, a favorite or a play changes it; see observeGames) and kept. Saves are written while a
+    /// game runs, so the running game's entry is made fresh each time, and the list is made again once it stops (its last
+    /// autosave and picture are written then). Devices that have the same answer get a 304.
+    private func gameList(_ req: WebServer.Request, _ res: WebServer.Responder) async {
         guard let games, let library else { await res.send(status: 503, json: ["error": "Not ready"]); return }
-        await games.reloadIfChanged(library: library)   // a few stat calls when nothing changed
-        let list = games.games, played = games.lastPlayed
-        gameIndex = Dictionary(list.map { (GameStreamHub.gameID($0), $0) }, uniquingKeysWith: { first, _ in first })
-        prepareArtworkSoon()   // the games may have arrived after the media did
-        let entries: [[String: Any]] = await Task.detached(priority: .userInitiated) {
-            list.filter { $0.system != .atari2600 }.map { game in
-                let id = GameStreamHub.gameID(game)
-                let artStamp = (try? game.thumbnailURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                return ["id": id, "title": game.title, "system": game.system.rawValue, "systemName": game.system.name,
-                        "art": artStamp.map { "/api/games/art/\(id)?v=\(Int($0.timeIntervalSince1970))" } ?? NSNull(),
-                        "lastPlayed": played[game.id].map { $0.timeIntervalSince1970.rounded() } ?? NSNull(),
-                        "canResume": game.canResume]
-            }
+        // Adding or removing a game changes the Games folders: checked at most every few seconds, not for each request.
+        if -gamesCheckedAt.timeIntervalSinceNow > Self.gamesCheckInterval {
+            gamesCheckedAt = Date()
+            await games.reloadIfChanged(library: library)
+        }
+        let (body, etag) = await gameListBody(games)
+        let headers = ["ETag": etag, "Cache-Control": "no-cache"]
+        if WebServer.isNotModified(req.headers, etag: etag, modified: .distantPast) {
+            await res.send(status: 304, contentType: "application/json; charset=utf-8", body: Data(), headers: headers)
+        } else {
+            await res.send(status: 200, contentType: "application/json; charset=utf-8", body: body, headers: headers)
+        }
+    }
+
+    /// The encoded list and its ETag. Encoded off the main thread, and kept with the entries while no game is running.
+    private func gameListBody(_ games: GameLibrary) async -> (Data, String) {
+        let entries = await gameEntries(games)
+        if let kept = gameListCache.body, gameListCache.entries(for: GameListCache.Key(revision: gamesRevision, live: nil)) != nil,
+           GameSession.current?.isRunning != true { return kept }
+        let encoded: (Data, String) = await Task.detached(priority: .userInitiated) {
+            let body = (try? JSONSerialization.data(withJSONObject: ["games": entries])) ?? Data("{\"games\":[]}".utf8)
+            return (body, "\"g\(ShareController.digest(body))\"")
         }.value
-        await res.send(json: ["games": entries])
+        if GameSession.current?.isRunning != true, gameListCache.entries(for: GameListCache.Key(revision: gamesRevision, live: nil)) != nil {
+            gameListCache.body = encoded
+        }
+        return encoded
+    }
+
+    /// The list's entries, from the cache when the library hasn't changed (see gameList).
+    private func gameEntries(_ games: GameLibrary) async -> [[String: Any]] {
+        observeGames()
+        let live = GameSession.current.flatMap { $0.isRunning ? $0.game.id : nil }
+        let key = GameListCache.Key(revision: gamesRevision, live: live)
+        let played = games.lastPlayed
+        if gameListCache.entries(for: key) == nil {
+            let list = games.games
+            gameIndex = Dictionary(list.map { (GameStreamHub.gameID($0), $0) }, uniquingKeysWith: { first, _ in first })
+            prepareArtworkSoon()   // the games may have arrived after the media did
+            let built = await Task.detached(priority: .userInitiated) { GameListCache.build(list, played: played, for: key) }.value
+            // Kept only if nothing changed while it was made; just made, the running game's entry is current either way.
+            if key.revision == gamesRevision { gameListCache = built }
+            return built.entries
+        }
+        guard live != nil else { return gameListCache.entries }
+        // The running game's saves change while it plays: its entry alone is made again (three file checks).
+        let cache = gameListCache
+        return await Task.detached(priority: .userInitiated) { cache.refreshed(live: live, played: played) }.value
+    }
+
+    @ObservationIgnored private var gameListCache = GameListCache()
+    @ObservationIgnored private var gamesCheckedAt = Date.distantPast
+    static let gamesCheckInterval: TimeInterval = 3
+    /// Bumped whenever the game list, favorites or play history change (see observeGames).
+    @ObservationIgnored private var gamesRevision = 0
+    @ObservationIgnored private var observingGames = false
+
+    private func observeGames() {
+        guard let games, !observingGames else { return }
+        observingGames = true
+        withObservationTracking {
+            _ = games.games; _ = games.lastPlayed
+        } onChange: { [weak self] in
+            MainActor.assumeIsolated { self?.gamesRevision += 1 }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.observingGames = false
+                self.gamesRevision += 1   // anything that changed before watching resumed
+                self.observeGames()
+            }
+        }
     }
 
     @ObservationIgnored private var gameIndex: [String: Game] = [:]
@@ -425,13 +495,15 @@ final class ShareController {
         guard let game = gameIndex[id] ?? games?.games.first(where: { GameStreamHub.gameID($0) == id }) else {
             await res.send(status: 404, text: "Not found"); return
         }
-        let url = game.thumbnailURL
         let folders = library?.folders ?? []
-        let allowed = await Task.detached(priority: .userInitiated) {
-            (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        // The picture's path is worked out off the main thread too, with the file checks.
+        let found: URL? = await Task.detached(priority: .userInitiated) {
+            let url = game.thumbnailURL
+            let ok = (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
                 && SharePolicy.Scope(libraries: folders).allows(url)
+            return ok ? url : nil
         }.value
-        guard allowed else { await res.send(status: 404, text: "Not found"); return }
+        guard let url = found else { await res.send(status: 404, text: "Not found"); return }
         // ?w=: a copy sized for the tile (checked above, like the original).
         if let width = ShareArtwork.bucket(req.query["w"]), let copy = await ShareArtwork.resized(url, width: width) {
             await res.sendFile(copy.url, contentType: copy.contentType, rangeHeader: nil, cacheControl: "private, max-age=300", requestHeaders: req.headers)
@@ -842,6 +914,12 @@ final class ShareController {
             // The library may not have been read yet this launch (the first device to visit would read it): read it now,
             // so the first visit finds the list and its covers ready.
             if self.isRunning, let media = self.media, let library = self.library, media.items.isEmpty { await media.reload(library: library) }
+            // The same for the game list: the first visit to Play then finds it made (a cold scan took over 100 ms).
+            if self.isRunning, let games = self.games, let library = self.library {
+                self.gamesCheckedAt = Date()
+                await games.reloadIfChanged(library: library)
+                _ = await self.gameEntries(games)
+            }
             self.prepareScheduled = false
             self.prepareArtwork()
         }
@@ -1340,5 +1418,50 @@ final class ShareController {
 
     nonisolated private static func sourceJSON(_ s: Source) -> [String: Any] {
         ["n": s.id, "title": s.ref.title, "book": s.bookTitle, "url": contentURL(id: s.ref.bookID, path: s.ref.path)]
+    }
+}
+
+/// /api/games entries, kept per game-library revision and running game (see ShareController.gameList).
+struct GameListCache: @unchecked Sendable {   // JSON-ready dictionaries: values only, never changed once made
+    struct Key: Equatable, Sendable {
+        var revision: Int
+        /// The running game (GameSession.current), whose saves change while it plays.
+        var live: String?
+    }
+    private(set) var key: Key?
+    private(set) var entries: [[String: Any]] = []
+    /// `entries` encoded, with its ETag, once asked for while no game is running (ShareController.gameListBody).
+    var body: (Data, String)?
+    /// Game.id → its game and place in `entries`, to make the running game's entry again.
+    private var places: [String: (game: Game, index: Int)] = [:]
+
+    func entries(for key: Key) -> [[String: Any]]? { self.key == key ? entries : nil }
+
+    /// Every game's entry (Atari 2600 games aren't offered for streaming). Looks at each game's save files.
+    static func build(_ list: [Game], played: [String: Date], for key: Key) -> GameListCache {
+        var cache = GameListCache()
+        cache.key = key
+        for game in list where game.system != .atari2600 {
+            cache.places[game.id] = (game, cache.entries.count)
+            cache.entries.append(entry(game, played: played))
+        }
+        return cache
+    }
+
+    /// The entries with the running game's made again from its files.
+    func refreshed(live: String?, played: [String: Date]) -> [[String: Any]] {
+        guard let live, let place = places[live] else { return entries }
+        var out = entries
+        out[place.index] = Self.entry(place.game, played: played)
+        return out
+    }
+
+    static func entry(_ game: Game, played: [String: Date]) -> [String: Any] {
+        let id = GameStreamHub.gameID(game)
+        let artStamp = (try? game.thumbnailURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        return ["id": id, "title": game.title, "system": game.system.rawValue, "systemName": game.system.name,
+                "art": artStamp.map { "/api/games/art/\(id)?v=\(Int($0.timeIntervalSince1970))" } ?? NSNull(),
+                "lastPlayed": played[game.id].map { $0.timeIntervalSince1970.rounded() } ?? NSNull(),
+                "canResume": game.canResume]
     }
 }

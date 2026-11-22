@@ -13,6 +13,15 @@ protocol AnswerEngine: Sendable {
     func stream(instructions: String, prompt: String) -> AsyncThrowingStream<String, Error>
     /// Same, and `notes.cutShort` is set when the model ran out of room and stopped mid-answer.
     func stream(instructions: String, prompt: String, notes: StreamNotes) -> AsyncThrowingStream<String, Error>
+    /// Same, for a question in a conversation: `head` is the start of `prompt` the next question will start with
+    /// too (household context and earlier turns). Engines that can keep its evaluated state do.
+    func stream(instructions: String, prompt: String, notes: StreamNotes, head: String?) -> AsyncThrowingStream<String, Error>
+    /// Characters of household context, earlier conversation and sources that fit with the instructions and a full answer.
+    var promptBudget: Int { get }
+    /// Evaluates the next question's `head` ahead of time, in the background, when the engine keeps state.
+    func prepareFollowUp(instructions: String, head: String)
+    /// New Conversation: forget any state kept for follow-ups.
+    func forgetConversation()
 }
 
 /// What an engine learned while streaming, read once the stream has ended.
@@ -30,6 +39,17 @@ extension AnswerEngine {
     func stream(instructions: String, prompt: String, notes: StreamNotes) -> AsyncThrowingStream<String, Error> {
         stream(instructions: instructions, prompt: prompt)
     }
+
+    /// Engines that keep no state between prompts just stream.
+    func stream(instructions: String, prompt: String, notes: StreamNotes, head: String?) -> AsyncThrowingStream<String, Error> {
+        stream(instructions: instructions, prompt: prompt, notes: notes)
+    }
+
+    func prepareFollowUp(instructions: String, head: String) {}
+    func forgetConversation() {}
+
+    /// Engines that don't say: as much as Ask would ever send.
+    var promptBudget: Int { 40_000 }
 
     /// Characters of personal and kit context to include. Small models get a short version.
     var contextBudget: Int { sourceBudget >= 10_000 ? 4_000 : 1_500 }
@@ -100,6 +120,8 @@ struct OllamaEngine: AnswerEngine {
     var displayName: String { "Answer model (larger)" }
     var technicalName: String { "Ollama · \(model)" + (Self.isLocalHost(host) ? "" : " on \(host.host() ?? "another computer")") }
     var sourceBudget: Int { 14_000 }
+    /// num_ctx 16,384 tokens, less a full answer and the instructions, at about 3 characters a token.
+    var promptBudget: Int { (16_384 - 1_024 - 1_100) * 3 }
     var runsOnDevice: Bool { Self.isLocalHost(host) }
 
     static func isLocalHost(_ host: URL) -> Bool {

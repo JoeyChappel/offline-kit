@@ -1,6 +1,7 @@
 #import "ZimArchive.h"
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <zim/archive.h>
 #include <zim/entry.h>
@@ -24,6 +25,12 @@ static NSString *S(const std::string &s) {
 
 @implementation ZimArchive {
     std::unique_ptr<zim::Archive> _archive;
+    // One full-text and one title searcher per archive, opened on first use and kept: each opens the archive's
+    // Xapian database. Xapian databases aren't safe to use from two threads at once, hence a lock for each.
+    std::mutex _searchLock;
+    std::unique_ptr<zim::Searcher> _searcher;
+    std::mutex _suggestLock;
+    std::unique_ptr<zim::SuggestionSearcher> _suggester;
 }
 
 - (nullable instancetype)initWithPath:(NSString *)path error:(NSError **)error {
@@ -72,31 +79,44 @@ static NSString *S(const std::string &s) {
 }
 
 - (NSArray<ZimHit *> *)search:(NSString *)query limit:(NSInteger)limit {
+    return [self search:query limit:limit snippetsExcept:nil];
+}
+
+- (NSArray<ZimHit *> *)search:(NSString *)query limit:(NSInteger)limit snippetsExcept:(nullable NSSet<NSString *> *)known {
     NSMutableArray *out = [NSMutableArray array];
     if (!_hasFullTextIndex || query.length == 0) return out;
+    std::lock_guard<std::mutex> guard(_searchLock);
     try {
-        zim::Searcher searcher(*_archive);
+        if (!_searcher) _searcher = std::make_unique<zim::Searcher>(*_archive);
         zim::Query q(std::string(query.UTF8String));
-        auto search = searcher.search(q);
+        auto search = _searcher->search(q);
         auto results = search.getResults(0, (int)limit);
         for (auto it = results.begin(); it != results.end(); ++it) {
             ZimHit *h = [ZimHit new];
             h.path = S(it.getPath());
             h.title = S(it.getTitle());
-            try { h.snippet = S(it.getSnippet()); } catch (...) { h.snippet = @""; }
+            // A snippet reads and decompresses the article and cleans up its HTML: skip it for hits the caller has.
+            if (known && [known containsObject:h.path]) {
+                h.snippet = @"";
+            } else {
+                try { h.snippet = S(it.getSnippet()); } catch (...) { h.snippet = @""; }
+            }
             h.score = it.getScore();
             [out addObject:h];
         }
-    } catch (...) {}
+    } catch (...) {
+        _searcher.reset();   // opened again on the next search
+    }
     return out;
 }
 
 - (NSArray<ZimHit *> *)suggest:(NSString *)query limit:(NSInteger)limit {
     NSMutableArray *out = [NSMutableArray array];
     if (query.length == 0) return out;
+    std::lock_guard<std::mutex> guard(_suggestLock);
     try {
-        zim::SuggestionSearcher searcher(*_archive);
-        auto search = searcher.suggest(std::string(query.UTF8String));
+        if (!_suggester) _suggester = std::make_unique<zim::SuggestionSearcher>(*_archive);
+        auto search = _suggester->suggest(std::string(query.UTF8String));
         auto results = search.getResults(0, (int)limit);
         for (auto it = results.begin(); it != results.end(); ++it) {
             ZimHit *h = [ZimHit new];
@@ -106,7 +126,9 @@ static NSString *S(const std::string &s) {
             h.score = 0;
             [out addObject:h];
         }
-    } catch (...) {}
+    } catch (...) {
+        _suggester.reset();
+    }
     return out;
 }
 
