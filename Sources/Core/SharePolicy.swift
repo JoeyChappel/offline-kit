@@ -9,12 +9,12 @@ enum SharePolicy {
     /// The app's own caches (cover art, video stills) are allowed.
     nonisolated static func isOffLimits(_ url: URL) -> Bool {
         let path = real(url)
-        if path.hasPrefix(real(KitLocation.caches) + "/") { return false }
+        if path.hasPrefix(real(appCaches) + "/") { return false }
         let privateFolder = real(PrivateStore.folder)
         if path == privateFolder || path.hasPrefix(privateFolder + "/") { return true }
         let home = real(URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true))
         if path.hasPrefix(home + "/Library/") || path.hasPrefix(home + "/.") { return true }
-        for system in ["/etc/", "/private/etc/", "/private/var/", "/System/", "/Library/", "/usr/", "/bin/", "/sbin/", "/cores/"]
+        for system in ["/etc/", "/private/etc/", "/var/", "/private/var/", "/System/", "/Library/", "/usr/", "/bin/", "/sbin/", "/cores/"]
         where path.hasPrefix(system) { return true }
         return false
     }
@@ -39,7 +39,7 @@ enum SharePolicy {
         private var files: Set<String> = []
 
         nonisolated init(libraries: [URL]) {
-            folders = [SharePolicy.real(KitLocation.caches)]
+            folders = [SharePolicy.real(SharePolicy.appCaches)]
             for library in libraries {
                 let root = SharePolicy.real(library)
                 folders.append(root)
@@ -61,6 +61,10 @@ enum SharePolicy {
             return files.contains(path) || folders.contains { path.hasPrefix($0 + "/") }
         }
     }
+
+    /// Offline Kit's own caches (cover art, video stills, phone-sized artwork). Not the whole caches folder: outside a
+    /// sandbox that is ~/Library/Caches, every app's.
+    nonisolated static var appCaches: URL { KitLocation.caches.appending(path: "OfflineKit", directoryHint: .isDirectory) }
 
     /// The full path with links followed and "..", "." removed.
     nonisolated static func real(_ url: URL) -> String {

@@ -23,8 +23,8 @@ final class NowPlaying {
 
     init() {
         // Space plays and pauses, but never while someone is typing (Ask, search, Find my media, Edit Details)
-        // or reading (a book scrolls with Space). ⌘. works anywhere in the window. In the full video player,
-        // ← and → skip 10 seconds and Esc goes back.
+        // or reading (a book scrolls with Space). ⌘. works anywhere in the window. In the full player,
+        // ← and → skip and Esc goes back.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // Local monitors run on the main thread.
             nonisolated(unsafe) let key = event
@@ -39,10 +39,13 @@ final class NowPlaying {
         if modifiers == .command, event.charactersIgnoringModifiers == "." { playback.toggle(); return true }
         guard modifiers.isEmpty, !Self.isTyping(in: window) else { return false }
         let video = fullScreen && playback.item.kind == .video
+        // Audiobooks skip like their Back 15 / Forward 30 buttons; songs and everything else move 10 seconds.
+        let audiobook = fullScreen && playback.item.kind == .audio && !playback.isMusic
+        let audio = fullScreen && playback.item.kind == .audio
         switch event.keyCode {
         case 49: playback.toggle(); return true                 // Space
-        case 123 where video: playback.skip(-10); return true   // ←
-        case 124 where video: playback.skip(10); return true    // →
+        case 123 where video || audio: playback.skip(audiobook ? -15 : -10); return true   // ←
+        case 124 where video || audio: playback.skip(audiobook ? 30 : 10); return true     // →
         case 53 where fullScreen: collapseRequest += 1; return true   // Esc
         default: return false
         }
@@ -152,6 +155,7 @@ struct MiniPlayerBar: View {
                 .help(playback.isPlaying ? "Pause (Space or ⌘.)" : "Play (Space or ⌘.)")
                 #endif
             if !compact {
+                SleepTimerMenu(playback: playback, iconOnly: true).menuStyle(.button).buttonStyle(.plain).fixedSize()
                 Button(music ? "Next song" : "Forward 30 seconds", systemImage: music ? "forward.end.fill" : "goforward.30") { if music { playback.next() } else { playback.skip(30) } }.labelStyle(.iconOnly)
                 Button("Expand", systemImage: "arrow.up.left.and.arrow.down.right", action: expand).labelStyle(.iconOnly)
             }

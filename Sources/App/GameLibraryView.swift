@@ -812,7 +812,7 @@ private struct GameDetailView: View {
                 VStack(alignment: .leading, spacing: 12) { playActions }
             }
             if game.system.hasSaveStates {
-                Text(game.canResume ? "Resume picks up your latest saved place. Longer sessions save automatically." : "Longer sessions save automatically. You can also save your place from the player.")
+                Text(game.canResume ? "Resume picks up \(savedDate.map { "your place, saved \($0.formatted(.relative(presentation: .named)))" } ?? "your latest saved place"). Longer sessions save automatically." : "Longer sessions save automatically. You can also save your place from the player.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             } else {
                 Text("Save and load from the game’s own menu.").font(.callout).foregroundStyle(.secondary)

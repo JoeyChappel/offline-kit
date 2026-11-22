@@ -82,6 +82,7 @@ enum ImportKind: String, CaseIterable, Identifiable, Sendable {
         }
         let ext = url.pathExtension.lowercased()
         if ext == "zim" { return .reference }
+        if ext == "zip", let kind = audioZipKind(url) { return kind }
         if ext == "pdf" { return .document }   // manuals and guides; switch to Book in the sheet for a novel
         if ext == "epub" { return .book }
         if MediaLibrary.videoExtensions.contains(ext) { return .video }
@@ -89,6 +90,31 @@ enum ImportKind: String, CaseIterable, Identifiable, Sendable {
         if MediaLibrary.audioExtensions.contains(ext) { return .audio }
         if GameSystem(file: url) != nil { return .game }
         return .unsupported
+    }
+
+    /// The audio files inside a zip (not the Mac's `__MACOSX` copies), by their path in the zip.
+    nonisolated static func audioEntries(in zip: ZipReader) -> [String] {
+        zip.entries.keys.filter { entry in
+            let file = (entry as NSString).lastPathComponent
+            return !entry.hasPrefix("__MACOSX/") && !file.hasPrefix("._") && !entry.hasSuffix("/")
+                && MediaLibrary.audioExtensions.contains((file as NSString).pathExtension.lowercased())
+        }.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    /// A zip that is mostly songs or chapters (LibriVox's downloads are zips of MP3s) is an audiobook or an album,
+    /// told apart by the same signs a folder uses. Anything else (a game's zip, a zip of documents) isn't one.
+    nonisolated private static func audioZipKind(_ url: URL) -> ImportKind? {
+        guard let zip = ZipReader(url: url) else { return nil }
+        let audio = audioEntries(in: zip)
+        let files = zip.entries.keys.filter { !$0.hasPrefix("__MACOSX/") && !$0.hasSuffix("/") && !($0 as NSString).lastPathComponent.hasPrefix("._") }
+        guard !audio.isEmpty, audio.count * 2 >= files.count else { return nil }
+        let name = url.lastPathComponent.lowercased()
+        if audio.contains(where: { ($0 as NSString).pathExtension.lowercased() == "m4b" }) || name.contains("audiobook") || name.contains("librivox") { return .audiobook }
+        let chapterish = audio.filter {
+            (($0 as NSString).lastPathComponent as NSString).deletingPathExtension.lowercased()
+                .range(of: #"chapter|chap\.|\bch\s?\d|\bpart\s?\d|\bbook\s?\d"#, options: .regularExpression) != nil
+        }
+        return chapterish.count * 2 >= audio.count && audio.count > 1 ? .audiobook : .album
     }
 
     /// What a file becomes when it was added from a section's + button: a PDF picked in Books is a book,
@@ -115,7 +141,20 @@ struct ImportItem: Identifiable, Sendable {
     var duplicateOf: String?
     /// Add it again even though it's already in the kit.
     var addAnyway = false
+    /// Said in the row when it can't be added, if there is more to say than "can't use this kind of file".
+    var why: String?
     var name: String { url.lastPathComponent }
+    /// A zip of songs or chapters: unzipped into its own audiobook or album folder when added.
+    var isZip: Bool { kind != .unsupported && url.pathExtension.lowercased() == "zip" && (kind == .audiobook || kind == .album) }
+    /// The folder a zip is unzipped into: its name without ".zip" and the file-name leftovers ("_64kb_mp3").
+    var zipFolderName: String {
+        var base = (url.lastPathComponent as NSString).deletingPathExtension.replacingOccurrences(of: "_", with: " ")
+        for tail in [" 64kb mp3", " 128kb mp3", " mp3", " librivox", " 64kb", " 128kb"] where base.lowercased().hasSuffix(tail) {
+            base = String(base.dropLast(tail.count))
+        }
+        let trimmed = base.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? (url.lastPathComponent as NSString).deletingPathExtension : trimmed
+    }
     var skipped: Bool { kind.isMedia && duplicateOf != nil && !addAnyway }
 }
 
@@ -134,6 +173,13 @@ final class DropImporter {
     private(set) var current = ""
     private(set) var failures: [String] = []
     private(set) var done = false
+    /// Bytes copied so far, across every file, and the total this run copies. Big movies show real progress.
+    private(set) var copiedBytes: Int64 = 0
+    private(set) var copyTotal: Int64 = 0
+    /// Stop was pressed: what finished stays, the file in progress is removed.
+    private(set) var stopped = false
+    @ObservationIgnored private var meter: TransferMeter?
+    @ObservationIgnored private var completed: [ImportItem] = []
     /// True while the kit is being checked for files it already has.
     private(set) var checking = false
     /// True while the dropped files are being looked at (typed and sized), before the sheet can list them.
@@ -149,7 +195,7 @@ final class DropImporter {
         lookTask?.cancel()
         items = []
         moveOriginals = false
-        copying = false; finished = 0; failures = []; done = false
+        copying = false; finished = 0; failures = []; done = false; stopped = false; copiedBytes = 0; completed = []
         looking = true
         isPresented = true
         lookTask = Task { [weak self] in
@@ -177,7 +223,12 @@ final class DropImporter {
         var list: [ImportItem] = []
         func item(_ url: URL) -> ImportItem {
             let isFolder = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
-            return ImportItem(url: url, kind: ImportKind.classify(url).preferring(section, isFolder: isFolder), size: KitTransfer.size(of: url))
+            let zip = url.pathExtension.lowercased() == "zip"
+            var item = ImportItem(url: url, kind: ImportKind.classify(url).preferring(section, isFolder: isFolder || zip), size: KitTransfer.size(of: url))
+            if zip && item.kind == .unsupported {
+                item.why = "Offline Kit can’t open what’s inside this zip. Unzip it first (double-click it in Finder), then add the folder."
+            }
+            return item
         }
         for url in urls {
             if Task.isCancelled { break }
@@ -200,7 +251,7 @@ final class DropImporter {
 
     func target(_ item: ImportItem) -> URL? {
         guard let library = destination?.folder, item.kind != .unsupported else { return nil }
-        return item.kind.folder(in: library).appending(path: item.name)
+        return item.kind.folder(in: library).appending(path: item.isZip ? item.zipFolderName : item.name, directoryHint: item.isZip ? .isDirectory : .inferFromPath)
     }
 
     func exists(_ item: ImportItem) -> Bool {
@@ -213,7 +264,7 @@ final class DropImporter {
         checkTask?.cancel()
         guard let library = destination?.folder, !items.isEmpty else { return }
         let media = library.appending(path: "Media", directoryHint: .isDirectory)
-        let list = items.filter { $0.kind.isMedia }
+        let list = items.filter { $0.kind.isMedia && !$0.isZip }
         checking = true
         checkTask = Task { [weak self] in
             let found = await Task.detached(priority: .userInitiated) { Self.duplicates(list, in: media) }.value
@@ -265,32 +316,57 @@ final class DropImporter {
         return out
     }
 
+    /// Stops copying: the file in progress is removed, and what already finished stays in the kit.
+    func stop() {
+        stopped = true
+        meter?.cancel()
+    }
+
     /// Copies everything new. A different file with the same name is replaced only when asked; otherwise both are kept.
-    /// Large movies take a while; the sheet shows which file is copying.
+    /// Large movies take a while; the sheet shows which file is copying and how many bytes are across.
     func run(library: Library, media: MediaLibrary, games: GameLibrary) async {
         guard let destination else { return }
         copying = true
+        stopped = false
+        completed = []
         let jobs = toCopy.compactMap { item -> (ImportItem, URL)? in
             guard var target = target(item) else { return nil }
-            if FileManager.default.fileExists(atPath: target.path) && !item.replace { target = Self.freeName(target) }
+            if FileManager.default.fileExists(atPath: target.path) && (!item.replace || item.isZip) { target = Self.freeName(target) }
             return (item, target)
         }
         let move = moveOriginals
+        let meter = TransferMeter()
+        self.meter = meter
+        copiedBytes = 0
+        copyTotal = jobs.reduce(0) { $0 + $1.0.size }
+        let poll = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.copiedBytes = meter.total
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
         for (item, target) in jobs {
+            if meter.stopped { break }
             current = item.name
             let result: String? = await Task.detached(priority: .userInitiated) {
                 let scoped = item.url.startAccessingSecurityScopedResource()
                 defer { if scoped { item.url.stopAccessingSecurityScopedResource() } }
-                return KitTransfer.transfer(item.url, to: target, move: move, replace: true)
+                if item.isZip { return KitTransfer.unzipAudio(item.url, to: target, move: move, meter: meter) }
+                return KitTransfer.transfer(item.url, to: target, move: move, replace: true, meter: meter)
             }.value
-            if let result { failures.append(result) }
+            if meter.stopped && !FileManager.default.fileExists(atPath: target.path) { break }   // a stopped file was cleaned up, not finished
+            if let result { failures.append(result) } else { completed.append(item) }
             finished += 1
         }
+        stopped = meter.stopped
+        poll.cancel()
+        copiedBytes = meter.total
+        self.meter = nil
         current = ""
         // A library folder the app doesn't scan yet becomes part of the kit.
         let newFolder = library.adopt(destination.folder)
         // Rescan only what was added to (everything for a newly added folder), and say "done" once it's on screen.
-        let kinds = newFolder ? Set(ImportKind.allCases) : Set(jobs.map(\.0.kind))
+        let kinds = newFolder ? Set(ImportKind.allCases) : Set(completed.map(\.kind))
         if kinds.contains(.reference) { await library.reload() }
         if kinds.contains(where: \.isMedia) { await media.reload(library: library) }
         if kinds.contains(.game) { await games.reload(library: library) }
@@ -298,6 +374,9 @@ final class DropImporter {
         copying = false
         done = true
     }
+
+    /// How many items were added (all of them, unless Stop was pressed or one failed).
+    var addedCount: Int { completed.count }
 
     /// "Name 2.mp4" (or "Name 2" for a folder) beside a different file that already has the name.
     nonisolated static func freeName(_ target: URL) -> URL {
@@ -313,16 +392,27 @@ final class DropImporter {
     /// Where the things added can be found, for the "done" line: "Watch and Music".
     var shelves: String {
         var names: [String] = []
-        for item in toCopy where !names.contains(item.kind.shelf) && !item.kind.shelf.isEmpty { names.append(item.kind.shelf) }
+        for item in (done ? completed : toCopy) where !names.contains(item.kind.shelf) && !item.kind.shelf.isEmpty { names.append(item.kind.shelf) }
         return ListFormatter.localizedString(byJoining: names)
     }
+}
+
+/// Counts the bytes a transfer has copied (from any thread) and carries Stop to it.
+final class TransferMeter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var bytes: Int64 = 0
+    private var stop = false
+    func add(_ count: Int64) { lock.withLock { bytes += count } }
+    var total: Int64 { lock.withLock { bytes } }
+    var stopped: Bool { lock.withLock { stop } }
+    func cancel() { lock.withLock { stop = true } }
 }
 
 /// Copies or moves one file or folder into the kit. Shared by dropped files and Find my media.
 /// A move on the same disk is a rename. Across disks it's copy, verify (size, then checksum for files), and only
 /// then the original goes to the Trash. Returns a message for the person when something went wrong.
 enum KitTransfer {
-    nonisolated static func transfer(_ source: URL, to target: URL, move: Bool, replace: Bool) -> String? {
+    nonisolated static func transfer(_ source: URL, to target: URL, move: Bool, replace: Bool, meter: TransferMeter? = nil) -> String? {
         let fm = FileManager.default
         let name = source.lastPathComponent
         do {
@@ -340,7 +430,17 @@ enum KitTransfer {
                 let temp = target.deletingLastPathComponent().appending(path: target.lastPathComponent + ".part")
                 try? fm.removeItem(at: temp)
                 do {
-                    try fm.copyItem(at: source, to: temp)
+                    // On the same disk a copy is a clone and instant; across disks it goes in chunks, so progress shows and Stop works.
+                    #if DEBUG
+                    // Test hook: -dropForceChunked YES copies in pieces even on one disk, to watch progress and Stop.
+                    let chunked = !sameDisk || UserDefaults.standard.bool(forKey: "dropForceChunked")
+                    #else
+                    let chunked = !sameDisk
+                    #endif
+                    if let meter, chunked { try copyTree(source, to: temp, meter: meter) } else {
+                        try fm.copyItem(at: source, to: temp)
+                        meter?.add(size(of: temp))
+                    }
                     if move {
                         guard verify(temp, matches: source) else {
                             try? fm.removeItem(at: temp)
@@ -356,8 +456,77 @@ enum KitTransfer {
                 if move { try fm.trashItem(at: source, resultingItemURL: nil) }
             }
             return nil
+        } catch is CancellationError {
+            return nil   // Stop was pressed; the partial copy is already removed
         } catch {
             return "\(name): \(explain(error))"
+        }
+    }
+
+    /// Copies a file or a folder of files in 4 MB pieces, counting bytes in `meter` and giving up when it says stop.
+    nonisolated static func copyTree(_ source: URL, to target: URL, meter: TransferMeter) throws {
+        let fm = FileManager.default
+        if (try? source.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+            try fm.createDirectory(at: target, withIntermediateDirectories: true)
+            for child in try fm.contentsOfDirectory(at: source, includingPropertiesForKeys: nil) {
+                try copyTree(child, to: target.appending(path: child.lastPathComponent), meter: meter)
+            }
+            return
+        }
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+        guard fm.createFile(atPath: target.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
+        let output = try FileHandle(forWritingTo: target)
+        defer { try? output.close() }
+        while true {
+            if meter.stopped { throw CancellationError() }
+            let chunk = try autoreleasepool { try input.read(upToCount: 4 << 20) }
+            guard let chunk, !chunk.isEmpty else { break }
+            try output.write(contentsOf: chunk)
+            meter.add(Int64(chunk.count))
+        }
+        if let date = (try? source.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate {
+            try? fm.setAttributes([.modificationDate: date], ofItemAtPath: target.path)
+        }
+    }
+
+    /// Unzips the songs or chapters of a zip (LibriVox's downloads) into `folder`, which becomes an audiobook or an album.
+    /// Built next to its final place and renamed when whole, so Stop or a full drive leaves nothing half-made.
+    /// Pictures and other files in the zip are left behind.
+    nonisolated static func unzipAudio(_ source: URL, to folder: URL, move: Bool, meter: TransferMeter) -> String? {
+        let fm = FileManager.default
+        let name = source.lastPathComponent
+        guard let zip = ZipReader(url: source) else { return "\(name): this zip can’t be read. It may be damaged or still downloading." }
+        let entries = ImportKind.audioEntries(in: zip)
+        guard !entries.isEmpty else { return "\(name): there are no songs or chapters inside." }
+        let temp = folder.deletingLastPathComponent().appending(path: "." + folder.lastPathComponent + ".part", directoryHint: .isDirectory)
+        do {
+            try? fm.removeItem(at: temp)
+            try fm.createDirectory(at: temp, withIntermediateDirectories: true)
+            var used = Set<String>()
+            for entry in entries {
+                if meter.stopped { throw CancellationError() }
+                var file = (entry as NSString).lastPathComponent
+                if file.hasPrefix(".") { file = "track " + file }
+                // Folders inside the zip are flattened; two files with one name keep both.
+                var n = 2
+                while !used.insert(file.lowercased()).inserted {
+                    file = ((entry as NSString).lastPathComponent as NSString).deletingPathExtension + " \(n)." + (entry as NSString).pathExtension
+                    n += 1
+                }
+                guard let data = zip.data(entry) else { throw CocoaError(.fileReadCorruptFile) }
+                try data.write(to: temp.appending(path: file))
+                meter.add(Int64(zip.entries[entry]?.compressedSize ?? data.count))
+            }
+            try fm.moveItem(at: temp, to: folder)
+            if move { try fm.trashItem(at: source, resultingItemURL: nil) }
+            return nil
+        } catch is CancellationError {
+            try? fm.removeItem(at: temp)
+            return nil
+        } catch {
+            try? fm.removeItem(at: temp)
+            return "\(name): \(error is CocoaError && (error as NSError).code == NSFileReadCorruptFileError ? "a file inside this zip is damaged." : explain(error))"
         }
     }
 
@@ -410,11 +579,14 @@ enum KitTransfer {
 
 extension View {
     /// Accepts files dropped anywhere on the window and asks where they should go.
-    func acceptsKitDrops(_ importer: DropImporter) -> some View { modifier(KitDropModifier(importer: importer)) }
+    /// `section` is what to treat dropped files as when a section is open (a novel dropped on Books is a book, not a
+    /// document); nil leaves each file to be recognized by itself.
+    func acceptsKitDrops(_ importer: DropImporter, section: ImportKind? = nil) -> some View { modifier(KitDropModifier(importer: importer, section: section)) }
 }
 
 private struct KitDropModifier: ViewModifier {
     let importer: DropImporter
+    let section: ImportKind?
     @State private var targeted = false
 
     func body(content: Content) -> some View {
@@ -427,7 +599,7 @@ private struct KitDropModifier: ViewModifier {
                     for provider in providers {
                         if let url = try? await provider.loadFileURL() { urls.append(url) }
                     }
-                    importer.receive(urls)
+                    importer.receive(urls, section: section)
                 }
                 return true
             }
@@ -494,6 +666,17 @@ private struct DropImportSheet: View {
         .padding(24)
         .frame(minWidth: 640, idealWidth: 700)
         .interactiveDismissDisabled(importer.copying)
+        #if DEBUG
+        // Test hook: -dropAutoAdd YES presses Add once the sheet is ready; -dropAutoStop S then presses Stop after S seconds.
+        .task {
+            guard UserDefaults.standard.bool(forKey: "dropAutoAdd") else { return }
+            try? await Task.sleep(for: .seconds(3))
+            if let stop = Double(UserDefaults.standard.string(forKey: "dropAutoStop") ?? "") {
+                Task { try? await Task.sleep(for: .seconds(stop)); importer.stop() }
+            }
+            await importer.run(library: library, media: media, games: games)
+        }
+        #endif
         .onChange(of: importer.destination) {
             // Replacement consent belongs to the destination shown in this review.
             guard !importer.copying, !importer.done else { return }
@@ -579,9 +762,9 @@ private struct DropImportSheet: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(value.name).font(.body.weight(.medium)).lineLimit(1).truncationMode(.middle)
                 if value.kind == .unsupported {
-                    Text("Offline Kit can’t use this kind of file.").font(.caption).foregroundStyle(.secondary)
+                    Text(value.why ?? "Offline Kit can’t use this kind of file.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 } else {
-                    Text("Goes to \(value.kind.shelf) · \(ByteCountFormatter.string(fromByteCount: value.size, countStyle: .file))")
+                    Text("Goes to \(value.kind.shelf) · \(ByteCountFormatter.string(fromByteCount: value.size, countStyle: .file))" + (value.isZip ? " · unzipped into its own folder" : ""))
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let copy = value.duplicateOf, value.kind.isMedia, !importer.done {
@@ -590,7 +773,7 @@ private struct DropImportSheet: View {
                     Toggle(isOn: item.addAnyway) { Text("Add another copy anyway").font(.caption) }
                         .toggleStyle(.checkbox).disabled(importer.copying)
                 }
-                if exists && value.kind != .unsupported && !value.skipped && !importer.done {
+                if exists && value.kind != .unsupported && !value.skipped && !value.isZip && !importer.done {
                     Toggle(isOn: item.replace) {
                         Text("Replace the file with this name at the destination (otherwise both are kept)").font(.caption)
                     }
@@ -621,12 +804,26 @@ private struct DropImportSheet: View {
         let tooBigForFAT = importer.destination?.isFAT32 == true && importer.toCopy.contains { $0.size >= 4_294_967_295 }
         VStack(alignment: .leading, spacing: 10) {
             if importer.copying {
-                ProgressView(value: Double(importer.finished), total: Double(max(importer.toCopy.count, 1))) {
-                    Text(importer.current.isEmpty ? "Updating your kit…" : "Copying \(importer.current)…").lineLimit(1).truncationMode(.middle)
+                // Real bytes, so one big movie moves instead of sitting at 0 of 1.
+                let total = max(importer.copyTotal, 1)
+                if importer.current.isEmpty {
+                    ProgressView { Text(importer.stopped ? "Stopping…" : "Updating your kit…") }
+                } else {
+                    ProgressView(value: Double(min(importer.copiedBytes, total)), total: Double(total)) {
+                        Text("\(importer.stopped ? "Stopping" : "Copying") \(importer.current)…").lineLimit(1).truncationMode(.middle)
+                    } currentValueLabel: {
+                        Text("\(ByteCountFormatter.string(fromByteCount: min(importer.copiedBytes, total), countStyle: .file)) of \(ByteCountFormatter.string(fromByteCount: total, countStyle: .file))"
+                             + (importer.toCopy.count > 1 ? " · file \(min(importer.finished + 1, importer.toCopy.count)) of \(importer.toCopy.count)" : ""))
+                            .monospacedDigit()
+                    }
                 }
-                Text("Big movies can take a few minutes. Keep the drive plugged in.").font(.caption).foregroundStyle(.secondary)
+                Text("Big movies can take a few minutes. Keep the drive plugged in, or press Stop: what already finished stays.").font(.caption).foregroundStyle(.secondary)
             } else if importer.done {
-                if importer.failures.isEmpty {
+                if importer.stopped {
+                    Label(importer.addedCount == 0 ? "Stopped. Nothing was added, and nothing half-copied was kept."
+                          : "Stopped. \(importer.addedCount) of \(importer.toCopy.count) \(importer.toCopy.count == 1 ? "item was" : "items were") \(importer.moveOriginals ? "moved" : "added") (find them in \(importer.shelves)). The one that was copying wasn’t kept.",
+                          systemImage: "stop.circle.fill").foregroundStyle(Color.accentColor)
+                } else if importer.failures.isEmpty {
                     Label(importer.toCopy.isEmpty ? "Nothing new to add: it’s all in your kit already."
                           : "Everything was \(importer.moveOriginals ? "moved" : "added"). Find it in \(importer.shelves).", systemImage: "checkmark.circle.fill")
                         .foregroundStyle(Color.accentColor)
@@ -651,7 +848,12 @@ private struct DropImportSheet: View {
                 if importer.done {
                     Button("Done") { dismiss() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
                 } else {
-                    Button("Cancel", role: .cancel) { dismiss() }.disabled(importer.copying)
+                    if importer.copying {
+                        Button("Stop", role: .cancel) { importer.stop() }.disabled(importer.stopped)
+                            .accessibilityHint("Stops copying. Files that already finished stay in your kit.")
+                    } else {
+                        Button("Cancel", role: .cancel) { dismiss() }
+                    }
                     Button("\(importer.moveOriginals ? "Move" : "Add") \(importer.toCopy.count) \(importer.toCopy.count == 1 ? "item" : "items")") {
                         // A one-off choice here never changes where the kit lives; only Get Resources and setup do.
                         Task { await importer.run(library: library, media: media, games: games) }

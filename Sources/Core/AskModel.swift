@@ -38,6 +38,10 @@ struct Turn: Identifiable, Equatable {
     var searchedFor: String?
     /// True while the built-in answer model is still loading into memory, before the first words arrive.
     var waking = false
+    /// The model ran out of room and stopped mid-answer.
+    var cutShort = false
+    /// The topic the question was scoped to, so Try Again asks it the same way.
+    var scope: SubjectTopic?
 }
 
 @MainActor @Observable
@@ -136,6 +140,9 @@ final class AskModel {
     - For "what if" and hypothetical questions: state your assumptions, reason step by step from established \
     facts, and keep the scenario exactly as the person set it up across follow-ups. When they change or correct \
     it, restate the new scenario in one line before answering. Don't simplify their setup into an easier one.
+    - If the question is about a gas, water or electrical problem (a gas smell, a burst pipe, a sparking outlet) \
+    and you're told where that shut-off is, say where it is in the first steps. If you aren't told, say to look for \
+    it and suggest writing it in Prepare afterward.
     - Mention a part of Offline Kit only when it directly helps (for example Emergency info for phone numbers and \
     radio frequencies, or Prepare for their checklist). Don't end answers with "find more in your library" lines.
     - Only for medical, electrical, gas, chemical or structural safety topics, end with one line telling them to \
@@ -250,9 +257,30 @@ final class AskModel {
         }
     }
 
+    /// The conversation New Conversation just cleared, kept briefly so Undo can bring it back.
+    private(set) var clearedTurns: [Turn]?
+    private(set) var clearedAt = Date.distantPast
+
     func clear() {
         stop()
+        if !turns.isEmpty { clearedTurns = turns; clearedAt = Date() }
         turns.removeAll()
+    }
+
+    /// Undo for New Conversation. Does nothing if a new question has been asked since.
+    func restoreCleared() {
+        guard let saved = clearedTurns, turns.isEmpty else { clearedTurns = nil; return }
+        turns = saved
+        clearedTurns = nil
+    }
+
+    func dismissUndo() { clearedTurns = nil }
+
+    /// Asks the last question again after it failed or was stopped, replacing that turn.
+    func retryLast(library: Library, household: Household?) {
+        guard !isBusy, let last = turns.last, last.status == .failed || last.status == .stopped else { return }
+        turns.removeLast()
+        if !ask(last.question, library: library, scope: last.scope, household: household) { turns.append(last) }
     }
 
     /// The Emergency button: show the alert and switch to short, steps-first answers.
@@ -276,6 +304,7 @@ final class AskModel {
     func ask(_ rawQuestion: String, library: Library, scope: SubjectTopic? = nil, household: Household? = nil) -> Bool {
         let question = rawQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !question.isEmpty, task == nil else { return false }
+        clearedTurns = nil
         // A new question outranks noting facts from the last one.
         learnTask?.cancel()
         learnTask = nil
@@ -289,6 +318,7 @@ final class AskModel {
         let shortHistory = conversationSoFar(turns: 2, perAnswer: 400)
         let longHistory = conversationSoFar(turns: 6, perAnswer: 1_500)
         var turn = Turn(question: question)
+        turn.scope = scope
         turn.isEmergency = emergency
         turns.append(turn)
         let index = turns.count - 1
@@ -422,7 +452,8 @@ final class AskModel {
                 var unshown: String?
                 do {
                     let prompt = Self.prompt(question: question, sources: current, context: context, history: history)
-                    for try await text in engine.stream(instructions: instructions, prompt: prompt) {
+                    let notes = StreamNotes()
+                    for try await text in engine.stream(instructions: instructions, prompt: prompt, notes: notes) {
                         if Task.isCancelled { break }
                         if turns[index].waking { turns[index].waking = false }
                         let now = Date()
@@ -436,6 +467,13 @@ final class AskModel {
                     }
                     guard !Task.isCancelled else { return }
                     if let unshown { turns[index].answer = unshown }
+                    // The model finished but wrote nothing (or only a hidden "thinking" part): say so, with Try Again.
+                    if turns[index].answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        turns[index].answer = ""
+                        fail(index, Self.emptyMessage)
+                        return
+                    }
+                    turns[index].cutShort = notes.cutShort
                     turns[index].status = .done
                     turns[index].finished = Date()
                     household?.log(question: question, answer: turns[index].answer, sources: current.map(\.ref.title))
@@ -482,6 +520,8 @@ final class AskModel {
 
     /// Seconds between redraws of a streaming answer.
     private static let answerRefresh: TimeInterval = 0.1
+
+    private static let emptyMessage = "Ask didn’t come up with an answer this time. Try again, or ask it in different words."
 
     private static let tooLongMessage = "That conversation got too long for the answer model. Start a new conversation and ask again."
 
@@ -543,7 +583,7 @@ final class AskModel {
     /// Short questions that lean on the one before ("would we notice it first?").
     static func isFollowUp(_ question: String) -> Bool {
         question.split(separator: " ").count <= 12
-            && (matches(#"\b(it|that|they|them|those|these|instead|else)\b"#, question)
+            && (matches(#"\b(it|that|they|them|those|these|instead|else|continue)\b"#, question)
                 || matches(#"^(and|but|so|or|what about|how about)\b"#, question))
     }
 

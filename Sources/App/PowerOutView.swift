@@ -334,19 +334,10 @@ struct PowerOutSection: View {
         SectionCard(symbol: section.symbol, title: section.title, subtitle: section.intro) {
             ForEach(section.points, id: \.self) { item in
                 let on = power.done.contains(item)
-                Button {
-                    if on { power.done.remove(item) } else { power.done.insert(item) }
-                } label: {
-                    HStack(alignment: .firstTextBaseline, spacing: 10) {
-                        Image(systemName: on ? "checkmark.square.fill" : "square")
-                            .foregroundStyle(on ? Color.accentColor : .secondary).imageScale(.large)
-                        Text(item).foregroundStyle(on ? .secondary : .primary).multilineTextAlignment(.leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 0)
-                    }
-                    .contentShape(Rectangle())
+                Toggle(isOn: Binding(get: { on }, set: { if $0 { power.done.insert(item) } else { power.done.remove(item) } })) {
+                    Text(item).foregroundStyle(on ? .secondary : .primary).fixedSize(horizontal: false, vertical: true)
                 }
-                .buttonStyle(.plain)
+                .toggleStyle(SquareCheckStyle(alignment: .firstTextBaseline))
                 .padding(.vertical, 2)
             }
             SourceList(sources: section.sources)

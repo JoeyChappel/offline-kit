@@ -70,7 +70,7 @@ final class WebServer: @unchecked Sendable {
         var onFinish: (@Sendable () -> Void)?
         private var unreported: Int64 = 0
         private var extraHeaderLines: String {
-            extraHeaders.map { "\($0.0): \($0.1.filter { $0 != "\r" && $0 != "\n" })\r\n" }.joined()
+            extraHeaders.map { "\($0.0): \(WebServer.headerSafe($0.1))\r\n" }.joined()
         }
         deinit {
             // Answered nothing (or stopped part-way without finishing): the connection can't carry another request.
@@ -81,7 +81,7 @@ final class WebServer: @unchecked Sendable {
         /// ETag then becomes weak, since the bytes differ from the uncompressed copy's.
         func send(status: Int, contentType: String, body: Data, headers: [String: String] = [:]) async {
             // A type can come from inside an archive: a line break in it must not start a header of its own.
-            let contentType = contentType.filter { $0 != "\r" && $0 != "\n" }
+            let contentType = WebServer.headerSafe(contentType)
             var body = body, headers = headers
             if Gzip.isCompressible(contentType), headers["Content-Range"] == nil, headers["Content-Encoding"] == nil {
                 headers["Vary"] = "Accept-Encoding"
@@ -97,7 +97,7 @@ final class WebServer: @unchecked Sendable {
             if status != 304 { head += "Content-Length: \(body.count)\r\n" }
             head += connectionHeaders() + "X-Content-Type-Options: nosniff\r\n"
             if headers["Cache-Control"] == nil { head += "Cache-Control: no-store\r\n" }
-            for (k, v) in headers { head += "\(k): \(v.filter { $0 != "\r" && $0 != "\n" })\r\n" }
+            for (k, v) in headers { head += "\(k): \(WebServer.headerSafe(v))\r\n" }
             head += extraHeaderLines + "\r\n"
             let sent = await write(Data(head.utf8) + body)
             finish(complete: sent)
@@ -224,7 +224,11 @@ final class WebServer: @unchecked Sendable {
             let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n"
             finished = true   // the connection now belongs to the WebSocket
             keepAlive = false
-            guard await write(Data(head.utf8)) else { connection.cancel(); return nil }
+            let sent = await write(Data(head.utf8))
+            // The HTTP response is over either way: report it (Connected Devices counts open requests by it).
+            if unreported > 0 { onBytes?(unreported); unreported = 0 }
+            onFinish?()
+            guard sent else { connection.cancel(); return nil }
             return WebSocket(connection)
         }
 
@@ -461,7 +465,7 @@ final class WebServer: @unchecked Sendable {
             let rest = buffer.count > used ? Data(buffer.suffix(from: buffer.startIndex + used)) : Data()
             let keep = request.keepAlive && served + 1 < Self.maxRequests
             let gzip = (request.headers["accept-encoding"] ?? "").lowercased().split(separator: ",")
-                .contains { $0.split(separator: ";").first?.trimmingCharacters(in: .whitespaces) == "gzip" && !$0.replacingOccurrences(of: " ", with: "").contains("q=0") }
+                .contains { Self.acceptsGzip(String($0)) }
             let responder = Responder(connection, keepAlive: keep, remaining: Self.maxRequests - served - 1, acceptsGzip: gzip)
             if keep {
                 responder.onReuse = { [weak self] in
@@ -527,6 +531,22 @@ final class WebServer: @unchecked Sendable {
                               rawQuery: pieces.count > 1 ? pieces[1] : nil,
                               query: query, headers: headers, body: Data(body), remoteHost: remote, keepAlive: keepAlive)
         return (request, used)
+    }
+
+    /// A header value with no line breaks. Filtered by Unicode scalar: Swift treats "\r\n" as one Character,
+    /// so a Character filter for "\r" and "\n" would let the pair through and allow a header of its own.
+    nonisolated static func headerSafe(_ value: String) -> String {
+        String(String.UnicodeScalarView(value.unicodeScalars.filter { $0 != "\r" && $0 != "\n" }))
+    }
+
+    /// One Accept-Encoding entry: gzip, unless it carries q=0 ("gzip;q=0.5" still accepts it).
+    nonisolated static func acceptsGzip(_ entry: String) -> Bool {
+        let parts = entry.split(separator: ";").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+        guard parts.first == "gzip" else { return false }
+        for part in parts.dropFirst() where part.hasPrefix("q=") {
+            return (Double(part.dropFirst(2)) ?? 1) > 0
+        }
+        return true
     }
 
     static func isLocal(_ host: String) -> Bool {

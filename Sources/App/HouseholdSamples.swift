@@ -75,6 +75,10 @@ enum HouseholdSamples {
             item("First aid kit", .firstAid, 1, "", "Hall closet", nil),
         ]
         extra.barcodeNames = ["0123456789012": "Canned black beans"]
+        // -seedNoSupplies YES: an empty Supplies list. -tickChecklist water,food: those checklist items are ticked.
+        if UserDefaults.standard.bool(forKey: "seedNoSupplies") { extra.supplies = [] }
+        let ticked = (UserDefaults.standard.string(forKey: "tickChecklist") ?? "").split(separator: ",").map(String.init)
+        for index in data.checklist.indices where ticked.contains(data.checklist[index].id) { data.checklist[index].have = true }
         data.records = extra
         household.data = data
     }

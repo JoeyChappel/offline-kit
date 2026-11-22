@@ -124,6 +124,8 @@ final class VoiceListener {
 
     /// Stops without handing anything over.
     func cancel() {
+        // Idle: nothing to stop, and resetting the audio session below costs about 60 ms on the main thread.
+        guard state != .idle || mic != nil || recognizer != nil else { return }
         session += 1
         mic?.stop()
         mic = nil

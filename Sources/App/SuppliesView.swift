@@ -37,6 +37,7 @@ struct SuppliesSection: View {
     @State private var editing: SupplyItem?
     @State private var alertNote: String?
     @State private var wide = false
+    @FocusState private var searchFocused: Bool
 
     var body: some View {
         @Bindable var household = household
@@ -73,6 +74,18 @@ struct SuppliesSection: View {
                     Label("No supplies yet", systemImage: "shippingbox")
                 } description: {
                     Text("Add water, food, medicine and batteries with their expiry dates, and Offline Kit can remind you before they go bad.")
+                } actions: {
+                    // What the family ticked in the checklist can start the list; they fill in amounts and dates after.
+                    let starters = Preparedness.supplyStarters(from: household.data.checklist)
+                    if !starters.isEmpty {
+                        Button("Start from my checklist (\(starters.count))", systemImage: "checklist") {
+                            household.data.extra.supplies.append(contentsOf: starters)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .help("Adds what you ticked in the Checklist. Then set each amount, place and expiry date.")
+                    } else {
+                        Button("Open Checklist", systemImage: "arrow.right") { navigation.prepare(.checklist) }
+                    }
                 }
                 .frame(maxWidth: .infinity).card(padding: 18)
             } else if items.isEmpty {
@@ -104,6 +117,7 @@ struct SuppliesSection: View {
             }
         }
         .onGeometryChange(for: Bool.self) { $0.size.width >= 760 } action: { wide = $0 }
+        .findShortcut($searchFocused)
         .sheet(item: $editing) { item in
             SupplyEditor(item: item, isNew: !all.contains { $0.id == item.id })
                 .environment(household)
@@ -137,7 +151,7 @@ struct SuppliesSection: View {
     private var searchField: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField("Search supplies", text: $search).textFieldStyle(.plain)
+            TextField("Search supplies", text: $search).textFieldStyle(.plain).focused($searchFocused)
             if !search.isEmpty {
                 Button { search = "" } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("Clear supply search")
@@ -300,7 +314,7 @@ private struct ExpiryBadge: View {
 
 // MARK: - Editor
 
-private struct SupplyEditor: View {
+struct SupplyEditor: View {
     @Environment(Household.self) private var household
     @Environment(\.dismiss) private var dismiss
     @State var item: SupplyItem

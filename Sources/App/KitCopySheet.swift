@@ -66,6 +66,16 @@ struct KitCopySheet: View {
                     if UserDefaults.standard.bool(forKey: "kitCopyGo") {
                         if copier.plan?.toCopy.isEmpty == false {
                             copier.start(replace: false)
+                            // -kitCopyStopTest YES: stop shortly after starting (the report shows Continue);
+                            // -kitCopyContinue YES then presses Continue 3 seconds later.
+                            if UserDefaults.standard.bool(forKey: "kitCopyStopTest") {
+                                while copier.phase != .copying || copier.bytesDone < 100_000_000 { try? await Task.sleep(for: .milliseconds(50)) }
+                                copier.stop()
+                                if UserDefaults.standard.bool(forKey: "kitCopyContinue") {
+                                    try? await Task.sleep(for: .seconds(6))
+                                    await continueCopy()
+                                }
+                            }
                             // -kitCopyPauseTest YES: pause shortly after starting, then resume 6 seconds later.
                             if UserDefaults.standard.bool(forKey: "kitCopyPauseTest") {
                                 try? await Task.sleep(for: .milliseconds(150))
@@ -351,7 +361,20 @@ struct KitCopySheet: View {
                     .help("Reads every file on both sides again and compares them. Takes about as long as the copy.")
                 Spacer()
                 showButton
-                Button("Done") { copier.reset(); dismiss() }.buttonStyle(.borderedProminent)
+                if copier.phase == .stopped {
+                    // Stopped partway: pick up where it left off. Files already copied are skipped.
+                    Button("Start Over") { copier.reset() }
+                        .help("Go back to choosing a drive")
+                    Button("Continue", systemImage: "play.fill") { Task { await continueCopy() } }
+                        .buttonStyle(.borderedProminent)
+                        .help("Copy what’s left. Files that already made it are not copied again.")
+                } else {
+                    Button("Done") { copier.reset(); dismiss() }.buttonStyle(.borderedProminent)
+                }
+            }
+            if copier.phase == .stopped {
+                Text("Continue looks at the destination again and copies only what’s missing, then checks it.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -417,8 +440,20 @@ struct KitCopySheet: View {
         return nil
     }
 
+    /// After a stopped copy: plan again (what's already there is skipped) and carry on straight away. When the plan
+    /// needs a decision (files to replace, too little space), it stays on the Review screen instead.
+    private func continueCopy() async {
+        await prepare()
+        guard let plan = copier.plan, copier.phase == .ready, !plan.toCopy.isEmpty, plan.replacing.isEmpty,
+              plan.tooBigForFAT32.isEmpty else { return }
+        let needed = plan.toCopy.reduce(0) { $0 + $1.size }
+        guard plan.freeAtDestination > needed + (256 << 20) else { return }
+        copier.start(replace: false)
+    }
+
     private func prepare() async {
-        guard let destination else { return }
+        // After closing and reopening the sheet the choice is gone, but the copier still knows where it was copying.
+        guard let destination = destination ?? copier.destinationKit else { return }
         replaceConfirmed = false
         let chosen = library.folders.filter(sources.contains)
         var app = Bundle.main.bundleURL

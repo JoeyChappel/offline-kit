@@ -3,6 +3,10 @@ import SwiftUI
 struct ShareView: View {
     @Environment(ShareController.self) private var share
     @State private var mode = SharingMode.browser
+    /// What's typed in the PIN box. It becomes the PIN when Return is pressed or the box is left, not on each key:
+    /// changing the PIN signs everyone out.
+    @State private var pinDraft = ""
+    @FocusState private var pinFocused: Bool
 
     private enum SharingMode: String, CaseIterable, Identifiable {
         case browser = "Use in a browser", phone = "Send to iPhone"
@@ -141,16 +145,34 @@ struct ShareView: View {
         }
     }
 
+    private func applyPIN() {
+        let digits = String(pinDraft.filter(\.isNumber).prefix(8))
+        guard digits != share.pin else { return }
+        share.pin = digits
+    }
+
     private var accessCard: some View {
-        @Bindable var share = share
-        return VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 14) {
             Label("Access", systemImage: "lock").font(.title2.bold())
-            TextField("Optional PIN, e.g. 1234", text: $share.pin)
-                .textFieldStyle(.roundedBorder)
-                .onChange(of: share.pin) {
-                    let digits = String(share.pin.filter(\.isNumber).prefix(8))
-                    if digits != share.pin { share.pin = digits }
+            HStack(spacing: 8) {
+                TextField("Optional PIN, e.g. 1234", text: $pinDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .focused($pinFocused)
+                    .onChange(of: pinDraft) {
+                        let digits = String(pinDraft.filter(\.isNumber).prefix(8))
+                        if digits != pinDraft { pinDraft = digits }
+                    }
+                    .onSubmit(applyPIN)
+                    .onChange(of: pinFocused) { if !pinFocused { applyPIN() } }
+                if pinDraft != share.pin {
+                    Button(pinDraft.isEmpty ? "Remove PIN" : "Set PIN", action: applyPIN)
                 }
+            }
+            .onAppear { pinDraft = share.pin }
+            if pinDraft != share.pin {
+                Text(share.pin.isEmpty ? "Press Return to set this PIN." : "Press Return to change the PIN. Everyone who is signed in will need to enter the new one.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             Text("Set a PIN to keep guests or neighbors on your Wi-Fi out. People enter it once per browser.")
                 .font(.callout).foregroundStyle(.secondary)
             Divider()

@@ -23,7 +23,7 @@ struct OfflineKitMacApp: App {
             MainActor.assumeIsolated { Household.shared?.flushPendingSave() }
             // Settings in drive mode are written after a short pause; write any still waiting.
             KitSettings.shared.flush()
-            LlamaRuntime.shared.shutdown()
+            if LlamaRuntime.exists { LlamaRuntime.shared.shutdown() }
         }
     }
 
@@ -86,6 +86,28 @@ struct OfflineKitMacApp: App {
                 if ms > 100 { NSLog("HANG %.0f ms", ms) }
                 Thread.sleep(forTimeInterval: 0.05)
             }
+        }
+    }
+
+    /// Test hook: -dumpMenu <file> writes the menu bar (titles, shortcuts, enabled) a few seconds after launch.
+    @MainActor private static func menuDumpForTesting() {
+        guard let path = UserDefaults.standard.string(forKey: "dumpMenu") else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(5))
+            NSApp.activate()   // menu items follow the key window, so the app has to be frontmost
+            NSApp.windows.first(where: { $0.isVisible && $0.frame.width > 500 })?.makeKeyAndOrderFront(nil)
+            try? await Task.sleep(for: .seconds(2))
+            func walk(_ menu: NSMenu, _ depth: Int) -> String {
+                menu.items.map { item in
+                    let mods = item.keyEquivalentModifierMask
+                    let key = item.keyEquivalent.isEmpty ? "" : " [" + (mods.contains(.control) ? "^" : "") + (mods.contains(.option) ? "~" : "")
+                        + (mods.contains(.shift) ? "$" : "") + (mods.contains(.command) ? "@" : "") + (item.keyEquivalent == "\u{1b}" ? "esc" : item.keyEquivalent) + "]"
+                    let line = String(repeating: "  ", count: depth) + (item.isSeparatorItem ? "-" : item.title) + key + (item.isEnabled ? "" : " (disabled)")
+                    return line + "\n" + (item.submenu.map { walk($0, depth + 1) } ?? "")
+                }.joined()
+            }
+            let state = "active=\(NSApp.isActive) key=\(NSApp.keyWindow?.title ?? "none") main=\(NSApp.mainWindow?.title ?? "none")\n"
+            try? (state + walk(NSApp.mainMenu ?? NSMenu(), 0)).write(toFile: path, atomically: true, encoding: .utf8)
         }
     }
 
@@ -156,8 +178,9 @@ struct OfflineKitMacApp: App {
                     AppUpdater.shared.startAutomaticChecks()
                     #if DEBUG
                     Self.hangWatchForTesting()
+                    Self.menuDumpForTesting()
                     Self.snapshotsForTesting()
-                    if UserDefaults.standard.bool(forKey: "sampleDownloads") {
+                    if UserDefaults.standard.string(forKey: "sampleDownloads") != nil {
                         downloads.insertSamples(folder: KitLocation.home.appending(path: "OfflineKit/Library"))
                     }
                     #endif
@@ -190,8 +213,9 @@ struct OfflineKitMacApp: App {
         .environment(nowPlaying)
         .environment(starterFilms)
         .commands {
-            // One main window: File › New Window would only make a second copy of the same library.
-            CommandGroup(replacing: .newItem) {}
+            // One main window: File › New Window would only make a second copy of the same library, so File › New
+            // is New Conversation instead (KitCommands).
+            KitCommands()
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") { Task { await AppUpdater.shared.check(userInitiated: true) } }
             }

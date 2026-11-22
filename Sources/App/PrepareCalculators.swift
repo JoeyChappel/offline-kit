@@ -408,11 +408,8 @@ private struct GeneratorCalculator: View {
                     ForEach($store.items) { $item in
                         GridRow {
                             HStack(spacing: 8) {
-                                Button { item.on.toggle() } label: {
-                                    Image(systemName: item.on ? "checkmark.square.fill" : "square")
-                                        .foregroundStyle(item.on ? Color.accentColor : .secondary).imageScale(.large)
-                                }
-                                .buttonStyle(.plain)
+                                Toggle(isOn: $item.on) { Text(item.name) }
+                                    .toggleStyle(SquareCheckStyle(showsLabel: false))
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(item.name).lineLimit(2)
                                     if item.on {

@@ -12,8 +12,8 @@ settings:
     SWIFT_VERSION: "5.0"
     CLANG_CXX_LANGUAGE_STANDARD: gnu++20
     SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge/Bridging.h
-    MARKETING_VERSION: "0.2.9"
-    CURRENT_PROJECT_VERSION: "11"
+    MARKETING_VERSION: "0.3.0"
+    CURRENT_PROJECT_VERSION: "12"
     GENERATE_INFOPLIST_FILE: YES
     INFOPLIST_KEY_CFBundleDisplayName: Offline Kit
     OTHER_LDFLAGS: ["-lc++"]
@@ -241,3 +241,40 @@ targets:
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
         GENERATE_INFOPLIST_FILE: NO
+
+  # Unit tests (Swift Testing). Not hosted: the bundle compiles the app's own sources (everything but the macOS
+  # @main file) so tests reach internal types without launching the app, its windows, sharing or update checks.
+  # Run with Tools/Tests/run-tests.sh. Tests use temp folders only; OFFLINEKIT_HOME keeps settings, caches and test
+  # keys out of the real home and the Keychain.
+  OfflineKitTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Sources/Bridge
+      - Sources/Core
+      - Sources/App
+      - path: Sources/Mac
+        excludes: ["OfflineKitMacApp.swift", "Info.plist", "OfflineKit.entitlements"]
+      - Tools/okit/LegacyHTMLText.swift
+      - Tests/OfflineKitTests
+      - path: Tests/Fixtures
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - sdk: Accelerate.framework
+      - sdk: libsqlite3.tbd
+      - framework: Vendor/CoreKiwix.xcframework
+        embed: false
+      - framework: Vendor/llama.xcframework
+        embed: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.joeychappel.offlinekit.tests
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Vendor/llama.xcframework/macos-arm64"]
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+    scheme:
+      testTargets: [OfflineKitTests]
+      environmentVariables:
+        # Stand-in home for settings, caches and test keys. Tools/Tests/run-tests.sh points it at a fresh folder.
+        OFFLINEKIT_HOME: /tmp/OfflineKitTests-home

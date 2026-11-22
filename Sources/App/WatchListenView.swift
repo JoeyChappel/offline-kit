@@ -2,6 +2,13 @@ import SwiftUI
 import AVKit
 import UniformTypeIdentifiers
 
+/// What Start Over replaced.
+private struct StartOverUndo: Identifiable {
+    let id = UUID()
+    let item: MediaItem
+    let previous: MediaProgress
+}
+
 struct WatchListenView: View {
     /// Set for the sidebar's Watch, Audiobooks, Music and Books links: shows only that kind, without category chips.
     /// Nil on iPhone, where one Watch tab keeps the chips.
@@ -31,6 +38,8 @@ struct WatchListenView: View {
     @State private var organizing = false
     @State private var unavailableMessage: String?
     @State private var dropTargeted = false
+    /// The place Start Over just replaced, offered back for a few seconds.
+    @State private var undoOffer: StartOverUndo?
     @Environment(\.dynamicTypeSize) private var typeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     #if os(macOS)
@@ -73,10 +82,14 @@ struct WatchListenView: View {
             #else
             content.fullScreenCover(item: $playing) { item in
                 NavigationStack { player(item).toolbar { ToolbarItem(placement: .topBarLeading) { Button("Minimize", systemImage: "chevron.down") { playing = nil } } } }
+                    .overlay(alignment: .bottom) { undoToast }
                     .environment(\.colorScheme, .dark).tint(MediaTheme.accent)
             }
             #endif
         }
+        #if os(macOS)
+        .overlay(alignment: .bottom) { undoToast }
+        #endif
         .onChange(of: filter) { genre = nil; artist = nil; collection = nil; selected = nil; sort = .title; query = ""; appliedQuery = "" }
         // Search waits for a pause in the typing; clearing it shows everything at once.
         .task(id: query) {
@@ -94,8 +107,31 @@ struct WatchListenView: View {
             await media.reloadIfStale(library: library)
             #if DEBUG
             let defaults = UserDefaults.standard
-            if let book = LibriVoxBook.picks.first(where: { $0.id == defaults.integer(forKey: "getAudiobook") }) { audiobooks.get(book) }
-            if let title = defaults.string(forKey: "playMedia"), let item = media.items.first(where: { $0.title == title }) { start(item) }
+            if let book = LibriVoxBook.picks.first(where: { $0.id == defaults.integer(forKey: "getAudiobook") }) {
+                audiobooks.get(book)
+                // Test hook: -cancelAudiobook S cancels that download S seconds after it starts.
+                if let wait = Double(defaults.string(forKey: "cancelAudiobook") ?? "") {
+                    try? await Task.sleep(for: .seconds(wait))
+                    audiobooks.cancel(book)
+                }
+            }
+            if let title = defaults.string(forKey: "playMedia"), let item = media.items.first(where: { $0.title == title }) {
+                start(item)
+                // Test hook: -playMediaRate 1.5 sets the listening speed (it should be remembered for that audiobook).
+                if let rate = Float(defaults.string(forKey: "playMediaRate") ?? "") { nowPlaying.playback?.rate = rate }
+                // Test hook: -playMediaAt S jumps S seconds into it after a moment (to cross the finish line).
+                if let at = Double(defaults.string(forKey: "playMediaAt") ?? "") {
+                    try? await Task.sleep(for: .seconds(2))
+                    nowPlaying.playback?.skip(at - (nowPlaying.playback?.current ?? 0))
+                }
+                // Test hook: -playMediaSleep M starts a sleep timer of M minutes (with the fade), to see the label and the volume.
+                if let minutes = Int(defaults.string(forKey: "playMediaSleep") ?? "") { nowPlaying.playback?.setSleep(minutes: minutes) }
+            }
+            // Test hook: -startOverMedia "<title>" starts that item over 3 seconds in, as Start Over does.
+            if let title = defaults.string(forKey: "startOverMedia"), let item = media.items.first(where: { $0.title == title }) {
+                try? await Task.sleep(for: .seconds(3))
+                start(item, true)
+            }
             if let title = defaults.string(forKey: "detailMedia") { selected = media.items.first { $0.title == title } }
             if let value = defaults.string(forKey: "mediaFilter"), let value = MediaFilter(rawValue: value) { filter = value }
             #if os(macOS)
@@ -560,14 +596,66 @@ struct WatchListenView: View {
         }
         if item.kind == .book {
             // Start Over opens the book at the beginning.
-            if fromStart { media.saveProgress(MediaProgress(track: 0, seconds: 0), for: item) }
+            if fromStart { offerUndo(for: item); media.saveProgress(MediaProgress(track: 0, seconds: 0), for: item) }
         } else {
-            if fromStart { nowPlaying.close(); media.saveProgress(MediaProgress(track: 0, seconds: 0), for: item) }
+            if fromStart { nowPlaying.close(); offerUndo(for: item); media.saveProgress(MediaProgress(track: 0, seconds: 0), for: item) }
             nowPlaying.open(item, library: media, autoplay: true)
             if let track { if track == -1 { nowPlaying.playback?.shuffle() } else { nowPlaying.playback?.load(track: track, play: true) } }
         }
         playing = item
     }
+    /// Start Over throws away a long place (hours into an audiobook). Keep it for a few seconds so Undo can bring it back.
+    private func offerUndo(for item: MediaItem) {
+        guard let previous = media.progress[item.progressKey], MediaCatalog.isInProgress(previous, kind: item.kind) else { undoOffer = nil; return }
+        let offer = StartOverUndo(item: item, previous: previous)
+        undoOffer = offer
+        Task {
+            try? await Task.sleep(for: .seconds(10))
+            if undoOffer?.id == offer.id { undoOffer = nil }
+        }
+    }
+
+    private func undoStartOver(_ offer: StartOverUndo) {
+        undoOffer = nil
+        let item = offer.item
+        if item.kind == .book {
+            // Close the reader first (it saves where it is when it goes), then put the old place back and reopen.
+            playing = nil
+            Task {
+                try? await Task.sleep(for: .milliseconds(350))
+                media.saveProgress(offer.previous, for: item, stopped: true)
+                playing = item
+            }
+        } else {
+            nowPlaying.close()
+            media.saveProgress(offer.previous, for: item, stopped: true)
+            nowPlaying.open(item, library: media, autoplay: true)
+        }
+    }
+
+    private var undoToast: some View {
+        Group { undoToastContent }.animation(Motion.gentle(reduceMotion), value: undoOffer?.id)
+    }
+
+    @ViewBuilder private var undoToastContent: some View {
+        if let offer = undoOffer {
+            HStack(spacing: 14) {
+                Text("Started “\(MediaCatalog.displayTitle(offer.item.title))” over").lineLimit(1)
+                Button("Undo") { undoStartOver(offer) }.buttonStyle(.borderedProminent).controlSize(.small)
+                    .accessibilityHint("Goes back to where you were")
+            }
+            .font(.callout)
+            .padding(.horizontal, 16).padding(.vertical, 10)
+            .background(MediaTheme.surface, in: Capsule())
+            .overlay(Capsule().strokeBorder(MediaTheme.muted.opacity(0.3), lineWidth: 0.5))
+            .foregroundStyle(MediaTheme.ink).tint(MediaTheme.accent)
+            .shadow(color: .black.opacity(0.25), radius: 10, y: 3)
+            .padding(.bottom, 90)   // above the mini player
+            .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
+            .accessibilityElement(children: .contain)
+        }
+    }
+
     private func openRequested() {
         guard let item = nowPlaying.expandRequest else { return }
         nowPlaying.expandRequest = nil; playing = item
@@ -607,6 +695,9 @@ struct WatchListenView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(book.title)
                         Text("\(book.author) · \(book.duration) · ages \(book.ages)").font(.caption).foregroundStyle(.secondary)
+                        if case .failed(let reason)? = audiobooks.states[book.id], !audiobooks.isInstalled(book) {
+                            Label(reason, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                        }
                     }
                     Spacer(minLength: 12)
                     trailing(book)
@@ -617,13 +708,20 @@ struct WatchListenView: View {
         .card(padding: 18)
     }
 
+    private func cancelButton(_ book: LibriVoxBook) -> some View {
+        Button("Cancel") { audiobooks.cancel(book) }.buttonStyle(.bordered).controlSize(.small)
+            .accessibilityLabel("Cancel download of \(book.title)")
+    }
+
     @ViewBuilder private func trailing(_ book: LibriVoxBook) -> some View {
         if audiobooks.isInstalled(book) {
             Pill(text: "Saved", symbol: "checkmark", tint: .accentColor)
         } else {
             switch audiobooks.states[book.id] {
-            case .queued: Pill(text: "Waiting", symbol: "clock")
-            case .downloading(let f): Pill(text: "\(Int(f * 100))%", symbol: "arrow.down", tint: .accentColor)
+            case .queued:
+                HStack(spacing: 8) { Pill(text: "Waiting", symbol: "clock"); cancelButton(book) }
+            case .downloading(let f):
+                HStack(spacing: 8) { Pill(text: "\(Int(f * 100))%", symbol: "arrow.down", tint: .accentColor); cancelButton(book) }
             case .failed: Button("Retry") { audiobooks.get(book) }.buttonStyle(.bordered)
             default:
                 Button("Get · \(ByteCountFormatter.string(fromByteCount: book.estimatedBytes, countStyle: .file))") { audiobooks.get(book) }

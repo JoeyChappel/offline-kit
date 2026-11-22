@@ -11,9 +11,26 @@ protocol AnswerEngine: Sendable {
     /// Characters of source text that fit comfortably in this model's context.
     var sourceBudget: Int { get }
     func stream(instructions: String, prompt: String) -> AsyncThrowingStream<String, Error>
+    /// Same, and `notes.cutShort` is set when the model ran out of room and stopped mid-answer.
+    func stream(instructions: String, prompt: String, notes: StreamNotes) -> AsyncThrowingStream<String, Error>
+}
+
+/// What an engine learned while streaming, read once the stream has ended.
+final class StreamNotes: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _cutShort = false
+    var cutShort: Bool {
+        get { lock.withLock { _cutShort } }
+        set { lock.withLock { _cutShort = newValue } }
+    }
 }
 
 extension AnswerEngine {
+    /// Engines that can't tell when they ran out of room just stream.
+    func stream(instructions: String, prompt: String, notes: StreamNotes) -> AsyncThrowingStream<String, Error> {
+        stream(instructions: instructions, prompt: prompt)
+    }
+
     /// Characters of personal and kit context to include. Small models get a short version.
     var contextBudget: Int { sourceBudget >= 10_000 ? 4_000 : 1_500 }
     var technicalName: String { displayName }
@@ -39,7 +56,16 @@ struct AppleEngine: AnswerEngine {
         }
     }
 
-    static var isAvailable: Bool { SystemLanguageModel.default.isAvailable }
+    /// Views ask in their bodies, so the answer is remembered briefly (the first ask costs ~100 ms and later ones add up).
+    /// It's still fresh enough to notice Apple Intelligence being turned on or its model finishing a download.
+    nonisolated(unsafe) private static var cachedAvailability: (value: Bool, at: ContinuousClock.Instant)?
+    static var isAvailable: Bool {
+        let now = ContinuousClock.now
+        if let cached = cachedAvailability, now - cached.at < .seconds(3) { return cached.value }
+        let value = SystemLanguageModel.default.isAvailable
+        cachedAvailability = (value, now)
+        return value
+    }
 
     func stream(instructions: String, prompt: String) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
@@ -118,6 +144,10 @@ struct OllamaEngine: AnswerEngine {
     struct ServerError: LocalizedError { let message: String; var errorDescription: String? { message } }
 
     func stream(instructions: String, prompt: String) -> AsyncThrowingStream<String, Error> {
+        stream(instructions: instructions, prompt: prompt, notes: StreamNotes())
+    }
+
+    func stream(instructions: String, prompt: String, notes: StreamNotes) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -145,7 +175,7 @@ struct OllamaEngine: AnswerEngine {
                     }
                     struct Chunk: Decodable {
                         struct Msg: Decodable { let content: String? }
-                        let message: Msg?; let done: Bool?; let error: String?
+                        let message: Msg?; let done: Bool?; let error: String?; let done_reason: String?
                     }
                     var answer = ""
                     for try await line in bytes.lines {
@@ -156,7 +186,10 @@ struct OllamaEngine: AnswerEngine {
                             answer += piece
                             continuation.yield(answer)
                         }
-                        if chunk.done == true { break }
+                        if chunk.done == true {
+                            if chunk.done_reason == "length" { notes.cutShort = true }
+                            break
+                        }
                     }
                     continuation.finish()
                 } catch {

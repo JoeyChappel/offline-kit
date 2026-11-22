@@ -21,6 +21,8 @@ struct AskView: View {
     @State private var showingNumbers = false
     /// True when the window is too narrow for the toolbar's words; its menus show icons only.
     @State private var compact = false
+    /// ↑ in an empty box brings back earlier questions: 0 is none, 1 the last one, 2 the one before.
+    @State private var recalled = 0
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -45,7 +47,8 @@ struct AskView: View {
                     }
                     ForEach(model.turns) { turn in
                         // Equatable: finished turns don't redraw while a later answer streams in.
-                        TurnView(turn: turn, large: model.isFullEmergency).equatable().id(turn.id)
+                        TurnView(turn: turn, large: model.isFullEmergency,
+                                 isLast: turn.id == model.turns.last?.id && !model.isBusy).equatable().id(turn.id)
                     }
                 }
                 .padding(.horizontal, 24)
@@ -72,11 +75,14 @@ struct AskView: View {
                 if let id = model.turns.last?.id { withAnimation { proxy.scrollTo(id, anchor: .top) } }
             }
         }
+        .overlay(alignment: .bottom) { undoToast }
         .safeAreaInset(edge: .bottom) { composer }
         }
         .background(Design.canvas)
         .onGeometryChange(for: Bool.self) { $0.size.width < 760 } action: { compact = $0 }
         .environment(voice)
+        .focusedSceneValue(\.askActions, AskActions(canStartOver: !model.turns.isEmpty, isBusy: model.isBusy,
+                                                    startOver: startOver, stop: model.stop))
         .onAppear {
             voice.model = model
             voice.ask = { ask($0) }
@@ -169,9 +175,9 @@ struct AskView: View {
                 }
             }
             ToolbarItem {
-                Button { model.clear(); focused = true } label: { Label("New Conversation", systemImage: "square.and.pencil") }
+                Button(action: startOver) { Label("New Conversation", systemImage: "square.and.pencil") }
                     .disabled(model.turns.isEmpty)
-                    .help("Start over")
+                    .help("Start over (⌘N). You can undo it for a few seconds.")
             }
         }
         #if os(macOS)
@@ -183,6 +189,8 @@ struct AskView: View {
             model.preloadIfNeeded(libraryFolders: library.folders)
         }
         #if DEBUG
+        // Test hook: -seedHousehold YES fills an empty test household with made-up people and supplies (also seeded in Prepare).
+        .task { await household.ensureLoaded(); HouseholdSamples.seedIfAsked(household) }
         // Test hook: -startEmergency YES opens Ask with the emergency alert showing.
         .task {
             guard UserDefaults.standard.bool(forKey: "startEmergency") else { return }
@@ -223,14 +231,30 @@ struct AskView: View {
             if UserDefaults.standard.string(forKey: "autoAsk") != nil { Self.log("library: \(library.books.count) books, loading=\(library.isLoading)\n") }
             guard let script = UserDefaults.standard.string(forKey: "autoAsk"), !library.books.isEmpty,
                   model.turns.isEmpty else { return }
-            for q in script.components(separatedBy: "||").map({ $0.trimmingCharacters(in: .whitespaces) }) where !q.isEmpty {
+            let questions = script.components(separatedBy: "||").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            for q in questions {
                 model.ask(q, library: library, household: household)
+                // Test hook: -autoStopAfter 0.3 stops the last question's answer that long after it starts being worked out
+                // (the library search is done), and logs how long Stop took to be honored.
+                if q == questions.last, let after = UserDefaults.standard.string(forKey: "autoStopAfter").flatMap(Double.init) {
+                    while model.turns.last?.status != .answering { try? await Task.sleep(for: .milliseconds(20)) }
+                    try? await Task.sleep(for: .seconds(after))
+                    model.stop()
+                    Self.log("STOPPED \(Int(Date().timeIntervalSince1970 * 1000))\n")
+                }
                 while model.isBusy { try? await Task.sleep(for: .milliseconds(300)) }
+                // Test hook: -forceCutShort YES marks each answer as cut short (a real one needs 1,024 tokens).
+                if UserDefaults.standard.bool(forKey: "forceCutShort"), let last = model.turns.indices.last { model.turns[last].cutShort = true }
                 if let t = model.turns.last {
-                    Self.log("===== Q: \(t.question)\nalert: \(model.alert.map { ($0.detected ? "detected · " : "full · ") + $0.headline } ?? "none")\nsources: \(t.sources.map(\.ref.title).joined(separator: " | "))\nA: \(t.answer)\nnoted: \(t.noted.map(\.text))\n")
+                    Self.log("===== Q: \(t.question)\nalert: \(model.alert.map { ($0.detected ? "detected · " : "full · ") + $0.headline } ?? "none")\nsources: \(t.sources.map(\.ref.title).joined(separator: " | "))\nA: \(t.answer)\nnoted: \(t.noted.map(\.text))\nengine: \(t.engine) status: \(t.status) cutShort: \(t.cutShort) error: \(t.error ?? "none")\ncontext: \(t.context)\n")
                 }
             }
             Self.log("DONE\n")
+            // Test hook: -autoClear 2 clears the conversation that many seconds after the last answer (the Undo toast shows).
+            if let wait = UserDefaults.standard.string(forKey: "autoClear").flatMap(Double.init) {
+                try? await Task.sleep(for: .seconds(wait))
+                startOver()
+            }
         }
         #endif
     }
@@ -282,6 +306,10 @@ struct AskView: View {
                             .lineLimit(1...6)
                             .focused($focused)
                             .onSubmit(send)
+                            #if os(macOS)
+                            .onKeyPress(.upArrow) { recallQuestion(older: true) }
+                            .onKeyPress(.downArrow) { recallQuestion(older: false) }
+                            #endif
                             .padding(.vertical, 6)
                     }
                     HandsFreeToggle(labeled: model.isFullEmergency)
@@ -340,12 +368,58 @@ struct AskView: View {
 
     private func send() { ask(draft) }
 
+    private func startOver() {
+        guard !model.turns.isEmpty else { return }
+        withAnimation { model.clear() }
+        recalled = 0
+        focused = true
+    }
+
+    /// ↑ in an empty box (or one still showing a recalled question) steps back through what was asked; ↓ steps forward.
+    /// A box with the person's own words in it keeps its arrow keys.
+    private func recallQuestion(older: Bool) -> KeyPress.Result {
+        let asked = model.turns.map(\.question)
+        let showing = recalled > 0 && recalled <= asked.count ? asked[asked.count - recalled] : nil
+        guard draft.isEmpty || draft == showing, !asked.isEmpty else { return .ignored }
+        if older {
+            guard recalled < asked.count else { return .handled }
+            recalled += 1
+        } else {
+            guard recalled > 0 else { return .ignored }
+            recalled -= 1
+        }
+        draft = recalled == 0 ? "" : asked[asked.count - recalled]
+        return .handled
+    }
+
+    /// "Conversation cleared. Undo", shown for a few seconds after New Conversation.
+    @ViewBuilder private var undoToast: some View {
+        if model.clearedTurns != nil {
+            HStack(spacing: 12) {
+                Text("Conversation cleared").font(.callout.weight(.semibold))
+                Button("Undo") { withAnimation { model.restoreCleared() } }
+                    .buttonStyle(.borderless).font(.callout.weight(.semibold))
+            }
+            .padding(.horizontal, 16).padding(.vertical, 9)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+            .padding(.bottom, 14)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .task(id: model.clearedAt) {
+                try? await Task.sleep(for: .seconds(10))
+                if !Task.isCancelled { withAnimation { model.dismissUndo() } }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityAction(named: "Undo") { model.restoreCleared() }
+        }
+    }
+
     /// Clears the text box only when the question was taken, so nothing typed is lost.
     @discardableResult
     private func ask(_ question: String) -> Bool {
         guard !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         let accepted = model.ask(question, library: library, scope: navigation.askScope, household: household)
-        if accepted { draft = "" }
+        if accepted { draft = ""; recalled = 0 }
         return accepted
     }
 }
@@ -563,9 +637,11 @@ private struct SuggestionCard: View {
 // MARK: - Turn
 
 private struct TurnView: View, Equatable {
-    static func == (a: TurnView, b: TurnView) -> Bool { a.turn == b.turn && a.large == b.large }
+    static func == (a: TurnView, b: TurnView) -> Bool { a.turn == b.turn && a.large == b.large && a.isLast == b.isLast }
     let turn: Turn
     var large = false
+    /// The newest question, and nothing is being answered: it can be asked again or continued.
+    var isLast = false
     @Environment(\.openArticle) private var openArticle
     @Environment(KitNavigation.self) private var navigation
     @Environment(Library.self) private var library
@@ -609,6 +685,15 @@ private struct TurnView: View, Equatable {
                 if let error = turn.error {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
+                }
+                if turn.cutShort && turn.status == .done {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Label("This answer was cut short. Ask me to continue to get the rest.", systemImage: "scissors")
+                            .font(.callout).foregroundStyle(.secondary)
+                        if isLast {
+                            Button("Continue") { continueAnswer() }.buttonStyle(.borderless).font(.callout.weight(.semibold))
+                        }
+                    }
                 }
                 if turn.status == .done || turn.status == .failed || turn.status == .stopped {
                     footer
@@ -771,6 +856,14 @@ private struct TurnView: View, Equatable {
                     .font(.caption).foregroundStyle(.tertiary).monospacedDigit()
             }
             Spacer()
+            if isLast && (turn.status == .failed || turn.status == .stopped) {
+                Button { model.retryLast(library: library, household: household) } label: {
+                    Label("Try Again", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .font(.caption.weight(.semibold))
+                .help("Ask this question again")
+            }
             if !turn.answer.isEmpty {
                 let reading = voice.reader.turnID == turn.id && voice.reader.isSpeaking
                 Button { voice.readAloud(turn) } label: {
@@ -786,6 +879,10 @@ private struct TurnView: View, Equatable {
             }
         }
         .padding(.top, 2)
+    }
+
+    private func continueAnswer() {
+        model.ask("Please continue", library: library, scope: turn.scope, household: household)
     }
 
     private func copy(_ text: String) {
@@ -897,22 +994,38 @@ struct ToolbarLabelStyle: LabelStyle {
 }
 
 /// Wraps children onto new lines, like tags.
+/// The children's natural sizes are measured once per layout update (the cache) and the row breaks are remembered for
+/// the last width, so SwiftUI's several size and placement passes don't each re-measure every child.
 struct FlowLayout: Layout {
     var spacing: CGFloat = 8
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
-        let rows = arrange(width: proposal.width ?? .infinity, subviews: subviews)
+    struct Cache {
+        var sizes: [CGSize] = []
+        var width: CGFloat = -1
+        var rows: [Row] = []
+    }
+
+    func makeCache(subviews: Subviews) -> Cache {
+        Cache(sizes: subviews.map { $0.sizeThatFits(.unspecified) })
+    }
+
+    func updateCache(_ cache: inout Cache, subviews: Subviews) {
+        cache = makeCache(subviews: subviews)
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) -> CGSize {
+        let rows = arrange(width: proposal.width ?? .infinity, cache: &cache)
         let width = rows.map { $0.width }.max() ?? 0
         let height = rows.map(\.height).reduce(0, +) + spacing * CGFloat(max(0, rows.count - 1))
         return CGSize(width: width, height: height)
     }
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout Cache) {
         var y = bounds.minY
-        for row in arrange(width: bounds.width, subviews: subviews) {
+        for row in arrange(width: bounds.width, cache: &cache) {
             var x = bounds.minX
             for index in row.indices {
-                let size = subviews[index].sizeThatFits(.unspecified)
+                let size = cache.sizes[index]
                 subviews[index].place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
                 x += size.width + spacing
             }
@@ -920,12 +1033,12 @@ struct FlowLayout: Layout {
         }
     }
 
-    private struct Row { var indices: [Int] = []; var width: CGFloat = 0; var height: CGFloat = 0 }
+    struct Row { var indices: [Int] = []; var width: CGFloat = 0; var height: CGFloat = 0 }
 
-    private func arrange(width: CGFloat, subviews: Subviews) -> [Row] {
+    private func arrange(width: CGFloat, cache: inout Cache) -> [Row] {
+        if cache.width == width { return cache.rows }
         var rows: [Row] = [Row()]
-        for (i, view) in subviews.enumerated() {
-            let size = view.sizeThatFits(.unspecified)
+        for (i, size) in cache.sizes.enumerated() {
             let extra = rows[rows.count - 1].indices.isEmpty ? size.width : size.width + spacing
             if rows[rows.count - 1].width + extra > width, !rows[rows.count - 1].indices.isEmpty {
                 rows.append(Row())
@@ -935,6 +1048,8 @@ struct FlowLayout: Layout {
             rows[rows.count - 1].width += added
             rows[rows.count - 1].height = max(rows[rows.count - 1].height, size.height)
         }
+        cache.width = width
+        cache.rows = rows
         return rows
     }
 }

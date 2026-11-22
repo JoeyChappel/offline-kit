@@ -41,6 +41,15 @@ final class ReadAloudSettings {
 
     /// Voices for this device's language, best quality first. Novelty voices left out.
     static var voices: [AVSpeechSynthesisVoice] {
+        // Settings reads this in a body (about 70 ms on iPhone); the installed set changes rarely, so keep it a while.
+        if let cached = cachedVoices, Date().timeIntervalSince(cached.at) < 30 { return cached.list }
+        let list = loadVoices()
+        cachedVoices = (list, Date())
+        return list
+    }
+    nonisolated(unsafe) private static var cachedVoices: (list: [AVSpeechSynthesisVoice], at: Date)?
+
+    private static func loadVoices() -> [AVSpeechSynthesisVoice] {
         let language = AVSpeechSynthesisVoice.currentLanguageCode()
         let prefix = String(language.prefix(2))
         return AVSpeechSynthesisVoice.speechVoices()

@@ -362,6 +362,30 @@ enum Preparedness {
         return defaultItems.map(\.category).filter { seen.insert($0).inserted }
     }
 
+    /// The checklist items that are stock to count and date rather than a tool (a flashlight): their supply names,
+    /// categories and units. Water and food are the ones with expiry dates to track.
+    private static let stock: [String: (name: String, category: SupplyCategory, unit: String)] = [
+        "water": ("Water", .water, "gallons"),
+        "food": ("Food that won’t spoil", .food, ""),
+        "batteries": ("Extra batteries", .batteries, ""),
+        "firstaid": ("First aid kit", .firstAid, ""),
+        "meds": ("Prescription medicines", .medicine, ""),
+        "bleach": ("Unscented household bleach", .other, ""),
+    ]
+
+    /// A supply to start from for a ticked checklist item that is stock, or nil (a tool, a document, a plan).
+    static func supply(for item: ChecklistItem) -> SupplyItem? {
+        guard let match = stock[item.id] else { return nil }
+        var supply = SupplyItem(name: match.name, category: match.category)
+        supply.unit = match.unit
+        return supply
+    }
+
+    /// Supplies for everything ticked in the checklist that is stock, for starting an empty Supplies list.
+    static func supplyStarters(from checklist: [ChecklistItem]) -> [SupplyItem] {
+        checklist.filter(\.have).compactMap(supply(for:))
+    }
+
     /// Keeps saved checklists current when new default items are added in an update.
     static func addMissingDefaults(to items: inout [ChecklistItem]) {
         let ids = Set(items.map(\.id))
@@ -412,6 +436,8 @@ enum AskContext {
                 }
                 let home = homeLine(data)
                 if !home.isEmpty { parts.append("Home: " + home) }
+                let shutoffs = shutoffLine(data)
+                if !shutoffs.isEmpty { parts.append("Where the utility shut-offs are (typed in Prepare): " + shutoffs) }
             }
             if p.useMemories {
                 let relevant = data.memories.filter { $0.personID == nil || $0.personID == asking?.id }
@@ -424,6 +450,8 @@ enum AskContext {
                 let missing = data.checklist.filter { !$0.have }.map(\.title)
                 if !have.isEmpty { parts.append("Supplies they have: " + have.joined(separator: "; ")) }
                 if !missing.isEmpty && !have.isEmpty { parts.append("Supplies they don’t have yet: " + missing.joined(separator: "; ")) }
+                let stock = stockLine(data)
+                if !stock.isEmpty { parts.append("Supplies in stock (from Prepare › Supplies): " + stock) }
             }
         }
         if !kit.isEmpty { parts.append(kit) }
@@ -454,6 +482,31 @@ enum AskContext {
         if !person.skills.isEmpty { bits.append("skills: \(person.skills.joined(separator: ", "))") }
         if !person.notes.isEmpty { bits.append(person.notes) }
         return bits.joined(separator: "; ")
+    }
+
+    /// "water: Basement, north wall; gas: Meter on the east side"
+    private static func shutoffLine(_ data: HouseholdData) -> String {
+        let plan = data.extra.plan
+        return [("water", plan.waterShutoff), ("gas", plan.gasShutoff), ("electric", plan.electricShutoff), ("notes", plan.shutoffNotes)]
+            .filter { !$0.1.isBlank }
+            .map { "\($0.0): \($0.1.trimmingCharacters(in: .whitespacesAndNewlines))" }.joined(separator: "; ")
+    }
+
+    /// "Water 12 gallons (garage); Canned food 20 cans (pantry, expires Mar 2027)". Expired items are flagged, and the list is capped.
+    private static func stockLine(_ data: HouseholdData, now: Date = .now) -> String {
+        let items = data.extra.supplies.filter { !$0.name.isBlank }
+        let shown = items.prefix(25).map { item -> String in
+            var bits: [String] = []
+            if !item.location.isBlank { bits.append(item.location.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            switch item.status(now: now) {
+            case .expired: bits.append("expired")
+            case .soon: bits.append(item.expiryText(now: now).lowercased())
+            default: break
+            }
+            return "\(item.name) \(item.amount)" + (bits.isEmpty ? "" : " (\(bits.joined(separator: ", ")))")
+        }
+        let more = items.count > 25 ? "; and \(items.count - 25) more" : ""
+        return shown.joined(separator: "; ") + more
     }
 
     private static func homeLine(_ data: HouseholdData) -> String {

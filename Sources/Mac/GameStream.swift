@@ -312,7 +312,10 @@ final class GameStreamHub {
 
     private func closed(_ client: Client) {
         clients[ObjectIdentifier(client)] = nil
-        if let id = client.deviceID { ShareDevices.shared.setActivity(device: id, text: nil) }
+        // Not while the same device still plays on another connection (it reconnected before this one was noticed gone).
+        if let id = client.deviceID, !clients.values.contains(where: { $0.deviceID == id && $0.role != .undecided }) {
+            ShareDevices.shared.setActivity(device: id, text: nil)
+        }
         switch client.role {
         case .player:
             guard let stream, stream.player === client else { break }
@@ -360,6 +363,7 @@ final class GameStreamHub {
             if json["mode"] as? String == "controller" { becomeController(client) }
             else { play(json, client: client) }
         case "ping":
+            if let id = client.deviceID { ShareDevices.shared.stillThere(device: id) }
             var reply: [String: Any] = ["t": "pong", "ts": json["ts"] ?? 0]
             if client.role == .controller { reply.merge(controllerStatus(client)) { $1 } }
             client.socket.send(json: reply)
@@ -473,6 +477,18 @@ final class GameStreamHub {
 
         // The device coming back to its paused game (or another device picking it up) carries straight on.
         if let stream, stream.player == nil, stream.session.isRunning, stream.session.game.id == game.id {
+            attach(client, to: stream, resumed: true)
+            return
+        }
+        // The same device reconnecting after a Wi-Fi blip, before its old connection was noticed gone (that takes up to
+        // half a minute with no word from it). A page checks in every 2 seconds, so an old connection quiet for longer
+        // is the one that dropped: this one carries straight on instead of being asked to take over from itself.
+        if let stream, let other = stream.player, other !== client, let id = client.deviceID, other.deviceID == id,
+           other.socket.quietFor > 3, stream.session.isRunning, stream.session.game.id == game.id {
+            stream.player = nil   // so the old socket closing doesn't pause the game
+            other.role = .undecided
+            other.socket.send(json: ["t": "ended", "reason": "replaced", "text": "This game carried on in another window."])
+            other.socket.close(code: 1001, reason: "Reconnected")
             attach(client, to: stream, resumed: true)
             return
         }

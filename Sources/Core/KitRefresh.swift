@@ -13,11 +13,18 @@ struct KitUpdate: Identifiable, Hashable, Sendable {
     var folder: URL { installed.deletingLastPathComponent() }
 }
 
+extension Notification.Name {
+    /// Posted on the main actor each time the network path goes from offline to online.
+    static let networkDidReconnect = Notification.Name("OfflineKit.networkDidReconnect")
+}
+
 /// Whether the Mac or phone has a working network path right now.
 @MainActor @Observable
 final class NetworkWatch {
     static let shared = NetworkWatch()
-    private(set) var isOnline = true
+    private(set) var isOnline = true {
+        didSet { if isOnline && !oldValue { NotificationCenter.default.post(name: .networkDidReconnect, object: nil) } }
+    }
     private let monitor = NWPathMonitor()
 
     private init() {

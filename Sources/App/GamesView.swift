@@ -153,6 +153,8 @@ struct PlayerView: View {
                         Button { session.openGameMenu() } label: { Label("Game Menu", systemImage: "list.bullet.rectangle") }
                             .help("Open the game’s menu to save, load or quit (fn-F5)")
                     }
+                    Button { (NSApp.keyWindow ?? NSApp.mainWindow)?.toggleFullScreen(nil) } label: { Label("Full Screen", systemImage: "arrow.up.left.and.arrow.down.right") }
+                        .help("Fill the screen with the game (⌃⌘F). Press it again, or Esc, to leave.")
                     Button { showHelp.toggle() } label: { Label("Controls", systemImage: "keyboard") }
                         .help("Show which keys play the game")
                         .popover(isPresented: $showHelp) { KeyHelp(system: game.system, joystick: session.joystickMode).padding() }
@@ -366,6 +368,7 @@ private struct KeyHelp: View {
                 row("Save / Load place", "⌘S / ⌘L")
             }
             row("Pause", "⌘P")
+            row("Full screen", "⌃⌘F or the Full Screen button")
             Text(joystick ? "A game controller works as the joystick too." : "Click the picture if keys stop reaching the game.")
                 .font(.caption).foregroundStyle(.secondary)
         }
@@ -390,6 +393,7 @@ private struct KeyHelp: View {
             }
             row("Save / Load place", "⌘S / ⌘L")
             row("Pause", "⌘P")
+            row("Full screen", "⌃⌘F or the Full Screen button")
             Text("Game controllers (Xbox, PlayStation, Switch Pro) work too.")
                 .font(.caption).foregroundStyle(.secondary)
         }

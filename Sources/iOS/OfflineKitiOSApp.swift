@@ -127,6 +127,21 @@ struct PhoneTabs: View {
         #if DEBUG
         // Test hook: -startSection prepare opens the Prepare tab.
         .onAppear { LaunchTiming.firstAppear(); if UserDefaults.standard.string(forKey: "startSection") == "prepare" { navigation.selection = .prepare } }
+        // Test hook: -cycleSections N walks the phone tabs N times (-cycleWait S before the first), logging stalls per tab.
+        .task {
+            guard let rounds = Int(UserDefaults.standard.string(forKey: "cycleSections") ?? "") else { return }
+            try? await Task.sleep(for: .seconds(Double(UserDefaults.standard.string(forKey: "cycleWait") ?? "") ?? 6))
+            let order: [SidebarItem] = [.media, .games, .resources, .prepare, .ask, .settings, .library]
+            StallProbe.start()
+            StallProbe.report("before cycling")
+            for step in 0..<(rounds * order.count) {
+                let item = order[step % order.count]
+                navigation.selection = item
+                try? await Task.sleep(for: .seconds(2))
+                StallProbe.report("\(item)")
+            }
+            NSLog("CYCLE done")
+        }
         #endif
         .onReceive(NotificationCenter.default.publisher(for: .openGetResources)) { _ in navigation.getResources(nil) }
         .onChange(of: ask.isFullEmergency) { _, emergency in if emergency { navigation.selection = .ask } }

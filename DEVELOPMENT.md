@@ -143,6 +143,18 @@ build/Build/Products/Debug/okit --download zimgit-water_en /tmp/okit-test
 
 Debug builds accept `-autoAsk "question"` at launch to ask automatically (used for simulator testing).
 
+## Unit tests
+
+```bash
+Tools/Tests/run-tests.sh
+```
+
+Regenerates the project, builds the `OfflineKitTests` scheme into `$TMPDIR/OfflineKitTests-DerivedData` with `CODE_SIGNING_ALLOWED=NO` and runs it (about 45 seconds cold, under 5 seconds of tests). Extra arguments go to `xcodebuild`, e.g. `-only-testing:OfflineKitTests/WebServerTests`.
+
+- **Setup:** a macOS unit-test bundle using Swift Testing, not hosted: it compiles `Sources/Bridge`, `Core`, `App` and `Mac` (all but `OfflineKitMacApp.swift`) plus `Tools/okit/LegacyHTMLText.swift` itself, so tests reach internal types without launching the app, its windows, sharing or update checks. Tests live in `Tests/OfflineKitTests`; `Tests/Fixtures/tiny.zim` (six articles, 37 KB) comes from `Tools/Tests/make-tiny-zim.py`.
+- **Isolation:** each run gets a fresh `OFFLINEKIT_HOME` under `/tmp` (the scheme's default is `/tmp/OfflineKitTests-home`), so settings, caches, indexes and test keys stay out of `~/OfflineKit`, this Mac's preferences and the Keychain; tests that need it fail if it's missing. Test files go in folders under `/tmp` that are removed afterwards. The HTTP and WebSocket tests run the real `WebServer` on a free loopback port.
+- **Known issues:** real bugs a test found are kept as `withKnownIssue` with a one-line reason; they show as known issues, not failures. Remove the wrapper once the bug is fixed.
+
 ## Layout
 
 - `Sources/Bridge`: Objective-C++ wrapper over libzim (`ZimArchive`)

@@ -19,6 +19,9 @@ struct DownloadStatusCard: View {
                     } else if summary.isPaused {
                         Button("Resume") { downloads.resumeAll() }
                             .buttonStyle(.borderless).font(.caption)
+                    } else if summary.failed > 0 && !summary.isRunning {
+                        Button("Retry All") { downloads.retryAll() }
+                            .buttonStyle(.borderless).font(.caption)
                     }
                 }
                 if !summary.isComplete {
@@ -77,6 +80,9 @@ struct DownloadProgressPanel: View {
                 HStack {
                     if summary.isPaused {
                         Button("Resume Downloads", systemImage: "play.fill") { downloads.resumeAll() }
+                            .buttonStyle(.borderedProminent)
+                    } else if summary.failed > 0 && !summary.isRunning {
+                        Button("Retry All", systemImage: "arrow.clockwise") { downloads.retryAll() }
                             .buttonStyle(.borderedProminent)
                     }
                     if showsOpenButton {

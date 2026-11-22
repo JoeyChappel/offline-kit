@@ -27,6 +27,37 @@ enum SidebarItem: Hashable {
     case book(String)
 }
 
+extension SidebarItem {
+    /// How the section is saved between launches. Settings and a single book aren't remembered.
+    var savedName: String? {
+        switch self {
+        case .ask: "ask"
+        case .library: "library"
+        case .archives: "archives"
+        case .area(let area): "area:" + area.rawValue
+        case .resources: "resources"
+        case .kit: "kit"
+        case .games: "games"
+        case .media: "media"
+        case .share: "share"
+        case .prepare: "prepare"
+        case .audiobooks: "audiobooks"
+        case .music: "music"
+        case .books: "books"
+        case .settings, .book: nil
+        }
+    }
+
+    init?(savedName: String) {
+        let all: [SidebarItem] = [.ask, .library, .archives, .resources, .kit, .games, .media, .share, .prepare, .audiobooks, .music, .books]
+        if let match = all.first(where: { $0.savedName == savedName }) { self = match; return }
+        if savedName.hasPrefix("area:"), let area = SubjectArea(rawValue: String(savedName.dropFirst(5))) { self = .area(area); return }
+        return nil
+    }
+
+    static let savedKey = "lastSection"
+}
+
 #if os(macOS)
 /// Settings buttons that act on the main window (Welcome, Kit Care, Get Resources, update sheet) work even when
 /// that window is closed: it is reopened first, and the action runs once RootView has appeared and is listening.
@@ -71,6 +102,18 @@ struct RootView: View {
     @Environment(\.openSettings) private var openSettings
     #else
     @State private var sheetArticle: ArticleRef?
+    #endif
+
+    #if os(macOS)
+    /// What files dropped on the window are, when a Watch & Listen section is open: the same as that section's + button.
+    private var dropSection: ImportKind? {
+        switch navigation.selection {
+        case .audiobooks: .audiobook
+        case .music: .audio
+        case .books: .book
+        default: nil
+        }
+    }
     #endif
 
     @ViewBuilder private var detail: some View {
@@ -178,7 +221,7 @@ struct RootView: View {
         .transaction { if UserDefaults.standard.bool(forKey: "noAnimations") { $0.disablesAnimations = true; $0.animation = nil } }
         #endif
         #if os(macOS)
-        .acceptsKitDrops(importer)
+        .acceptsKitDrops(importer, section: dropSection)
         #if DEBUG
         // Test hook: -thenOpen library switches sections after 8 seconds (to check the mini player).
         .task {
@@ -190,7 +233,7 @@ struct RootView: View {
         .task {
             guard let paths = UserDefaults.standard.string(forKey: "dropFiles") else { return }
             try? await Task.sleep(for: .seconds(1))
-            importer.receive(paths.split(separator: "|").map { URL(fileURLWithPath: String($0)) })
+            importer.receive(paths.split(separator: "|").map { URL(fileURLWithPath: String($0)) }, section: dropSection)
         }
         #endif
         #endif
@@ -212,6 +255,18 @@ struct RootView: View {
             navigation.selection = .kit
         }
         .environment(navigation)
+        #if os(macOS)
+        .focusedSceneValue(\.kitNavigation, navigation)
+        // Opens on the section that was showing when the app was last closed (a -startSection test hook overrides it below).
+        .onAppear {
+            if let saved = KitSettings.shared.string(forKey: SidebarItem.savedKey).flatMap(SidebarItem.init(savedName:)) {
+                navigation.selection = saved
+            }
+        }
+        .onChange(of: navigation.selection) {
+            if let name = navigation.selection?.savedName { KitSettings.shared.set(name, forKey: SidebarItem.savedKey) }
+        }
+        #endif
         #if DEBUG
         // Test hook: -startSection media|games|resources|share opens that section.
         .onAppear {
@@ -239,7 +294,11 @@ struct RootView: View {
                 Task {
                     // -cycleWait S: seconds before the first switch (default 6); -cycleScroll YES scrolls each screen (macOS).
                     try? await Task.sleep(for: .seconds(Double(UserDefaults.standard.string(forKey: "cycleWait") ?? "") ?? 6))
-                    let order: [SidebarItem] = [.media, .audiobooks, .music, .books, .games]
+                    // -cycleItems music,kit,...: which screens to visit (default Watch, Audiobooks, Music, Books, Play).
+                    let names: [String: SidebarItem] = ["media": .media, "audiobooks": .audiobooks, "music": .music, "books": .books, "games": .games,
+                                                       "resources": .resources, "kit": .kit, "prepare": .prepare, "ask": .ask, "settings": .settings, "library": .library]
+                    let chosen = (UserDefaults.standard.string(forKey: "cycleItems") ?? "").split(separator: ",").compactMap { names[String($0)] }
+                    let order: [SidebarItem] = chosen.isEmpty ? [.media, .audiobooks, .music, .books, .games] : chosen
                     let scroll = UserDefaults.standard.bool(forKey: "cycleScroll")
                     StallProbe.start()
                     StallProbe.report("before cycling")

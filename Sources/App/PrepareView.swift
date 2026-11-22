@@ -80,7 +80,7 @@ struct PrepareView: View {
     @State private var lastInGroup: [PrepareGroup: PrepareTab] = [:]
     /// Where "Done" goes from What Ask knows.
     @State private var beforePrivacy: PrepareTab = .checklist
-    @State private var calculator: Calculator = .water
+    @State private var calculator: Calculator = KitSettings.shared.string(forKey: "lastCalculator").flatMap(Calculator.init(rawValue:)) ?? .water
     /// A person whose Family plan card People asked to open.
     @State private var focusPerson: UUID?
     @State private var power = PowerOut.shared
@@ -88,6 +88,9 @@ struct PrepareView: View {
 
     private static var startTab: PrepareTab {
         if PowerOut.shared.isActive { return .powerOut }
+        // Back to the screen that was open last time, unless it needs details that are locked.
+        let saved = KitSettings.shared.string(forKey: "lastPrepareTab").flatMap(PrepareTab.init(rawValue:))
+        if let saved, saved != .privacy, !(saved.isPrivate && PrivateStore.isLocked) { return saved }
         return PrivateStore.isLocked ? .info : .checklist
     }
 
@@ -132,12 +135,16 @@ struct PrepareView: View {
         .navigationTitle("Prepare")
         .onAppear(perform: follow)
         .onChange(of: navigation.prepareTab) { follow() }
-        .onChange(of: tab) { if let group = tab.group { lastInGroup[group] = tab } }
+        .onChange(of: tab) {
+            if let group = tab.group { lastInGroup[group] = tab }
+            if tab != .privacy { KitSettings.shared.set(tab.rawValue, forKey: "lastPrepareTab") }
+        }
+        .onChange(of: calculator) { KitSettings.shared.set(calculator.rawValue, forKey: "lastCalculator") }
         #if DEBUG
         // Test hook: -prepareTab people opens that tab.
         .task { if let raw = UserDefaults.standard.string(forKey: "prepareTab"), let t = PrepareTab(rawValue: raw) { open(t) } }
         // Test hook: -seedHousehold YES fills an empty test store (OFFLINEKIT_HOME only) with made-up people.
-        .task { HouseholdSamples.seedIfAsked(household) }
+        .task { await household.ensureLoaded(); HouseholdSamples.seedIfAsked(household) }
         #if os(macOS)
         // Test hook: -prepareWindowWidth 820 sizes the window (820 is its minimum), for checking the layout at that width.
         .task {
@@ -400,6 +407,8 @@ struct SectionCard<Content: View>: View {
 private struct ChecklistSection: View {
     @Environment(Household.self) private var household
     @State private var newItem: [String: String] = [:]
+    /// A checklist item being added to Supplies, in the same editor as Add Item.
+    @State private var addingSupply: SupplyItem?
 
     var body: some View {
         @Bindable var household = household
@@ -441,17 +450,16 @@ private struct ChecklistSection: View {
                     ForEach($household.data.checklist) { $item in
                         if item.category == category {
                             HStack(spacing: 10) {
-                                Button { item.have.toggle() } label: {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: item.have ? "checkmark.square.fill" : "square")
-                                            .foregroundStyle(item.have ? Color.accentColor : .secondary).imageScale(.large)
-                                        Text(item.title).foregroundStyle(item.have ? .secondary : .primary)
-                                            .multilineTextAlignment(.leading)
-                                        Spacer(minLength: 0)
-                                    }
-                                    .contentShape(Rectangle())
+                                Toggle(isOn: $item.have) {
+                                    Text(item.title).foregroundStyle(item.have ? .secondary : .primary)
                                 }
-                                .buttonStyle(.plain)
+                                .toggleStyle(SquareCheckStyle())
+                                if item.have, let starter = Self.offer(for: item, in: household.data) {
+                                    Button("Add to Supplies…", systemImage: "shippingbox") { addingSupply = starter }
+                                        .buttonStyle(.borderless).font(.callout)
+                                        .help("Record how much you have and when it expires")
+                                        .accessibilityLabel("Add \(item.title) to Supplies")
+                                }
                                 if item.custom {
                                     Button(role: .destructive) {
                                         household.data.checklist.removeAll { $0.id == item.id }
@@ -475,6 +483,16 @@ private struct ChecklistSection: View {
                 .card(padding: 18)
             }
         }
+        .sheet(item: $addingSupply) { starter in
+            SupplyEditor(item: starter, isNew: true).environment(household)
+        }
+    }
+
+    /// Water and food, once ticked, with nothing in Supplies for them yet: the offer to record the amount and expiry date.
+    private static func offer(for item: ChecklistItem, in data: HouseholdData) -> SupplyItem? {
+        guard item.id == "water" || item.id == "food", let supply = Preparedness.supply(for: item),
+              !data.extra.supplies.contains(where: { $0.category == supply.category }) else { return nil }
+        return supply
     }
 
     private func add(to category: String) {
@@ -920,8 +938,8 @@ struct AskKnowledgeSection: View {
                         subtitle: "Turn any of these off at any time. Off means Ask doesn’t see it.") {
                 Toggle("Personalize answers", isOn: $household.data.privacy.personalize).font(.body.weight(.semibold))
                 Group {
-                    Toggle("Household, people, health and skills", isOn: $household.data.privacy.useHousehold)
-                    Toggle("Supplies checklist", isOn: $household.data.privacy.useChecklist)
+                    Toggle("Household, people, health, skills and shut-off locations", isOn: $household.data.privacy.useHousehold)
+                    Toggle("Supplies checklist and what you have in stock", isOn: $household.data.privacy.useChecklist)
                     Toggle("Things Ask has noted", isOn: $household.data.privacy.useMemories)
                     Toggle("Note new facts from questions", isOn: $household.data.privacy.learnMemories)
                 }

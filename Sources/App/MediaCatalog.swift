@@ -496,7 +496,7 @@ enum MediaCatalog {
         if item.kind == .book {
             bits.append("Book")
             if let author = info?.author, !author.isEmpty { bits.append(author) }
-            if let parts = info?.parts { bits.append(item.tracks[0].pathExtension.lowercased() == "pdf" ? "\(parts) pages" : "\(parts) chapters") }
+            if let parts = info?.parts { bits.append(item.tracks[0].pathExtension.lowercased() == "pdf" ? "\(parts) page\(parts == 1 ? "" : "s")" : "\(parts) chapter\(parts == 1 ? "" : "s")") }
             if let genre = info?.genre { bits.append(genre) }
             return bits.joined(separator: " · ")
         }

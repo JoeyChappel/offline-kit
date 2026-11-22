@@ -116,7 +116,15 @@ final class LlamaRuntime: @unchecked Sendable {
 
     /// What is loaded and when it was last used, readable without waiting for a load or a generation to finish.
     private let stateLock = NSLock()
-    private var readyKey: String?
+    /// Which model is loaded, kept outside `shared` on purpose: asking "is it ready?" (the main thread does, for each
+    /// question) must never create the runtime, which starts Metal and takes seconds, or wait for a thread that is.
+    private static let readyBox = ReadyBox()
+    private final class ReadyBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var key: String?
+        func get() -> String? { lock.withLock { key } }
+        func set(_ value: String?) { lock.withLock { key = value } }
+    }
     private var lastUsed = Date()
     private var idleCheck = 0
     private var pressure: DispatchSourceMemoryPressure?
@@ -124,7 +132,15 @@ final class LlamaRuntime: @unchecked Sendable {
     /// A model nobody has asked anything of for this long is released (it holds several GB).
     static let idleSeconds: TimeInterval = 600
 
+    /// Set when the app quits: a prompt or answer in progress stops at its next step, so quitting doesn't wait for it.
+    private let quitting = CancelFlag()
+    private static let created = CancelFlag()
+    /// Whether `shared` has been made. Making it starts llama.cpp's Metal backend (compiling its shaders takes seconds),
+    /// which quitting must not do just to release a model that was never loaded.
+    static var exists: Bool { created.value }
+
     private init() {
+        Self.created.value = true
         llama_backend_init()
         // Low memory: give the model back unless it's answering right now (it loads again on the next question).
         let source = DispatchSource.makeMemoryPressureSource(eventMask: .critical, queue: .global(qos: .utility))
@@ -140,8 +156,8 @@ final class LlamaRuntime: @unchecked Sendable {
     private static func key(path: String, contextTokens: Int32) -> String { "\(path)#\(contextTokens)" }
 
     /// True when this model is already in memory, so a question can start answering at once.
-    func isReady(file: URL, contextTokens: Int32) -> Bool {
-        stateLock.withLock { readyKey == Self.key(path: file.path, contextTokens: contextTokens) }
+    static func isReady(file: URL, contextTokens: Int32) -> Bool {
+        readyBox.get() == key(path: file.path, contextTokens: contextTokens)
     }
 
     /// Loads the model ahead of the first question. Blocking; call off the main thread. Errors are left for
@@ -184,6 +200,7 @@ final class LlamaRuntime: @unchecked Sendable {
     /// Releases the model and its context. Call before the process exits (the Mac app does this on quit):
     /// freeing them during exit() runs after ggml's own Metal teardown and crashes.
     func shutdown() {
+        quitting.value = true
         lock.lock()
         defer { lock.unlock() }
         unload()
@@ -218,7 +235,7 @@ final class LlamaRuntime: @unchecked Sendable {
         self.context = context
         self.loadedPath = path
         self.contextTokens = UInt32(contextTokens)
-        stateLock.withLock { readyKey = Self.key(path: path, contextTokens: contextTokens) }
+        Self.readyBox.set(Self.key(path: path, contextTokens: contextTokens))
     }
 
     private func unload() {
@@ -228,7 +245,7 @@ final class LlamaRuntime: @unchecked Sendable {
         model = nil
         loadedPath = nil
         prefixes = []
-        stateLock.withLock { readyKey = nil }
+        Self.readyBox.set(nil)
     }
 
     /// Formats the conversation with the model's own chat template.
@@ -288,9 +305,11 @@ final class LlamaRuntime: @unchecked Sendable {
             let status = batch.withUnsafeMutableBufferPointer { buf in
                 llama_decode(context, llama_batch_get_one(buf.baseAddress! + offset, Int32(count)))
             }
+            // 2: the abort callback stopped it partway (Stop was pressed). The caller clears the context before reuse.
+            if status == 2 && isCancelled() { return false }
             guard status == 0 else { throw LlamaError.decodeFailed(status) }
             offset += count
-            if isCancelled() { return false }
+            if isCancelled() || quitting.value { return false }
         }
         return true
     }
@@ -356,13 +375,22 @@ final class LlamaRuntime: @unchecked Sendable {
     }
 
     /// Generates a reply, calling `onText` with the full text so far. Blocking; call off the main thread.
+    /// Returns true when it stopped because it reached `maxTokens` rather than finishing its answer.
+    @discardableResult
     func generate(file: URL, contextTokens: Int32, custom: Bool, system: String, user: String, maxTokens: Int = 1024,
-                  isCancelled: () -> Bool, onText: (String) -> Void) throws {
+                  isCancelled: @escaping () -> Bool, onText: (String) -> Void) throws -> Bool {
         lock.lock()
         defer { lock.unlock(); touch() }
         try load(path: file.path, contextTokens: contextTokens, custom: custom)
         guard let model, let context else { throw LlamaError.contextFailed }
         let vocab = llama_model_get_vocab(model)
+        // Stop works inside a batch, not only between them: llama.cpp asks this before each step of the graph.
+        // It runs on the decoding thread, which holds `lock`, and takes no lock of its own. Cleared on the way out.
+        let quitting = self.quitting
+        let abort = AbortCheck { isCancelled() || quitting.value }   // Stop, or the app quitting
+        llama_set_abort_callback(context, { data in Unmanaged<AbortCheck>.fromOpaque(data!).takeUnretainedValue().check() },
+                                 Unmanaged.passUnretained(abort).toOpaque())
+        defer { llama_set_abort_callback(context, nil, nil) }
 
         let prompt = format(system: system, user: user, custom: custom)
         let needed = -llama_tokenize(vocab, prompt, Int32(prompt.utf8.count), nil, 0, true, true)
@@ -401,14 +429,14 @@ final class LlamaRuntime: @unchecked Sendable {
             #endif
         } else if let prefix = instructionTokens(system: system, custom: custom, vocab: vocab),
                   tokens.count > prefix.count, tokens.starts(with: prefix) {
-            guard try decode(tokens[..<prefix.count], context: context, isCancelled: isCancelled) else { return }
+            guard try decode(tokens[..<prefix.count], context: context, isCancelled: isCancelled) else { return false }
             keepPrefix(prefix, context: context)
             start = prefix.count
         }
         #if DEBUG
         Self.lastPrefill = (tokens.count, start)
         #endif
-        guard try decode(tokens[start...], context: context, isCancelled: isCancelled) else { return }
+        guard try decode(tokens[start...], context: context, isCancelled: isCancelled) else { return false }
         #if DEBUG
         if Self.measuresTimings { llama_synchronize(context) }
         timings.prefillMs = ms(since: began)
@@ -442,8 +470,9 @@ final class LlamaRuntime: @unchecked Sendable {
         var lastEmit: UInt64 = 0
         var showing = false
         let interval: UInt64 = 50_000_000
+        var ended = false          // finished its answer, or was stopped; otherwise it ran out of tokens
         for _ in 0..<maxTokens {
-            if isCancelled() { break }
+            if isCancelled() || quitting.value { ended = true; break }
             #if DEBUG
             let waiting = DispatchTime.now().uptimeNanoseconds
             if Self.measuresTimings { llama_synchronize(context) }
@@ -454,7 +483,7 @@ final class LlamaRuntime: @unchecked Sendable {
             #if DEBUG
             timings.sampleMs += ms(since: sampling)
             #endif
-            if llama_vocab_is_eog(vocab, token) { break }
+            if llama_vocab_is_eog(vocab, token) { ended = true; break }
             var n = llama_token_to_piece(vocab, token, &piece, Int32(piece.count), 0, false)
             if n < 0 {
                 piece = [CChar](repeating: 0, count: Int(-n))
@@ -462,6 +491,7 @@ final class LlamaRuntime: @unchecked Sendable {
             }
             if n > 0 { piece.withUnsafeBytes { bytes.append(contentsOf: $0.prefix(Int(n))) } }
             let status = llama_decode(context, llama_batch_get_one(&token, 1))
+            if status == 2 && isCancelled() { ended = true; break }
             guard status == 0 else { throw LlamaError.decodeFailed(status) }
             let now = DispatchTime.now().uptimeNanoseconds
             if !showing || now - lastEmit >= interval {
@@ -483,7 +513,14 @@ final class LlamaRuntime: @unchecked Sendable {
         timings.generateMs = ms(since: generating)
         #endif
         onText(Self.visibleAnswer(String(decoding: bytes, as: UTF8.self)).trimmingCharacters(in: .whitespacesAndNewlines))
+        return !ended
     }
+}
+
+/// Lets llama.cpp ask "should I stop?" from inside a decode.
+private final class AbortCheck {
+    let check: () -> Bool
+    init(_ check: @escaping () -> Bool) { self.check = check }
 }
 
 extension LlamaRuntime {
@@ -525,7 +562,7 @@ struct LlamaEngine: AnswerEngine {
     var sourceBudget: Int { min(14_000, (Int(contextTokens) - 1_700) * 3) }
 
     /// True when the model is already in memory.
-    var isReady: Bool { LlamaRuntime.shared.isReady(file: model.url, contextTokens: contextTokens) }
+    var isReady: Bool { LlamaRuntime.isReady(file: model.url, contextTokens: contextTokens) }
 
     /// Starts loading the model in the background, so the first question doesn't wait for it. With `instructions`,
     /// also evaluates them, so the first question starts answering sooner.
@@ -539,6 +576,10 @@ struct LlamaEngine: AnswerEngine {
     }
 
     func stream(instructions: String, prompt: String) -> AsyncThrowingStream<String, Error> {
+        stream(instructions: instructions, prompt: prompt, notes: StreamNotes())
+    }
+
+    func stream(instructions: String, prompt: String, notes: StreamNotes) -> AsyncThrowingStream<String, Error> {
         let model = self.model, contextTokens = self.contextTokens
         return AsyncThrowingStream { continuation in
             // Checked before loading: an oversized model would fail partway, or push the device out of memory.
@@ -552,9 +593,10 @@ struct LlamaEngine: AnswerEngine {
             let cancelled = CancelFlag()
             let thread = Thread {
                 do {
-                    try LlamaRuntime.shared.generate(file: model.url, contextTokens: contextTokens, custom: model.isCustom,
-                                                     system: instructions, user: prompt,
-                                                     isCancelled: { cancelled.value }) { continuation.yield($0) }
+                    let hitLimit = try LlamaRuntime.shared.generate(file: model.url, contextTokens: contextTokens, custom: model.isCustom,
+                                                                    system: instructions, user: prompt,
+                                                                    isCancelled: { cancelled.value }) { continuation.yield($0) }
+                    if hitLimit { notes.cutShort = true }
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)

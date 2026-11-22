@@ -54,6 +54,9 @@ final class WebSocket: @unchecked Sendable {
 
     var isClosed: Bool { lock.withLock { closed } }
 
+    /// Seconds since anything arrived from the device (the page checks in every couple of seconds).
+    var quietFor: TimeInterval { lock.withLock { -lastHeard.timeIntervalSinceNow } }
+
     func send(text: String) { send(opcode: 0x1, payload: Data(text.utf8), completion: nil) }
 
     func send(json: [String: Any]) {
@@ -131,17 +134,17 @@ final class WebSocket: @unchecked Sendable {
                 case .frame: continue
                 case .fail(let code):
                     self.close(code: code)
-                    self.end()
+                    self.end(hangUp: false)
                     return
                 case .closed:
-                    self.end()
+                    self.end(hangUp: false)   // our answering close frame is on its way; close() hangs up after it
                     return
                 }
                 break
             }
             if isComplete { self.end(); return }
             // A device sending more than one message's worth without finishing it is misbehaving.
-            if buffer.count > Self.maxMessage + 16 { self.close(code: 1009); self.end(); return }
+            if buffer.count > Self.maxMessage + 16 { self.close(code: 1009); self.end(hangUp: false); return }
             self.receive(buffer: buffer, fragments: fragments)
         }
     }
@@ -228,10 +231,11 @@ final class WebSocket: @unchecked Sendable {
              -lastHeard.timeIntervalSinceNow > Self.idleLimit)
         }
         if stalled { connection.cancel(); end() }
-        else if idle { close(code: 1001, reason: "No word from the device"); end() }
+        else if idle { close(code: 1001, reason: "No word from the device"); end(hangUp: false) }
     }
 
-    private func end() {
+    /// `hangUp: false` right after close(code:), which disconnects once the close frame is sent (or after 2 s).
+    private func end(hangUp: Bool = true) {
         let handler = lock.withLock { () -> (@Sendable () -> Void)? in
             guard !closed else { return nil }
             closed = true
@@ -243,7 +247,7 @@ final class WebSocket: @unchecked Sendable {
             return handler
         }
         guard let handler else { return }
-        connection.cancel()
+        if hangUp { connection.cancel() }
         handler()
     }
 }

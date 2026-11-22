@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Observation
 import CryptoKit
 
@@ -130,7 +130,10 @@ final class ShareDevices {
     var isSharing: Bool { share?.isRunning ?? false }
     var hasPIN: Bool { !(share?.pin.isEmpty ?? true) }
 
-    init() { load() }
+    init() {
+        load()
+        saveOnQuit()
+    }
 
     /// Called once by ShareController. The closures reach its private sign-in sessions; nothing else does.
     func attach(share: ShareController, library: Library, media: MediaLibrary,
@@ -258,6 +261,8 @@ final class ShareDevices {
         if devices[id]?.waitingSince != nil { devices[id]?.waitingSince = nil; ShareApprovalPanel.update() }
 
         offerCookie(res, id: id, had: cookie, port: port)
+        // Another device is using Share: keep the Mac from napping for the next few minutes (not for this Mac's own browser).
+        if !thisMac { ShareAwake.shared.deviceUsed() }
         track(res, device: id, download: port == .main && req.path.hasPrefix("/api/send/file/"))
         // Until it's signed in (with a PIN set), the only thing it can be doing is signing in.
         let signedIn = !hasPIN || token != nil
@@ -303,6 +308,12 @@ final class ShareDevices {
 
     /// "Playing <game>".
     func setPlaying(device id: String, game: String) { setActivity(device: id, symbol: "gamecontroller.fill", text: "Playing \(game)") }
+
+    /// A device with an open game socket checked in (it makes no other requests while it plays): it's still online.
+    func stillThere(device id: String) {
+        guard let seen = devices[id]?.lastSeen, -seen.timeIntervalSinceNow > 30 else { return }
+        devices[id]?.lastSeen = Date()
+    }
 
     // MARK: Identity
 
@@ -769,13 +780,31 @@ final class ShareDevices {
         saveTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled, let self else { return }
-            self.savedAt = Date()
-            let saved = self.devices.values.map { d in
-                Saved(id: d.id, cookies: Array(d.cookieIDs.subtracting([d.id]).sorted().prefix(8)), nickname: d.nickname,
-                      name: d.autoName, kind: d.kind, first: d.firstSeen, last: d.lastSeen)
-            }
-            if let data = try? JSONEncoder().encode(saved) {
-                KitSettings.shared.set(String(decoding: data, as: UTF8.self), forKey: Self.devicesKey)
+            self.saveNow()
+        }
+    }
+
+    /// Writes the device list now, in place of any write still waiting.
+    private func saveNow() {
+        saveTask?.cancel()
+        saveTask = nil
+        savedAt = Date()
+        let saved = devices.values.map { d in
+            Saved(id: d.id, cookies: Array(d.cookieIDs.subtracting([d.id]).sorted().prefix(8)), nickname: d.nickname,
+                  name: d.autoName, kind: d.kind, first: d.firstSeen, last: d.lastSeen)
+        }
+        if let data = try? JSONEncoder().encode(saved) {
+            KitSettings.shared.set(String(decoding: data, as: UTF8.self), forKey: Self.devicesKey)
+        }
+    }
+
+    /// Quitting within a few seconds of a change (a rename, a new device) writes it rather than losing it.
+    private func saveOnQuit() {
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.saveTask != nil else { return }
+                self.saveNow()
+                KitSettings.shared.flush()   // drive-mode settings are written after a pause; quitting can't wait for it
             }
         }
     }
@@ -788,7 +817,9 @@ final class ShareDevices {
         let spare = devices.values.filter { !keep($0) && !isOnline($0) }.sorted { $0.lastSeen < $1.lastSeen }
         for device in spare.prefix(devices.count - Self.maxDevices) { devices[device.id] = nil }
         if devices.count > Self.maxDevices {
-            for device in devices.values.filter({ !keep($0) }).sorted(by: { $0.lastSeen < $1.lastSeen }).prefix(devices.count - Self.maxDevices) {
+            // Never one seen in the last minute: admit() is holding the device it just created.
+            for device in devices.values.filter({ !keep($0) && -$0.lastSeen.timeIntervalSinceNow > 60 })
+                .sorted(by: { $0.lastSeen < $1.lastSeen }).prefix(devices.count - Self.maxDevices) {
                 devices[device.id] = nil
             }
         }

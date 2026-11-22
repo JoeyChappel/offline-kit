@@ -344,6 +344,9 @@ final class MacTransfers {
 
     /// Reconnects to downloads the system kept going while the app was closed.
     func restore() {
+        // Nothing saved means nothing to reconnect to; the background session (about 70 ms to create) waits until a
+        // transfer starts or the system relaunches the app for one.
+        guard !jobs.isEmpty else { return }
         _ = session
         #if DEBUG
         // Test hook: -fromMacOpen YES goes to Get, where the From your Mac card opens itself.

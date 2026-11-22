@@ -400,6 +400,22 @@ final class MediaLibrary {
             .trimmingCharacters(in: .whitespaces)
     }
 
+    /// The listening speed each audiobook was last set to, by progress key.
+    @ObservationIgnored private lazy var rates: [String: Float] = {
+        KitSettings.shared.string(forKey: "mediaRates").flatMap { $0.data(using: .utf8) }
+            .flatMap { try? JSONDecoder().decode([String: Float].self, from: $0) } ?? [:]
+    }()
+
+    func savedRate(for item: MediaItem) -> Float { rates[item.progressKey] ?? 1 }
+
+    func saveRate(_ rate: Float, for item: MediaItem) {
+        guard savedRate(for: item) != rate else { return }
+        rates[item.progressKey] = rate == 1 ? nil : rate
+        if let data = try? JSONEncoder().encode(rates), let text = String(data: data, encoding: .utf8) {
+            KitSettings.shared.set(text, forKey: "mediaRates")
+        }
+    }
+
     /// Where saved positions that haven't been published yet wait (see saveProgress).
     @ObservationIgnored private var unpublished: [String: MediaProgress] = [:]
     @ObservationIgnored private var persistTask: Task<Void, Never>?
@@ -410,13 +426,15 @@ final class MediaLibrary {
     /// - while playing, a few seconds of progress within the same chapter is held back from `progress`, so the screens
     ///   reading it don't redraw every tick; pausing, stopping and changing chapter publish it right away;
     /// - the settings file is written a moment later, off the main thread, and covers every save made meanwhile.
-    func saveProgress(_ value: MediaProgress, for item: MediaItem, stopped: Bool = false) {
+    func saveProgress(_ value: MediaProgress, for item: MediaItem, stopped: Bool = false, duration: Double? = nil) {
         let key = item.progressKey
+        // Credits and outros count as the end (see `atTheFinishLine`).
+        let adjusted = Self.applyingFinishLine(value, item: item, duration: duration ?? knownDuration(of: item, track: value.track))
         let known = unpublished[key] ?? progress[key]
-        let same = known.map { $0.track == value.track && $0.seconds == value.seconds && $0.finished == value.finished } ?? false
-        if item.kind == .video { updateStill(item, value, now: stopped) }
+        let same = known.map { $0.track == adjusted.track && $0.seconds == adjusted.seconds && $0.finished == adjusted.finished } ?? false
+        if item.kind == .video { updateStill(item, adjusted, now: stopped) }
         guard !same else { return }
-        var value = value
+        var value = adjusted
         value.updated = Date()
         let shown = progress[key]
         let quiet = !stopped && item.kind != .book && !value.finished && shown != nil && shown?.finished == false && (shown?.seconds ?? 0) >= 3
@@ -428,6 +446,29 @@ final class MediaLibrary {
             progress[key] = value
         }
         persist(soon: stopped)
+    }
+
+    /// The length of one track as the scan found it, for callers that don't have the player at hand (the web app, a phone).
+    private func knownDuration(of item: MediaItem, track: Int) -> Double? {
+        let details = info[item.progressKey]
+        if item.tracks.count == 1 { return details?.duration }
+        guard let tracks = details?.tracks, tracks.indices.contains(track) else { return nil }
+        return tracks[track].duration
+    }
+
+    /// True once playback is far enough into the last video or audio track that what's left is credits or an outro:
+    /// 95% through, or, for anything over ten minutes, the last minute. Such an item counts as finished, so it leaves
+    /// Keep Watching and Continue instead of sitting there at 99%.
+    nonisolated static func atTheFinishLine(position: Double, duration: Double) -> Bool {
+        guard duration > 0, position.isFinite else { return false }
+        return position / duration >= 0.95 || (duration >= 600 && duration - position <= 60)
+    }
+
+    /// The same save, marked finished when it's at the finish line of the last track. Books decide this themselves.
+    nonisolated static func applyingFinishLine(_ value: MediaProgress, item: MediaItem, duration: Double?) -> MediaProgress {
+        guard !value.finished, item.kind != .book, value.track == item.tracks.count - 1,
+              let duration, atTheFinishLine(position: value.seconds, duration: duration) else { return value }
+        return MediaProgress(track: value.track, seconds: 0, finished: true, updated: value.updated)
     }
 
     /// Writes the progress file once a moment from now (sooner when playback has just stopped). Saves that arrive
@@ -569,19 +610,64 @@ final class AudiobookDownloads {
         if !running { Task { await run() } }
     }
 
+    private var currentTask: Task<Void, Error>?
+    private var currentBook: Int?
+
+    /// Stops a download that is waiting or running. What it had fetched so far is removed, so no half-finished book shows up.
+    func cancel(_ book: LibriVoxBook) {
+        if let index = queue.firstIndex(where: { $0.id == book.id }) {
+            queue.remove(at: index)
+            states[book.id] = nil
+        } else if currentBook == book.id {
+            currentTask?.cancel()
+        }
+    }
+
+    /// The reason a download failed, in plain words.
+    nonisolated static func reason(for error: Error) -> String {
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            switch ns.code {
+            case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorTimedOut, NSURLErrorCannotFindHost,
+                 NSURLErrorCannotConnectToHost, NSURLErrorDNSLookupFailed, NSURLErrorInternationalRoamingOff, NSURLErrorDataNotAllowed:
+                return "Needs internet to download"
+            case NSURLErrorSecureConnectionFailed, NSURLErrorServerCertificateUntrusted:
+                return "Couldn’t make a safe connection to LibriVox"
+            default: break
+            }
+        }
+        if ns.domain == NSCocoaErrorDomain && ns.code == NSFileWriteOutOfSpaceError { return "Not enough room on the drive" }
+        if error is URLError || (error as? DecodingError) != nil { return "LibriVox didn’t answer properly. Try again in a little while" }
+        return "Couldn’t finish the download. Try again in a little while"
+    }
+
     private func run() async {
         running = true
         while !queue.isEmpty {
             let book = queue.removeFirst()
+            let task = Task { try await download(book) }
+            currentTask = task
+            currentBook = book.id
             do {
-                try await download(book)
+                try await task.value
                 states[book.id] = .done
                 onFinished?()
+            } catch is CancellationError {
+                discardPartial(book)
+            } catch let error as URLError where error.code == .cancelled {
+                discardPartial(book)
             } catch {
-                states[book.id] = .failed(error.localizedDescription)
+                states[book.id] = .failed(Self.reason(for: error))
             }
+            currentTask = nil
+            currentBook = nil
         }
         running = false
+    }
+
+    private func discardPartial(_ book: LibriVoxBook) {
+        states[book.id] = nil
+        if !isInstalled(book) { try? FileManager.default.removeItem(at: folder(for: book)) }
     }
 
     private struct Sections: Decodable {
@@ -638,13 +724,25 @@ final class MediaPlayback {
     private(set) var sleepDeadline: Date?
     private(set) var sleepAtChapterEnd = false
     private(set) var finished = false
+    /// Why the current file can't be played, in plain words. Nil while it plays (or is still opening).
+    private(set) var problem: String?
     private var shuffleOrder: [Int]?
-    var rate: Float = 1 { didSet { if isPlaying { player.rate = rate }; announce() } }
+    /// Listening speed. Remembered per audiobook, so a book set to 1.5× opens at 1.5× next time.
+    var rate: Float = 1 {
+        didSet {
+            if isPlaying { player.rate = rate }
+            if item.kind == .audio && rate != oldValue { library?.saveRate(rate, for: item) }
+            announce()
+        }
+    }
 
     @ObservationIgnored private var timeObserver: Any?
     @ObservationIgnored private var endObserver: NSObjectProtocol?
     @ObservationIgnored private weak var library: MediaLibrary?
     @ObservationIgnored private var lastSaved = Date.distantPast
+    @ObservationIgnored private var statusObservation: NSKeyValueObservation?
+    /// How long before a sleep timer ends the sound fades out.
+    nonisolated static let sleepFade: Double = 25
 
     init(item: MediaItem, library: MediaLibrary) {
         self.item = item
@@ -653,6 +751,7 @@ final class MediaPlayback {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: item.kind == .video ? .moviePlayback : .spokenAudio)
         try? AVAudioSession.sharedInstance().setActive(true)
         #endif
+        if item.kind == .audio { rate = library.savedRate(for: item) }
         let saved = library.progress[item.progressKey]
         let startTrack = saved.map { $0.finished ? 0 : min($0.track, item.tracks.count - 1) } ?? 0
         load(track: startTrack, at: saved.flatMap { $0.finished ? nil : $0.seconds } ?? 0)
@@ -669,6 +768,13 @@ final class MediaPlayback {
         if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
         timeObserver = nil
         endObserver = nil
+        statusObservation = nil
+        player.volume = 1
+    }
+
+    /// An album or song rather than an audiobook.
+    var isMusic: Bool {
+        item.kind == .audio && library.map { MediaCatalog.category(item, $0.info[item.progressKey]) == .music } == true
     }
 
     var trackTitle: String {
@@ -679,9 +785,21 @@ final class MediaPlayback {
         guard item.tracks.indices.contains(index) else { return }
         if player.currentItem != nil { save(force: true) }
         finished = false
+        problem = nil
         track = index
         let playerItem = AVPlayerItem(url: item.tracks[index])
         player.replaceCurrentItem(with: playerItem)
+        // A file that can't be opened never says so by itself: the player just stays black. Watch for it.
+        statusObservation = playerItem.observe(\.status, options: [.new]) { [weak self] observed, _ in
+            guard observed.status == .failed else { return }
+            let reason = observed.error
+            Task { @MainActor [weak self] in
+                guard let self, self.player.currentItem === observed else { return }
+                self.problem = Self.reason(for: reason)
+                self.isPlaying = false
+                self.announce()
+            }
+        }
         if seconds > 1 { player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) }
         current = seconds
         duration = 0
@@ -703,9 +821,33 @@ final class MediaPlayback {
         SystemMediaControls.shared.update(self, info: library?.info[item.progressKey])
     }
 
+    /// What to tell someone about a file that won't open. The system's own wording is for programmers.
+    private static func reason(for error: Error?) -> String {
+        if let error = error as NSError?, error.domain == NSURLErrorDomain || error.code == NSFileReadNoSuchFileError {
+            return "The file isn’t where the kit expects it. It may have been moved, or its drive unplugged."
+        }
+        return "It may be damaged, still copying, or in a format this device can’t play."
+    }
+
+    /// Stops after some minutes or at the end of the chapter. Either way the sound fades out over the last
+    /// `sleepFade` seconds, so it doesn't cut off. Calling it with nothing cancels the timer.
     func setSleep(minutes: Int? = nil, endOfChapter: Bool = false) {
         sleepDeadline = minutes.map { Date().addingTimeInterval(Double($0) * 60) }
         sleepAtChapterEnd = endOfChapter
+        if sleepDeadline == nil && !endOfChapter { player.volume = 1 }
+    }
+
+    /// Seconds until the sleep timer stops playback, if one is set and counting.
+    private var sleepRemaining: Double? {
+        if let deadline = sleepDeadline { return deadline.timeIntervalSinceNow }
+        if sleepAtChapterEnd, duration > 0 { return (duration - current) / Double(max(rate, 0.1)) }
+        return nil
+    }
+
+    private func fadeForSleep() {
+        guard let remaining = sleepRemaining else { if player.volume != 1 { player.volume = 1 }; return }
+        let volume = Float(min(1, max(0, remaining / Self.sleepFade)))
+        if abs(player.volume - volume) > 0.02 { player.volume = volume }
     }
 
     func play() {
@@ -750,7 +892,7 @@ final class MediaPlayback {
     private func tick(_ seconds: Double) {
         guard seconds.isFinite else { return }
         current = seconds
-        if let deadline = sleepDeadline, Date() >= deadline { setSleep(); pause() }
+        if let deadline = sleepDeadline, Date() >= deadline { setSleep(); pause(); player.volume = 1 } else { fadeForSleep() }
         if let d = player.currentItem?.duration.seconds, d.isFinite { duration = d }
         // The system player's own controls can pause or play too; keep the mini player in step.
         let playing = player.rate != 0
@@ -760,7 +902,7 @@ final class MediaPlayback {
 
     private func trackEnded() {
         let shouldSleep = sleepAtChapterEnd
-        if shouldSleep { setSleep(); pause() }
+        if shouldSleep { setSleep(); pause(); player.volume = 1 }
         if let nextTrack {
             load(track: nextTrack, play: !shouldSleep)
         } else {
@@ -774,6 +916,7 @@ final class MediaPlayback {
     private func save(force: Bool) {
         guard force || Date().timeIntervalSince(lastSaved) > 5 else { return }
         lastSaved = Date()
-        library?.saveProgress(MediaProgress(track: track, seconds: finished ? 0 : current, finished: finished), for: item, stopped: force)
+        library?.saveProgress(MediaProgress(track: track, seconds: finished ? 0 : current, finished: finished), for: item, stopped: force,
+                              duration: duration > 0 ? duration : nil)
     }
 }

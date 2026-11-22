@@ -91,6 +91,7 @@ final class DebouncedAction {
 
 @MainActor @Observable
 final class EPUBReaderModel {
+    nonisolated static let defaultTextScale = 1.1
     let item: MediaItem
     private(set) var book: EPUBBook?
     private(set) var zip: ZipReader?
@@ -108,7 +109,7 @@ final class EPUBReaderModel {
     init(item: MediaItem) {
         self.item = item
         theme = ReaderTheme(rawValue: KitSettings.shared.string(forKey: "readerTheme") ?? "") ?? .light
-        textScale = Double(KitSettings.shared.string(forKey: "readerTextScale") ?? "") ?? 1.1
+        textScale = Double(KitSettings.shared.string(forKey: "readerTextScale") ?? "") ?? Self.defaultTextScale
         if let (book, zip) = EPUBBook.open(item.tracks[0]) { self.book = book; self.zip = zip }
     }
 
@@ -129,8 +130,23 @@ final class EPUBReaderModel {
         }
     }
 
-    func go(to index: Int, at scroll: Double = 0) {
+    /// Where the reader was before a jump from Contents or a link, so one tap goes back. Fades after a while.
+    private(set) var returnPlace: (chapter: Int, scroll: Double)?
+    @ObservationIgnored private var returnTask: Task<Void, Never>?
+
+    /// Jumps to a chapter. `remember` keeps the place left behind for "Back to where you were"; the Previous and Next
+    /// buttons don't, since they can undo each other.
+    func go(to index: Int, at scroll: Double = 0, remember: Bool = false) {
         guard let book, book.chapters.indices.contains(index) else { return }
+        returnTask?.cancel()
+        returnPlace = nil
+        if remember, index != chapter {
+            returnPlace = (chapter, fraction)
+            returnTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(12))
+                if !Task.isCancelled { self?.returnPlace = nil }
+            }
+        }
         chapter = index
         pendingScroll = scroll
         fraction = scroll
@@ -143,9 +159,25 @@ final class EPUBReaderModel {
 
     func saveNow() {
         saver.cancel()
-        guard let media, let book else { return }
-        let done = chapter == book.chapters.count - 1 && fraction > 0.97
+        guard let media, book != nil else { return }
+        // Reading the last real chapter to its end counts, and so does reaching a license page after it.
+        let last = lastReadableChapter
+        let done = chapter > last || (chapter == last && fraction > 0.95)
         media.saveProgress(MediaProgress(track: chapter, seconds: done ? 0 : fraction, finished: done), for: item)
+    }
+
+    /// The last chapter that is the book itself. Project Gutenberg files and others end with a license or copyright
+    /// page that nobody reads, so finishing the story is what counts as finishing the book.
+    var lastReadableChapter: Int {
+        guard let book else { return 0 }
+        var index = book.chapters.count - 1
+        while index > 0, Self.isBackMatter(book.chapters[index].title) { index -= 1 }
+        return index
+    }
+
+    nonisolated static func isBackMatter(_ title: String) -> Bool {
+        let text = title.lowercased()
+        return ["license", "licence", "gutenberg", "colophon", "copyright", "transcriber", "terms of use"].contains { text.contains($0) }
     }
 
     var css: String {
@@ -165,6 +197,7 @@ private struct EPUBReaderView: View {
     @State private var model: EPUBReaderModel
     @State private var showingAppearance = false
     @State private var compact = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(item: MediaItem) { _model = State(initialValue: EPUBReaderModel(item: item)) }
 
@@ -172,7 +205,9 @@ private struct EPUBReaderView: View {
         Group {
             if let book = model.book, let zip = model.zip {
                 VStack(spacing: 0) {
-                    if model.ready { EPUBWebView(model: model, zip: zip) } else { Color.clear }
+                    Group { if model.ready { EPUBWebView(model: model, zip: zip) } else { Color.clear } }
+                        .overlay(alignment: .bottom) { backToPlace }
+                        .animation(Motion.gentle(reduceMotion), value: model.returnPlace != nil)
                     bottomBar(book)
                 }
                 .background(Color(hex: model.theme.background))
@@ -191,7 +226,7 @@ private struct EPUBReaderView: View {
                 if let book = model.book {
                     Menu {
                         ForEach(Array(book.chapters.enumerated()), id: \.offset) { index, chapter in
-                            Button { model.go(to: index) } label: {
+                            Button { model.go(to: index, remember: true) } label: {
                                 if index == model.chapter { Label(chapter.title, systemImage: "checkmark") } else { Text(chapter.title) }
                             }
                         }
@@ -213,12 +248,29 @@ private struct EPUBReaderView: View {
                 Button("Smaller Text", action: smallerText).keyboardShortcut("-", modifiers: .command)
                 Button("Larger Text", action: largerText).keyboardShortcut("+", modifiers: .command)
                 Button("Larger Text", action: largerText).keyboardShortcut("=", modifiers: .command)
+                Button("Reset Text Size", action: resetText).keyboardShortcut("0", modifiers: .command)
             }.opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+        }
+    }
+
+    /// After a jump from Contents or a link: one tap returns to the page the reader was on.
+    @ViewBuilder private var backToPlace: some View {
+        if let place = model.returnPlace {
+            Button { model.go(to: place.chapter, at: place.scroll) } label: {
+                Label("Back to where you were", systemImage: "arrow.uturn.backward").font(.callout.weight(.medium))
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+            }
+            .buttonStyle(.plain)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().strokeBorder(.secondary.opacity(0.3), lineWidth: 0.5))
+            .padding(.bottom, 14)
+            .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
         }
     }
 
     private func smallerText() { model.textScale = max(0.8, model.textScale - 0.1) }
     private func largerText() { model.textScale = min(2.2, model.textScale + 0.1) }
+    private func resetText() { model.textScale = EPUBReaderModel.defaultTextScale }
 
     private var appearance: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -232,6 +284,10 @@ private struct EPUBReaderView: View {
                 Spacer(minLength: 0)
                 Button("A+", action: largerText).disabled(model.textScale >= 2.2).accessibilityLabel("Larger text")
             }.buttonStyle(.bordered)
+            Button("Reset to \(Int((EPUBReaderModel.defaultTextScale * 100).rounded()))%", action: resetText)
+                .buttonStyle(.borderless).font(.callout).frame(maxWidth: .infinity)
+                .disabled(abs(model.textScale - EPUBReaderModel.defaultTextScale) < 0.01)
+                .help("Reset text size (⌘0)")
             Divider()
             Text("Page color").font(.subheadline.weight(.semibold))
             HStack(spacing: 14) {
@@ -258,8 +314,8 @@ private struct EPUBReaderView: View {
                 if compact { Image(systemName: "chevron.left") } else { Label("Previous", systemImage: "chevron.left") }
             }
                 .accessibilityLabel("Previous section")
-                .keyboardShortcut(.leftArrow, modifiers: [])
-                .help("Previous section (←)")
+                .keyboardShortcut(.leftArrow, modifiers: .command)
+                .help("Previous section (⌘←)")
                 .disabled(model.chapter == 0)
             VStack(spacing: 4) {
                 Text(book.chapters[model.chapter].title).font(.callout.weight(.medium)).lineLimit(1)
@@ -276,8 +332,8 @@ private struct EPUBReaderView: View {
             }
                 .accessibilityLabel("Next section")
                 .labelStyle(.titleAndIcon)
-                .keyboardShortcut(.rightArrow, modifiers: [])
-                .help("Next section (→)")
+                .keyboardShortcut(.rightArrow, modifiers: .command)
+                .help("Next section (⌘→)")
                 .disabled(model.chapter + 1 >= book.chapters.count)
         }
         .buttonStyle(.bordered)
@@ -390,7 +446,7 @@ private struct EPUBWebView: PlatformViewRepresentable {
                 var path = url.path(percentEncoded: false)
                 if path.hasPrefix("/") { path.removeFirst() }
                 if let index = book.chapters.firstIndex(where: { $0.path == path }), index != model.chapter {
-                    model.go(to: index)
+                    model.go(to: index, remember: true)
                     return .cancel
                 }
             }

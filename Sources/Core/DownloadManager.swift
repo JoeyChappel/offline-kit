@@ -16,6 +16,10 @@ final class DownloadJob: @MainActor Identifiable {
     var state: State = .queued
     /// For single-URL downloads (AI models) that have no Kiwix .meta4 mirror list.
     var presetMeta: Metalink?
+    /// Paused because the internet dropped (not by the person). These restart by themselves when it comes back.
+    var waitingForInternet = false
+    /// A failure that may clear by itself on a retry (a mirror hiccup), as opposed to a full drive or a bad checksum.
+    fileprivate var failureMayClear = false
     fileprivate var task: Task<Void, Never>?
 
     var id: String { folder.path + "/" + fileName }
@@ -38,6 +42,7 @@ final class DownloadJob: @MainActor Identifiable {
         switch state {
         case .queued: return "Waiting · \(fmt(total))"
         case .preparing: return "Contacting mirrors…"
+        case .paused where waitingForInternet: return "Waiting for the internet · \(fmt(done)) of \(fmt(total))"
         case .paused: return "Paused · \(fmt(done)) of \(fmt(total))"
         case .verifying: return "Checking the file · \(Int(fraction * 100))%"
         case .done: return "Installed · \(fmt(total))"
@@ -65,6 +70,15 @@ final class DownloadManager {
     var activeCount: Int { jobs.filter { $0.isActive || $0.state == .queued }.count }
     /// Download speed smoothed across chunks and carried between files, for steady time estimates.
     private(set) var smoothedSpeed: Double = 0
+    @ObservationIgnored private var reconnectObserver: NSObjectProtocol?
+
+    init() {
+        // Touching the shared watch starts it. When the internet comes back, downloads it interrupted start again.
+        _ = NetworkWatch.shared
+        reconnectObserver = NotificationCenter.default.addObserver(forName: .networkDidReconnect, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.internetReturned() }
+        }
+    }
 
     /// One line of progress for everything in the list, for the sidebar, Library and onboarding.
     var summary: DownloadSummary? {
@@ -93,10 +107,14 @@ final class DownloadManager {
             ("After a disaster", 645_000_000, 0, .queued),
             ("Safe drinking water", 21_000_000, 0, .queued),
         ]
+        // -sampleDownloads offline: the Wi-Fi dropped mid-batch, and one download failed for another reason.
+        let offline = UserDefaults.standard.string(forKey: "sampleDownloads") == "offline"
         for (title, total, done, state) in items {
+            let state: DownloadJob.State = offline && state == .downloading ? .paused : offline && title == "Safe drinking water" ? .failed("The file didn't match its checksum after two repair attempts. Delete it and try again.") : state
             let job = DownloadJob(fileName: title + ".zim", title: title, name: title, metalinkURL: URL(string: "https://example.invalid")!,
                                   folder: folder, total: total)
             job.done = done; job.state = state
+            job.waitingForInternet = offline && state == .paused
             if state == .downloading { job.bytesPerSecond = 6_500_000 }
             jobs.append(job)
         }
@@ -186,6 +204,7 @@ final class DownloadManager {
     func pause(_ job: DownloadJob) {
         job.task?.cancel()
         job.task = nil
+        job.waitingForInternet = false
         job.state = .paused
         pump()
     }
@@ -196,7 +215,50 @@ final class DownloadManager {
         pump()
     }
 
-    func resumeAll() { for job in jobs where job.state == .paused { job.state = .queued }; pump() }
+    func resumeAll() {
+        for job in jobs where job.state == .paused { job.waitingForInternet = false; job.state = .queued }
+        pump()
+    }
+
+    var hasFailed: Bool { jobs.contains { if case .failed = $0.state { return true } else { return false } } }
+
+    /// Queues every paused or failed download again.
+    func retryAll() {
+        for job in jobs {
+            if case .failed = job.state { job.waitingForInternet = false; job.state = .queued }
+        }
+        resumeAll()
+    }
+
+    /// Restarts what the internet dropping stopped, and failures that may clear on their own. Downloads the person
+    /// paused, and ones that failed for a reason a retry won't fix (full drive, bad checksum), stay as they are.
+    func internetReturned() {
+        for job in jobs {
+            if job.state == .paused && job.waitingForInternet {
+                job.waitingForInternet = false
+                job.state = .queued
+            } else if case .failed = job.state, job.failureMayClear {
+                job.failureMayClear = false
+                job.state = .queued
+            }
+        }
+        pump()
+    }
+
+    /// Whether an error means "no internet right now" rather than a real failure.
+    nonisolated static func isNetworkTrouble(_ error: Error) -> Bool {
+        if let download = error as? DownloadError {
+            if case .allMirrorsFailed = download { return true }
+            return false
+        }
+        guard let url = error as? URLError else { return false }
+        switch url.code {
+        case .notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotFindHost, .cannotConnectToHost,
+             .dnsLookupFailed, .internationalRoamingOff, .dataNotAllowed, .secureConnectionFailed:
+            return true
+        default: return false
+        }
+    }
 
     /// At launch, picks up only downloads into this Mac's own kit (or the drive the app runs from). Ones left on
     /// another drive wait for a click, so plugging a drive in never starts downloads by itself.
@@ -268,8 +330,19 @@ final class DownloadManager {
             } catch let error as URLError where error.code == .cancelled {
                 // Same as above.
             } catch {
-                job.state = .failed(error.localizedDescription)
                 job.task = nil
+                if Self.isNetworkTrouble(error), !NetworkWatch.shared.isOnline || !(error is DownloadError) {
+                    // The internet dropped: wait for it rather than calling this a failure.
+                    job.bytesPerSecond = 0
+                    job.waitingForInternet = true
+                    job.state = .paused
+                } else {
+                    switch error as? DownloadError {
+                    case .noSpace?, .fat32?, .checksum?: job.failureMayClear = false
+                    default: job.failureMayClear = true
+                    }
+                    job.state = .failed(error.localizedDescription)
+                }
             }
             self?.pump()
         }

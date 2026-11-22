@@ -38,6 +38,7 @@ final class ShareController {
     private static let networksKey = "shareNetworks"
     var pin: String {
         didSet {
+            guard pin != oldValue else { return }
             KitSettings.shared.set(pin, forKey: "sharePIN")
             sessions.removeAll()   // a new PIN signs everyone out
             bookTokens.removeAll()
@@ -266,6 +267,7 @@ final class ShareController {
     }
 
     private func stop() {
+        ShareAwake.shared.release()
         GameStreamHub.shared.shutDown()
         server?.stop()
         server = nil

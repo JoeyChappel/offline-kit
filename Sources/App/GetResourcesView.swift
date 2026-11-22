@@ -96,6 +96,7 @@ struct SaveLocation: Identifiable, Hashable {
 struct GetResourcesView: View {
     @Environment(KitNavigation.self) private var navigation
     @Environment(Library.self) private var library
+    @FocusState private var searchFocused: Bool
     @Environment(DownloadManager.self) private var downloads
 
     @State private var catalog: Catalog?
@@ -144,6 +145,7 @@ struct GetResourcesView: View {
             .safeAreaInset(edge: .bottom) { if !wide && catalog != nil { footer } }
         }
         .background(Design.canvas)
+        .findShortcut($searchFocused)
         .sheet(isPresented: $reviewing) { review }
         .onAppear {
             area = navigation.resourceArea
@@ -261,7 +263,7 @@ struct GetResourcesView: View {
     private var resourceSearch: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField("Search resources", text: $query).textFieldStyle(.plain)
+            TextField("Search resources", text: $query).textFieldStyle(.plain).focused($searchFocused)
             if !query.isEmpty {
                 Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }
                     .buttonStyle(.plain).foregroundStyle(.secondary).accessibilityLabel("Clear resource search")
@@ -759,7 +761,9 @@ struct DownloadsCard: View {
             HStack {
                 Text("Downloads").font(.title2.bold())
                 Spacer(minLength: 0)
-                if downloads.jobs.contains(where: { $0.state == .paused }) {
+                if downloads.hasFailed {
+                    Button("Retry All", systemImage: "arrow.clockwise") { downloads.retryAll() }.buttonStyle(.bordered)
+                } else if downloads.jobs.contains(where: { $0.state == .paused }) {
                     Button("Resume All") { downloads.resumeAll() }.buttonStyle(.bordered)
                 }
             }

@@ -345,6 +345,7 @@ struct MediaPlayerView: View {
                                 }.padding(18).background(MediaTheme.surface, in: RoundedRectangle(cornerRadius: 14)).foregroundStyle(MediaTheme.ink).padding(24).padding(.bottom, 48)
                             }
                         }
+                        .overlay { if let problem = playback.problem { UnplayableFile(playback: playback, problem: problem).background(.black) } }
                         .onChange(of: playback.finished) {
                             if playback.finished, !cancelledNext, MediaCatalog.chainsToNext(item, duration: playback.duration, info: media.info), let next = MediaCatalog.nextVideo(after: item, items: media.items, info: media.info, progress: media.progress) { advance(next) }
                         }
@@ -381,6 +382,7 @@ struct AudioPlayerView: View {
                         Text(MediaCatalog.trackTitle(playback.item, info, playback.track)).font(.headline).multilineTextAlignment(.center)
                         if !music { Text("Chapter \(playback.track + 1) of \(playback.item.tracks.count)").font(.caption).foregroundStyle(MediaTheme.muted) }
                     }
+                    if let problem = playback.problem { UnplayableFile(playback: playback, problem: problem).frame(minHeight: 150) }
                     VStack {
                         Slider(value: Binding(get: { scrubbing ?? (playback.duration > 0 ? min(1, max(0, playback.current / playback.duration)) : 0) }, set: { scrubbing = $0 }), onEditingChanged: { editing in if !editing, let value = scrubbing { playback.seek(to: value); scrubbing = nil } })
                             .accessibilityLabel("Playback position")
@@ -388,19 +390,31 @@ struct AudioPlayerView: View {
                     }
                     HStack(spacing: 20) {
                         Button("Previous", systemImage: "backward.end.fill") { playback.previous() }.labelStyle(.iconOnly).disabled(playback.track == 0 && playback.current < 5)
-                        if !music { Button("Back 15 seconds", systemImage: "gobackward.15") { playback.skip(-15) }.labelStyle(.iconOnly) }
+                        if !music {
+                            Button("Back 15 seconds", systemImage: "gobackward.15") { playback.skip(-15) }.labelStyle(.iconOnly)
+                                #if os(macOS)
+                                .help("Back 15 seconds (←)")
+                                #else
+                                .keyboardShortcut(.leftArrow, modifiers: [])
+                                #endif
+                        }
                         Button { playback.toggle() } label: { Image(systemName: playback.isPlaying ? "pause.circle.fill" : "play.circle.fill").font(.system(size: 62)) }.accessibilityLabel(playback.isPlaying ? "Pause" : "Play")
                             #if os(macOS)
                             .help(playback.isPlaying ? "Pause (Space or ⌘.)" : "Play (Space or ⌘.)")
                             #endif
-                        if !music { Button("Forward 30 seconds", systemImage: "goforward.30") { playback.skip(30) }.labelStyle(.iconOnly) }
+                        if !music {
+                            Button("Forward 30 seconds", systemImage: "goforward.30") { playback.skip(30) }.labelStyle(.iconOnly)
+                                #if os(macOS)
+                                .help("Forward 30 seconds (→)")
+                                #else
+                                .keyboardShortcut(.rightArrow, modifiers: [])
+                                #endif
+                        }
                         Button("Next", systemImage: "forward.end.fill") { playback.next() }.labelStyle(.iconOnly).disabled(playback.nextTrack == nil)
                     }.font(.title2).buttonStyle(.plain).foregroundStyle(MediaTheme.accent).controlSize(.large)
-                    if !music {
-                        ViewThatFits(in: .horizontal) {
-                            HStack(spacing: 16) { listeningTools(proxy) }
-                            VStack(spacing: 16) { listeningTools(proxy) }
-                        }
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 16) { listeningTools(proxy) }
+                        VStack(spacing: 16) { listeningTools(proxy) }
                     }
                     MediaTrackList(item: playback.item, info: info, progress: MediaProgress(track: playback.track, seconds: playback.current, finished: playback.finished), play: { playback.load(track: $0, play: true) }).id("tracks")
                 }.frame(maxWidth: 600).padding(24).frame(maxWidth: .infinity)
@@ -412,23 +426,68 @@ struct AudioPlayerView: View {
             }.tint(MediaTheme.accent).environment(\.colorScheme, .dark)
     }
     @ViewBuilder private func listeningTools(_ proxy: ScrollViewProxy) -> some View {
-        Menu {
-            ForEach([0.75, 1, 1.25, 1.5, 1.75, 2] as [Float], id: \.self) { rate in Button("\(rate.formatted())×") { playback.rate = rate } }
-        } label: { Label("\(playback.rate.formatted())× Speed", systemImage: "speedometer") }
+        if !music {
+            Menu {
+                ForEach([0.75, 1, 1.25, 1.5, 1.75, 2] as [Float], id: \.self) { rate in Button("\(rate.formatted())×") { playback.rate = rate } }
+            } label: { Label("\(playback.rate.formatted())× Speed", systemImage: "speedometer") }
+        }
+        SleepTimerMenu(playback: playback)
+        if !music { Button("Chapters", systemImage: "list.bullet") { proxy.scrollTo("tracks", anchor: .top) } }
+    }
+}
+
+/// Stops playback after a while or at the end of the chapter, fading the sound out at the end.
+/// Used by the full player and the mini player.
+struct SleepTimerMenu: View {
+    let playback: MediaPlayback
+    /// The mini player shows just the moon.
+    var iconOnly = false
+    var body: some View {
         Menu {
             Button("Off") { playback.setSleep() }
             ForEach([15, 30, 60], id: \.self) { value in Button("\(value) minutes") { playback.setSleep(minutes: value) } }
-            Button("End of chapter") { playback.setSleep(endOfChapter: true) }
-        } label: { Label(sleepLabel, systemImage: "moon") }
-        Button("Chapters", systemImage: "list.bullet") { proxy.scrollTo("tracks", anchor: .top) }
+            Button(music ? "End of this song" : "End of chapter") { playback.setSleep(endOfChapter: true) }
+        } label: {
+            if iconOnly { Image(systemName: active ? "moon.zzz.fill" : "moon").accessibilityLabel(label) } else { Label(label, systemImage: active ? "moon.zzz.fill" : "moon") }
+        }
+        .menuIndicator(iconOnly ? .hidden : .automatic)
+        .help(active ? label : "Sleep timer: stop playing after a while, with the sound fading out")
     }
+    @Environment(MediaLibrary.self) private var media
+    private var music: Bool { MediaCatalog.category(playback.item, media.info[playback.item.progressKey]) == .music }
+    private var active: Bool { playback.sleepAtChapterEnd || playback.sleepDeadline != nil }
     /// "Sleep · 12 min left". Redrawn as playback ticks, so it counts down.
-    private var sleepLabel: String {
-        if playback.sleepAtChapterEnd { return "Sleep · End of chapter" }
+    private var label: String {
+        if playback.sleepAtChapterEnd { return music ? "Sleep · End of song" : "Sleep · End of chapter" }
         guard let deadline = playback.sleepDeadline else { return "Sleep timer" }
         _ = playback.current   // re-read on every tick
         let minutes = max(1, Int((deadline.timeIntervalSinceNow / 60).rounded(.up)))
         return "Sleep · \(minutes) min left"
+    }
+}
+
+/// "This file won't play", with the reason and, on Mac, a way to find the file.
+struct UnplayableFile: View {
+    let playback: MediaPlayback
+    let problem: String
+    var body: some View {
+        ContentUnavailableView {
+            Label("This file won’t play", systemImage: "exclamationmark.triangle")
+        } description: {
+            VStack(spacing: 6) {
+                Text(playback.item.tracks.count > 1 ? playback.trackTitle : playback.item.tracks[playback.track].lastPathComponent).font(.callout.weight(.medium))
+                Text(problem)
+            }
+        } actions: {
+            #if os(macOS)
+            Button("Show in Finder", systemImage: "folder") { NSWorkspace.shared.activateFileViewerSelecting([playback.item.tracks[playback.track]]) }
+            #endif
+            if playback.item.tracks.count > 1, playback.nextTrack != nil {
+                Button("Skip to the Next One", systemImage: "forward.end") { playback.next() }
+            }
+        }
+        .environment(\.colorScheme, .dark)
+        .accessibilityElement(children: .contain)
     }
 }
 
