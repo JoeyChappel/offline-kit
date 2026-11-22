@@ -147,10 +147,7 @@ enum Bench {
     /// after the conversation so far was prepared and restored.
     /// usage: OFFLINEKIT_GREEDY=1 okit --followup-check <conversations.txt>   (okit --ask-bench's format)
     static func followUpCheck(file: String) async {
-        let text = (try? String(contentsOfFile: file, encoding: .utf8)) ?? ""
-        let conversations = text.components(separatedBy: "\n---").map {
-            $0.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !$0.hasPrefix("#") }
-        }.filter { $0.count >= 2 }
+        let conversations = AskQuality.conversations(file: file).map { $0.map(\.text) }.filter { $0.count >= 2 }
         let library = Library()
         await library.reload()
         await prepare(library: library)

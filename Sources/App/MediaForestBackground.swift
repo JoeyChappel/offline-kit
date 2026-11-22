@@ -27,6 +27,10 @@ struct MediaForestBackground: View {
             guard !Task.isCancelled else { return }
             image = result
         }
+        #if os(iOS)
+        // On iPhone the picture reaches behind the status bar and tab bar; without this a white band showed at the top.
+        .ignoresSafeArea()
+        #endif
         .accessibilityHidden(true)
         .allowsHitTesting(false)
     }

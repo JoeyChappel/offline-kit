@@ -51,7 +51,7 @@ final class PDFIndex: @unchecked Sendable {
     }
 
     private static func cacheURL(_ id: String) -> URL {
-        URL.cachesDirectory.appending(path: "OfflineKit/pdf-text/\(id).json")
+        KitLocation.caches.appending(path: "OfflineKit/pdf-text/\(id).json")
     }
 
     private static func build(_ archive: ZimArchive) -> [Chunk] {

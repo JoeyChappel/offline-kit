@@ -105,8 +105,10 @@ struct PrepareView: View {
                             } label: {
                                 Label("Private supply inventory", systemImage: "lock.fill").font(.callout).foregroundStyle(.secondary)
                             }
-                        } else if tab == .people || tab == .home || tab == .calculators {
+                        } else if tab == .people || tab == .home || tab == .calculators || tab == .powerOut || tab == .guides {
                             PrivacyNote { open(.privacy) }
+                        } else if tab == .privacy {
+                            EmptyView()
                         } else {
                             KitHeading(eyebrow: "PREPARE", title: "Get ready before you need it.",
                                        subtitle: "Tell Offline Kit about your household and supplies so Ask can give answers that fit you.")
@@ -119,7 +121,7 @@ struct PrepareView: View {
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 28)
-                .frame(maxWidth: [.supplies, .people, .home, .calculators].contains(tab) ? 1100 : 860, alignment: .leading)
+                .frame(maxWidth: [.supplies, .people, .home, .calculators, .powerOut, .guides, .privacy].contains(tab) ? 1100 : 860, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
             .onChange(of: focusPerson) {
@@ -920,20 +922,77 @@ struct AskKnowledgeSection: View {
     @State private var memoryOwner: UUID?
     @State private var confirmErase = false
     @State private var confirmClearHistory = false
+    @State private var section = KnowledgeTab.controls
+    @State private var showingContext = false
+    @State private var processing = "Checking answer engine…"
+    @State private var processingDetail = ""
+
+    private enum KnowledgeTab: String, CaseIterable, Identifiable {
+        case controls = "Controls", facts = "Noted facts", history = "History", storage = "Storage & erasure"
+        var id: Self { self }
+    }
 
     var body: some View {
-        if household.isLocked {
-            UnlockPrivateDetails().card(padding: 18)
-        } else {
-            details
+        Group {
+            if household.isLocked { UnlockPrivateDetails().card(padding: 18) }
+            else { details }
         }
+        .sheet(isPresented: $showingContext) {
+            NavigationStack {
+                ScrollView {
+                    if household.isLocked { UnlockPrivateDetails().padding(24) }
+                    else { fullContext.padding(24) }
+                }.background(Design.canvas)
+                    .navigationTitle("Exactly what Ask sees")
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { showingContext = false } } }
+            }
+            #if os(macOS)
+            .frame(width: 700, height: 620)
+            #endif
+        }
+        .task(id: destinationKey) { await checkDestination() }
     }
 
     @ViewBuilder private var details: some View {
-        @Bindable var household = household
         let _ = household.storeChanges
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("What Ask knows").font(.title.bold())
+                Text("Choose what personal details Ask can use, and review what it remembers.").font(.callout).foregroundStyle(.secondary)
+            }
+            ViewThatFits(in: .horizontal) {
+                Picker("Privacy area", selection: $section) { navigationOptions }.pickerStyle(.segmented).frame(minWidth: 600)
+                Picker("Privacy area", selection: $section) { navigationOptions }.pickerStyle(.menu)
+            }
+            switch section {
+            case .controls:
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 20) {
+                        controls.frame(minWidth: 380, maxWidth: .infinity)
+                        contextSummary.frame(minWidth: 280, maxWidth: 360)
+                    }
+                    VStack(alignment: .leading, spacing: 18) { controls; contextSummary }
+                }
+            case .facts: facts
+            case .history: history
+            case .storage: storage
+            }
+            if let error = household.saveError {
+                Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+        }
+    }
+
+    @ViewBuilder private var navigationOptions: some View {
+        ForEach(KnowledgeTab.allCases) { tab in
+            Text(tab == .facts ? "Noted facts (\(household.data.memories.count))" : tab == .history ? "History (\(household.data.history.count))" : tab.rawValue).tag(tab)
+        }
+    }
+
+    private var controls: some View {
+        @Bindable var household = household
         let p = household.data.privacy
-        VStack(alignment: .leading, spacing: 16) {
+        return VStack(alignment: .leading, spacing: 16) {
             SectionCard(symbol: "slider.horizontal.3", title: "What Ask can use",
                         subtitle: "Turn any of these off at any time. Off means Ask doesn’t see it.") {
                 Toggle("Personalize answers", isOn: $household.data.privacy.personalize).font(.body.weight(.semibold))
@@ -944,20 +1003,48 @@ struct AskKnowledgeSection: View {
                     Toggle("Note new facts from questions", isOn: $household.data.privacy.learnMemories)
                 }
                 .disabled(!p.personalize)
+            }
+
+            SectionCard(symbol: "bubble.left", title: "Question history", subtitle: "History is controlled separately from personalization. \(household.data.history.count) saved.") {
                 Toggle("Keep a history of questions and answers", isOn: $household.data.privacy.keepHistory)
             }
+        }
+    }
 
-            SectionCard(symbol: "eye", title: "Exactly what Ask sees",
-                        subtitle: "This text goes with each question you ask on this device, for the person shown. " + (model.usesHomeNetwork ? PrivacyNote.askDestination(homeNetwork: true) : "It never leaves this device.") + " The small on-device model gets a shorter version. Questions from other devices over Wi-Fi never include it.") {
-                let text = AskContext.build(household.data, kit: AskModel.kitSummary(library), limit: 4_000)
-                Text(text.isEmpty ? "Nothing yet." : text)
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(12)
-                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    private var contextSummary: some View {
+        SectionCard(symbol: "eye", title: "Exactly what Ask sees") {
+            LabeledContent("Person asking", value: household.activePerson.map { $0.name.isBlank ? "Unnamed" : $0.name } ?? "Someone else")
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Processing: \(processing)").font(.callout.weight(.medium))
+                if !processingDetail.isEmpty { Text(processingDetail).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
             }
+            Divider()
+            Text("The small on-device model gets a shorter version. Questions from other devices over Wi-Fi never include personal details.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Button("View full context", systemImage: "eye") { showingContext = true }.buttonStyle(.bordered)
+            Divider()
+            Label(PrivateStore.whereText, systemImage: "lock.fill").font(.caption).foregroundStyle(.secondary)
+        }
+    }
 
+    private var fullContext: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Person asking: \(household.activePerson.map { $0.name.isBlank ? "Unnamed" : $0.name } ?? "Someone else")").font(.headline)
+            Text("Processing: \(processing)").font(.callout)
+            Text(processingDetail).font(.caption).foregroundStyle(.secondary)
+            Text("Personal details available to Ask. Smaller on-device models receive a shorter version. Questions over Wi-Fi sharing never include personal details.")
+                .font(.caption).foregroundStyle(.secondary)
+            let text = AskContext.build(household.data, kit: AskModel.kitSummary(library), limit: 4_000)
+            Text(text.isEmpty ? "Nothing yet." : text)
+                .font(.system(.callout, design: .monospaced)).textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private var facts: some View {
+        @Bindable var household = household
+        return VStack(alignment: .leading, spacing: 16) {
             SectionCard(symbol: "brain", title: "Things Ask has noted",
                         subtitle: "Facts you mentioned in questions or added here. Edit or delete any of them.") {
                 if household.data.memories.isEmpty {
@@ -973,18 +1060,34 @@ struct AskKnowledgeSection: View {
                     }
                     .padding(.vertical, 2)
                 }
-                HStack {
-                    Picker("About", selection: $memoryOwner) {
-                        Text("Household").tag(UUID?.none)
-                        ForEach(household.data.people) { Text($0.name.isEmpty ? "Unnamed" : $0.name).tag(Optional($0.id)) }
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) { ownerPicker.frame(minWidth: 110, maxWidth: 200); memoryField.frame(minWidth: 180); addMemoryButton }
+                    VStack(alignment: .leading, spacing: 10) {
+                        ownerPicker
+                        HStack(spacing: 10) { memoryField; addMemoryButton }
                     }
-                    .labelsHidden().fixedSize()
-                    TextField("Add a fact, like “Sam carries an EpiPen”", text: $newMemory).textFieldStyle(.roundedBorder)
-                        .onSubmit(addMemory)
-                    Button("Add", action: addMemory).disabled(newMemory.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
+
             }
 
+        }
+    }
+    private var ownerPicker: some View {
+        Picker("About", selection: $memoryOwner) {
+            Text("Household").tag(UUID?.none)
+            ForEach(household.data.people) { Text($0.name.isEmpty ? "Unnamed" : $0.name).tag(Optional($0.id)) }
+        }.fixedSize(horizontal: false, vertical: true)
+    }
+    private var memoryField: some View {
+        TextField("Add a fact, like “Sam carries an EpiPen”", text: $newMemory).textFieldStyle(.roundedBorder).onSubmit(addMemory)
+    }
+    private var addMemoryButton: some View {
+        Button("Add", action: addMemory).disabled(newMemory.trimmingCharacters(in: .whitespaces).isEmpty)
+    }
+
+    private var history: some View {
+        @Bindable var household = household
+        return VStack(alignment: .leading, spacing: 16) {
             SectionCard(symbol: "clock.arrow.circlepath", title: "Question history",
                         subtitle: "\(household.data.history.count) saved. \(PrivateStore.whereText).") {
                 ForEach(household.data.history.suffix(30).reversed()) { item in
@@ -1008,6 +1111,10 @@ struct AskKnowledgeSection: View {
                 }
             }
 
+        }
+    }
+    private var storage: some View {
+        VStack(alignment: .leading, spacing: 16) {
             PassphraseCard()
 
             VStack(alignment: .leading, spacing: 8) {
@@ -1027,9 +1134,35 @@ struct AskKnowledgeSection: View {
                      ? "Every Mac that uses this drive loses them. This can’t be undone. Copies of the drive made earlier still hold their own encrypted copy."
                      : "This can’t be undone.")
             }
-            if let error = household.saveError {
-                Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-            }
+        }
+    }
+
+    private var destinationKey: String {
+        [model.choice.rawValue, model.ollamaHost, model.ollamaModel, model.builtInModel,
+         library.folders.map(\.path).joined(separator: "|"), String(KitChanges.shared.models)].joined(separator: "|")
+    }
+    @MainActor private func checkDestination() async {
+        processing = "Checking answer engine…"
+        processingDetail = ""
+        let validHost = AskModel.isHomeNetworkAddress(model.ollamaHost)
+        if validHost { await model.refreshOllama() }
+        guard !Task.isCancelled else { return }
+        model.libraryFolders = library.folders
+        let engine: (any AnswerEngine)?
+        if !validHost && model.choice == .auto {
+            if let installed = LocalModels.selected(libraryFolders: library.folders, id: model.builtInModel) { engine = LlamaEngine(model: installed) }
+            else { engine = AppleEngine.isAvailable ? AppleEngine() : nil }
+        } else if !validHost && model.choice == .ollama { engine = nil }
+        else { engine = await model.resolveEngine() }
+        guard !Task.isCancelled else { return }
+        if let engine {
+            processing = engine.runsOnDevice ? "On this device" : "On your home network"
+            processingDetail = engine.runsOnDevice
+                ? "\(engine.displayName). Questions and the household context used with them are processed on this device."
+                : "\(engine.displayName). Questions and the household context used with them are sent to \(model.ollamaHost) on your home network."
+        } else {
+            processing = "No answer engine available"
+            processingDetail = "Check your answer preference and availability in Settings. Availability is checked again before answering."
         }
     }
 

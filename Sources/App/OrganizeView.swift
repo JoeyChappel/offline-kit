@@ -41,58 +41,64 @@ struct OrganizeSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header.padding(24)
-            Divider()
-            if waiting.isEmpty {
-                ContentUnavailableView {
-                    Label(organizer.isWorking ? "Working through your library…" : "Nothing waiting for review", systemImage: "sparkles")
-                } description: {
-                    Text(organizer.isWorking ? "Suggestions appear here as they’re ready. You can review them while it keeps going."
-                         : "Choose what to organize and start. Each suggestion shows where it came from: the file, an article in your offline library, or an AI guess.")
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        let sections = CatalogKind.allCases.filter { kind in waiting.contains { $0.kind == kind } }
-                        if sections.count > 1, organizer.scope == nil {
-                            HStack {
-                                Text("\(sections.count) sections are waiting").font(.subheadline).foregroundStyle(.secondary)
-                                Spacer()
-                                Button("Accept Everything…", systemImage: "checkmark.circle") { confirmAccept = .everything }
-                                    .help("Applies every suggestion in every section, AI guesses included. You will be asked to confirm, and Undo takes it all back.")
-                                    .accessibilityHint("Applies all suggestions, including AI guesses, after you confirm.")
-                            }
-                            .padding(.horizontal, 24).padding(.vertical, 10)
-                            Divider()
-                        }
-                        ForEach(CatalogKind.allCases) { kind in
-                            let list = waiting.filter { $0.kind == kind }
-                            if !list.isEmpty {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    header.padding(.horizontal, 24).padding(.top, 24)
+                    HStack {
+                        Text("Review suggestions").font(.title2.bold())
+                        Spacer()
+                        Text("\(waiting.count) waiting").font(.callout).foregroundStyle(.secondary)
+                    }.padding(.horizontal, 24)
+                    if waiting.isEmpty {
+                        ContentUnavailableView {
+                            Label(organizer.isWorking ? "Working through your library…" : "Nothing waiting for review", systemImage: "sparkles")
+                        } description: {
+                            Text("Suggestions appear here as they’re ready. You choose which details to approve.")
+                        }.frame(maxWidth: .infinity, minHeight: 180)
+                    } else {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            let sections = CatalogKind.allCases.filter { kind in waiting.contains { $0.kind == kind } }
+                            if sections.count > 1, organizer.scope == nil {
                                 HStack {
-                                    Text("\(kind.section) · \(list.count)").font(.headline)
+                                    Text("\(sections.count) sections are waiting").font(.subheadline).foregroundStyle(.secondary)
                                     Spacer()
-                                    Menu("Approve All in \(kind.section)") {
-                                        Button("Approve Details From Files and Library") { approveAll(kind) }
-                                        Button("Accept AI Guesses Too…") { confirmAccept = .section(kind) }
-                                    } primaryAction: { approveAll(kind) }
-                                        .fixedSize()
-                                        .help("The main button applies details from your files and your offline library, and leaves AI guesses here for you to check item by item. The menu also offers to accept AI guesses too.")
+                                    Button("Accept Everything…", systemImage: "checkmark.circle") { confirmAccept = .everything }
+                                        .help("Applies every suggestion in every section, AI guesses included. You will be asked to confirm, and Undo takes it all back.")
+                                        .accessibilityHint("Applies all suggestions, including AI guesses, after you confirm.")
                                 }
                                 .padding(.horizontal, 24).padding(.vertical, 10)
-                                .background(.bar)
-                                ForEach(list) { suggestion in
-                                    VStack(spacing: 0) {
-                                        card(suggestion).padding(.horizontal, 24).padding(.vertical, 6)
-                                        Divider().padding(.leading, 24)
+                                Divider()
+                            }
+                            ForEach(CatalogKind.allCases) { kind in
+                                let list = waiting.filter { $0.kind == kind }
+                                if !list.isEmpty {
+                                    HStack {
+                                        Text("\(kind.section) · \(list.count)").font(.headline)
+                                        Spacer()
+                                        Menu("Approve All in \(kind.section)") {
+                                            Button("Approve Details From Files and Library") { approveAll(kind) }
+                                            Button("Accept AI Guesses Too…") { confirmAccept = .section(kind) }
+                                        } primaryAction: { approveAll(kind) }
+                                            .fixedSize()
+                                            .help("The main button applies details from your files and your offline library, and leaves AI guesses here for you to check item by item. The menu also offers to accept AI guesses too.")
                                     }
-                                    .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+                                    .padding(.horizontal, 24).padding(.vertical, 10)
+                                    .background(.bar)
+                                    ForEach(list) { suggestion in
+                                        VStack(spacing: 0) {
+                                            card(suggestion).padding(.horizontal, 24).padding(.vertical, 6)
+                                            Divider().padding(.leading, 24)
+                                        }
+                                        .transition(reduceMotion ? .identity : .opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+                                    }
                                 }
                             }
                         }
+                        .animation(Motion.gentle(reduceMotion), value: waiting.map(\.key))
                     }
-                    .animation(Motion.gentle(reduceMotion), value: waiting.map(\.key))
-                }
+                }.padding(.bottom, 18)
             }
+            activityStatus
             Divider()
             HStack {
                 Text("Saved in “\(KitCatalog.fileName)” inside each library folder, so it travels with the drive. File names and folders are never changed.")
@@ -140,50 +146,93 @@ struct OrganizeSheet: View {
     }
 
     private var header: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Organize with AI").font(.title.bold())
+                Text("Suggest details. Review them before they change your collection.").font(.callout).foregroundStyle(.secondary)
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 18) {
+                    setupCard.frame(minWidth: 300, maxWidth: .infinity)
+                    provenanceCard.frame(minWidth: 280, maxWidth: .infinity)
+                }
+                VStack(alignment: .leading, spacing: 18) { setupCard; provenanceCard }
+            }
+
+        }
+    }
+
+    private var setupCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Choose what to organize").font(.headline)
+            Picker("Section", selection: $organizer.scope) {
+                Text("Everything").tag(CatalogKind?.none)
+                ForEach(CatalogKind.allCases) { Text($0.section).tag(Optional($0)) }
+            }.disabled(organizer.isWorking)
+            Toggle("Look again at items already organized", isOn: $organizer.redo).toggleStyle(.checkbox).disabled(organizer.isWorking)
+            Text("Genre, studio or author, year, series, age ratings and descriptions.").font(.caption).foregroundStyle(.secondary)
+            if !organizer.isWorking {
+                HStack { Spacer(minLength: 0); runControls }
+            }
+
+        }.card(padding: 16)
+    }
+
+    @ViewBuilder private var runControls: some View {
+        switch organizer.state {
+        case .running:
+            Button("Pause", systemImage: "pause.fill") { organizer.pause() }
+            Button("Stop", systemImage: "stop.fill") { organizer.stop() }
+        case .paused:
+            Button("Resume", systemImage: "play.fill") { organizer.resume() }.buttonStyle(.borderedProminent)
+            Button("Stop", systemImage: "stop.fill") { organizer.stop() }
+        case .idle, .finished:
+            Button("Start", systemImage: "sparkles") { organizer.start(library: library, media: media, games: games, model: model) }
+                .buttonStyle(.borderedProminent)
+        }
+    }
+
+
+    @ViewBuilder private var activityStatus: some View {
+        if organizer.isWorking || organizer.message != nil || note != nil || catalog.saveError != nil {
+            VStack(alignment: .leading, spacing: 10) {
+                if organizer.isWorking {
+                    HStack(spacing: 16) {
+                        ProgressView(value: Double(organizer.done), total: Double(max(organizer.total, 1))) {
+                            Text(organizer.state == .paused ? "Paused at \(organizer.done) of \(organizer.total)" : "Looking at \(organizer.current)… (\(organizer.done) of \(organizer.total))")
+                                .lineLimit(1)
+                        }
+                        runControls
+                    }
+                }
+                if let message = organizer.message { Text(message).font(.callout).foregroundStyle(.secondary) }
+                if let note { Label(note, systemImage: "sparkles").font(.callout).foregroundStyle(.orange) }
+                if let error = catalog.saveError { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.callout) }
+            }.padding(.horizontal, 20).padding(.vertical, 12).background(.bar)
+        }
+    }
+
+    private var provenanceCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 14) {
-                Image(systemName: "sparkles").font(.largeTitle).foregroundStyle(Color.accentColor)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Organize with AI").font(.title.bold())
-                    Text("Fills in genre, studio or author, year, series, an age rating and a short description. Details already in your files come first, then articles in your offline library, then the model’s own knowledge, marked “AI guess”.")
-                        .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            HStack(spacing: 14) {
-                Picker("Organize", selection: $organizer.scope) {
-                    Text("Everything").tag(CatalogKind?.none)
-                    ForEach(CatalogKind.allCases) { Text($0.section).tag(Optional($0)) }
-                }.fixedSize().disabled(organizer.isWorking)
-                Toggle("Look again at items already organized", isOn: $organizer.redo).toggleStyle(.checkbox).disabled(organizer.isWorking)
-                Spacer()
-                switch organizer.state {
-                case .running:
-                    Button("Pause", systemImage: "pause.fill") { organizer.pause() }
-                    Button("Stop", systemImage: "stop.fill") { organizer.stop() }
-                case .paused:
-                    Button("Resume", systemImage: "play.fill") { organizer.resume() }.buttonStyle(.borderedProminent)
-                    Button("Stop", systemImage: "stop.fill") { organizer.stop() }
-                case .idle, .finished:
-                    Button("Start", systemImage: "sparkles") { organizer.start(library: library, media: media, games: games, model: model) }
-                        .buttonStyle(.borderedProminent)
-                }
-            }
-            if organizer.isWorking {
-                ProgressView(value: Double(organizer.done), total: Double(max(organizer.total, 1))) {
-                    Text(organizer.state == .paused ? "Paused at \(organizer.done) of \(organizer.total)" : "Looking at \(organizer.current)… (\(organizer.done) of \(organizer.total))")
-                        .lineLimit(1)
-                }
-            }
-            if let message = organizer.message { Text(message).font(.callout).foregroundStyle(.secondary) }
-            if let note { Label(note, systemImage: "sparkles").font(.callout).foregroundStyle(.orange) }
+            Text("Where details come from").font(.headline)
+            provenance("Your files", note: "Existing details come first.", symbol: "doc")
+            provenance("Offline library", note: "Checked against articles when available.", symbol: "book.closed")
+            provenance("AI guess", note: "Model guesses start unchecked for review.", symbol: "sparkles")
+            Text("AI age ratings are not used.").font(.caption).foregroundStyle(.secondary)
             let archives = organizer.grounding ?? {
                 let names = library.books.filter { $0.archive.name.lowercased().hasPrefix("wikipedia") }.map(\.title)
                 return names.isEmpty ? nil : names.joined(separator: ", ")
             }()
             Label(archives.map { "Checking details against \($0) in your library." }
                   ?? "Details come from your files, plus AI guesses you can check. Add Wikipedia in Get Resources to check them against real articles.",
-                  systemImage: "books.vertical").font(.caption).foregroundStyle(.secondary).lineLimit(2)
-            if let error = catalog.saveError { Label(error, systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange).font(.callout) }
+                  systemImage: "books.vertical").font(.caption).foregroundStyle(.secondary)
+        }.card(padding: 16)
+    }
+
+    private func provenance(_ title: String, note: String, symbol: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: symbol).foregroundStyle(title == "AI guess" ? Color.orange : Color.accentColor).frame(width: 22)
+            VStack(alignment: .leading, spacing: 2) { Text(title).font(.callout.weight(.semibold)); Text(note).font(.caption).foregroundStyle(.secondary) }
         }
     }
 

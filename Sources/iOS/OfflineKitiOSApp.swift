@@ -34,6 +34,8 @@ struct OfflineKitiOSApp: App {
                         Task { await library.reload(); await media.reload(library: library) }
                     }
                     await library.reload()
+                    // Covers, title cards and title screens for media without art, in the background (AutoArtwork).
+                    AutoArtwork.shared.attach(media: media, games: games, nowPlaying: nowPlaying, library: library)
                     // First launch: copy the bundled classic books into the kit.
                     if await StarterBooks.installIfNeeded() { await media.reload(library: library) }
                     await downloads.restore(from: library.folders)
@@ -138,7 +140,12 @@ struct PhoneTabs: View {
             for step in 0..<(rounds * order.count) {
                 let item = order[step % order.count]
                 navigation.selection = item
-                try? await Task.sleep(for: .seconds(2))
+                // -cycleScroll YES scrolls the biggest vertical scroll view down and back up before reporting.
+                if UserDefaults.standard.bool(forKey: "cycleScroll") {
+                    try? await Task.sleep(for: .milliseconds(600))
+                    await PhoneScroller.scrollMainContent()
+                    try? await Task.sleep(for: .milliseconds(300))
+                } else { try? await Task.sleep(for: .seconds(2)) }
                 StallProbe.report("\(item)")
             }
             NSLog("CYCLE done")
@@ -165,3 +172,31 @@ struct PhoneTabs: View {
 struct PhoneLibrary: View {
     var body: some View { LibraryBrowser() }
 }
+
+#if DEBUG
+/// Profiling aid for -cycleScroll on iPhone: scrolls the biggest vertical scroll view on screen down and back up.
+@MainActor
+enum PhoneScroller {
+    static func scrollMainContent() async {
+        guard let root = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).flatMap(\.windows).first(where: \.isKeyWindow) else { return }
+        var best: UIScrollView?
+        func walk(_ v: UIView) {
+            if let sv = v as? UIScrollView, sv.contentSize.height > sv.bounds.height + 50, sv.contentSize.width <= sv.bounds.width + 1,
+               sv.bounds.width * sv.bounds.height > (best.map { $0.bounds.width * $0.bounds.height } ?? 0) { best = sv }
+            v.subviews.forEach(walk)
+        }
+        walk(root)
+        guard let sv = best else { return }
+        let travel = min(sv.contentSize.height - sv.bounds.height, 6000)
+        let steps = 40
+        for i in 1...steps {
+            sv.setContentOffset(CGPoint(x: 0, y: travel * Double(i) / Double(steps)), animated: false)
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        for i in 1...steps {
+            sv.setContentOffset(CGPoint(x: 0, y: travel * Double(steps - i) / Double(steps)), animated: false)
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+    }
+}
+#endif

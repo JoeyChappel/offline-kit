@@ -120,6 +120,10 @@ final class LlamaRuntime: @unchecked Sendable {
     private var conversation: (tokens: [llama_token], state: [UInt8])?
     /// Generations waiting for `lock`. A background warm-up stops at its next step when one arrives.
     private let waiting = Counter()
+    /// Counts New Conversations. Static, so reading it never creates the runtime (which starts Metal). A
+    /// conversation being prepared stops, and isn't kept, when this moves on from the count it started with.
+    private static let conversations = Counter()
+    static var conversationCount: Int { conversations.value }
 
     /// What is loaded and when it was last used, readable without waiting for a load or a generation to finish.
     private let stateLock = NSLock()
@@ -406,19 +410,23 @@ final class LlamaRuntime: @unchecked Sendable {
     /// Evaluates the next question's settled part ahead of time (instructions, household context and the
     /// conversation so far), so the follow-up only evaluates its question and sources. Blocking; call off the main
     /// thread. Does nothing when the model isn't loaded, and stops at its next step when a question arrives.
-    func prepareConversation(file: URL, contextTokens: Int32, custom: Bool, system: String, head: String) {
+    /// `conversation` is `conversationCount` when it was asked for: a New Conversation since then stops it.
+    func prepareConversation(file: URL, contextTokens: Int32, custom: Bool, system: String, head: String,
+                             conversation count: Int = LlamaRuntime.conversationCount) {
         lock.lock()
         defer { lock.unlock() }
-        guard loadedPath == file.path, self.contextTokens == UInt32(contextTokens), let model, let context else { return }
+        let conversations = Self.conversations
+        guard conversations.value == count, loadedPath == file.path, self.contextTokens == UInt32(contextTokens),
+              let model, let context else { return }
         let vocab = llama_model_get_vocab(model)
         guard let target = settledTokens(system: system, head: head, custom: custom, vocab: vocab),
               conversation?.tokens != target else { return }
         let waiting = self.waiting, quitting = self.quitting
-        let abort = AbortCheck { waiting.value > 0 || quitting.value }
+        let abort = AbortCheck { waiting.value > 0 || quitting.value || conversations.value != count }
         llama_set_abort_callback(context, { data in Unmanaged<AbortCheck>.fromOpaque(data!).takeUnretainedValue().check() },
                                  Unmanaged.passUnretained(abort).toOpaque())
         defer { llama_set_abort_callback(context, nil, nil) }
-        let stop = { waiting.value > 0 }
+        let stop = { waiting.value > 0 || conversations.value != count }
         #if DEBUG
         let began = DispatchTime.now().uptimeNanoseconds
         #endif
@@ -433,6 +441,8 @@ final class LlamaRuntime: @unchecked Sendable {
         if start < target.count {
             guard (try? decode(target[start...], context: context, isCancelled: stop)) == true else { return }
         }
+        // New Conversation while this was evaluated: it belongs to the conversation that was cleared.
+        guard conversations.value == count else { return }
         keepConversation(target, context: context)
         #if DEBUG
         if ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil {
@@ -442,11 +452,15 @@ final class LlamaRuntime: @unchecked Sendable {
         #endif
     }
 
-    /// New Conversation: the saved conversation can't be used again. Returns at once; the state is released as
-    /// soon as nothing is using the model.
+    /// New Conversation: the saved conversation can't be used again. Returns at once; one being prepared stops at
+    /// its next step, and the state is released as soon as nothing is using the model.
     func forgetConversation() {
+        Self.newConversation()
         DispatchQueue.global(qos: .utility).async { [self] in lock.withLock { conversation = nil } }
     }
+
+    /// Counts a New Conversation, so a conversation being prepared stops, without creating the runtime.
+    static func newConversation() { conversations.add(1) }
 
     #if DEBUG
     /// Tokens in the last prompt, and how many of them came from the saved instructions (for the benchmark).
@@ -692,10 +706,12 @@ struct LlamaEngine: AnswerEngine {
     func preload(instructions: String? = nil, head: String? = nil) {
         guard case .ready = model.plan, instructions != nil || !isReady else { return }
         let url = model.url, tokens = contextTokens, custom = model.isCustom
+        let count = LlamaRuntime.conversationCount
         let thread = Thread {
             LlamaRuntime.shared.preload(file: url, contextTokens: tokens, custom: custom, instructions: instructions)
             if let instructions, let head {
-                LlamaRuntime.shared.prepareConversation(file: url, contextTokens: tokens, custom: custom, system: instructions, head: head)
+                LlamaRuntime.shared.prepareConversation(file: url, contextTokens: tokens, custom: custom, system: instructions,
+                                                        head: head, conversation: count)
             }
         }
         thread.stackSize = 8 << 20
@@ -714,15 +730,22 @@ struct LlamaEngine: AnswerEngine {
     func prepareFollowUp(instructions: String, head: String) {
         guard case .ready = model.plan, isReady else { return }
         let url = model.url, tokens = contextTokens, custom = model.isCustom
+        let count = LlamaRuntime.conversationCount
         let thread = Thread {
-            LlamaRuntime.shared.prepareConversation(file: url, contextTokens: tokens, custom: custom, system: instructions, head: head)
+            LlamaRuntime.shared.prepareConversation(file: url, contextTokens: tokens, custom: custom, system: instructions,
+                                                    head: head, conversation: count)
         }
         thread.stackSize = 8 << 20
         thread.qualityOfService = .utility
         thread.start()
     }
 
-    func forgetConversation() {
+    func forgetConversation() { Self.forgetSavedConversation() }
+
+    /// New Conversation, whichever engine answered last: the built-in model's saved conversation goes, and one
+    /// being prepared stops. Never creates the runtime.
+    static func forgetSavedConversation() {
+        LlamaRuntime.newConversation()
         guard LlamaRuntime.exists else { return }
         LlamaRuntime.shared.forgetConversation()
     }

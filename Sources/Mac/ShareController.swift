@@ -476,6 +476,7 @@ final class ShareController {
         observingGames = true
         withObservationTracking {
             _ = games.games; _ = games.lastPlayed
+            _ = GameArtStore.shared.titleScreens   // a new title screen changes a game's "art" address
         } onChange: { [weak self] in
             MainActor.assumeIsolated { self?.gamesRevision += 1 }
             Task { @MainActor [weak self] in
@@ -489,7 +490,7 @@ final class ShareController {
 
     @ObservationIgnored private var gameIndex: [String: Game] = [:]
 
-    /// GET /api/games/art/<id>: the game's shelf picture (its last frame), cached like other artwork.
+    /// GET /api/games/art/<id>: the game's shelf picture (its last frame, else its title screen), cached like other artwork.
     private func gameArt(id: String, _ req: WebServer.Request, _ res: WebServer.Responder) async {
         // The art addresses come from the list, which leaves an index of the games behind: no id encoding per picture.
         guard let game = gameIndex[id] ?? games?.games.first(where: { GameStreamHub.gameID($0) == id }) else {
@@ -498,7 +499,8 @@ final class ShareController {
         let folders = library?.folders ?? []
         // The picture's path is worked out off the main thread too, with the file checks.
         let found: URL? = await Task.detached(priority: .userInitiated) {
-            let url = game.thumbnailURL
+            // The last frame of a real game, else its generated title screen (GameTitleCards).
+            guard let url = GameTitleCards.shelfPicture(for: game) else { return nil }
             let ok = (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
                 && SharePolicy.Scope(libraries: folders).allows(url)
             return ok ? url : nil
@@ -952,7 +954,11 @@ final class ShareController {
             }
             tiers[n < 24 ? 0 : 1].append((URL(fileURLWithPath: path), widths))
         }
-        for (n, game) in gameList.prefix(400).enumerated() { tiers[n < 24 ? 0 : 1].append((game.thumbnailURL, [320])) }
+        for (n, game) in gameList.prefix(400).enumerated() {
+            // The last frame and the title screen: whichever exists gets a copy (a missing one costs a file check).
+            tiers[n < 24 ? 0 : 1].append((game.thumbnailURL, [320]))
+            if let title = GameArtStore.shared.titleScreen(for: game) { tiers[n < 24 ? 0 : 1].append((URL(fileURLWithPath: title), [320])) }
+        }
         let jobs = tiers[0] + tiers[1]
         let folders = library?.folders ?? []
         prepareTask?.cancel()
@@ -1370,6 +1376,10 @@ final class ShareController {
         guard let model, let library else { await res.send(status: 503, json: ["error": "Not ready"]); return }
         askBusy = true
         defer { askBusy = false }
+        // An app in the background naps: macOS slows its disk reads, and a phone's question waited minutes on the
+        // search. Someone is waiting for this one.
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated], reason: "Answering a question over Wi-Fi")
+        defer { ProcessInfo.processInfo.endActivity(activity) }
 
         await res.startEventStream()
         model.libraryFolders = library.folders
@@ -1381,37 +1391,30 @@ final class ShareController {
         // Each event reports whether the device is still there; once it's gone, stop so the Mac isn't
         // generating for nobody and other devices can ask (returning ends the stream, which cancels the engine).
         guard await res.event("engine", engine.displayName) else { res.finish(); return }
-        var budget = engine.sourceBudget
-        let archives = library.books.map(\.archive)
-        var sources = await Task.detached(priority: .userInitiated) {
-            Retriever.retrieve(question: question, archives: archives, budgetChars: budget)
-        }.value
-        guard await res.event("sources", sources.map(Self.sourceJSON)) else { res.finish(); return }
-
-        for attempt in 0..<3 {
-            do {
-                var last = Date.distantPast
-                var text = ""
-                for try await partial in engine.stream(instructions: AskModel.instructions,
-                                                       prompt: AskModel.prompt(question: question, sources: sources)) {
-                    text = partial
-                    if Date().timeIntervalSince(last) > 0.08 {
-                        last = Date()
-                        // Leaving the loop terminates the engine's stream, which cancels generation.
-                        guard await res.event("answer", text) else { res.finish(); return }
-                    }
-                }
-                guard await res.event("answer", text), await res.event("done", true) else { res.finish(); return }
-                questionsAnswered += 1
-                break
-            } catch where (AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error)) && attempt < 2 && sources.count > 1 {
-                budget /= 2
-                sources = Array(sources.prefix(max(1, sources.count / 2)))
-                await res.event("sources", sources.map(Self.sourceJSON))
-            } catch {
-                await res.event("error", error.localizedDescription)
-                break
-            }
+        (engine as? LlamaEngine)?.preload(instructions: AskModel.instructions)
+        // The same search and answer as Ask on the Mac (medical references first, the fallbacks when it misses, the
+        // echo guard, retries and citation check), without the household context or conversation.
+        guard let found = await AskModel.findSources(question: question, scope: nil, previous: [], library: library, engine: engine,
+                                                     budget: AskModel.sourceBudget(engine: engine, context: "", history: ""),
+                                                     emergency: false, isCurrent: { true })
+        else { res.finish(); return }
+        guard await res.event("sources", found.sources.map(Self.sourceJSON)) else { res.finish(); return }
+        let result = await AskModel.answer(question: question, sources: found.sources, engine: engine, instructions: AskModel.instructions,
+                                           context: "", history: "", keepsConversation: false,
+                                           show: { await res.event("answer", $0) },
+                                           sourcesChanged: { await res.event("sources", $0.map(Self.sourceJSON)) },
+                                           trace: { message in
+                                               #if DEBUG
+                                               AskTrace.log("Wi-Fi " + message)
+                                               #endif
+                                           })
+        switch result.outcome {
+        case .answered:
+            if await res.event("done", true) { questionsAnswered += 1 }
+        case .empty: await res.event("error", AskModel.emptyMessage)
+        case .tooLong: await res.event("error", AskModel.tooLongMessage)
+        case .failed(let message): await res.event("error", message)
+        case .stopped: break
         }
         res.finish()
     }
@@ -1458,7 +1461,7 @@ struct GameListCache: @unchecked Sendable {   // JSON-ready dictionaries: values
 
     static func entry(_ game: Game, played: [String: Date]) -> [String: Any] {
         let id = GameStreamHub.gameID(game)
-        let artStamp = (try? game.thumbnailURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        let artStamp = GameTitleCards.shelfPicture(for: game).flatMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]) }?.contentModificationDate
         return ["id": id, "title": game.title, "system": game.system.rawValue, "systemName": game.system.name,
                 "art": artStamp.map { "/api/games/art/\(id)?v=\(Int($0.timeIntervalSince1970))" } ?? NSNull(),
                 "lastPlayed": played[game.id].map { $0.timeIntervalSince1970.rounded() } ?? NSNull(),

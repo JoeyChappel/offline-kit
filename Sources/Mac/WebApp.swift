@@ -82,7 +82,7 @@ enum WebApp {
 @media (prefers-color-scheme:dark){:root{--accent:#5FC398;--accent-ink:#05251a;--accent-soft:rgba(95,195,152,.15);--bg:#0c1512;--surface:#16211c;--surface2:#1e2b25;--text:#edf3ef;--muted:#97a89f;--line:rgba(255,255,255,.09);--bar:rgba(18,28,24,.74);--warn:#f0a050;--shadow:0 10px 28px rgba(0,0,0,.45);color-scheme:dark}}
 .room,#player{--accent:#b3d68c;--accent-ink:#0c1b16;--accent-soft:rgba(179,214,140,.16);--bg:#0c1b16;--surface:#172d24;--surface2:#1f3a2e;--text:#f5f5e8;--muted:#b3c4b4;--line:rgba(245,245,232,.12);--bar:rgba(12,27,22,.72);color-scheme:dark}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:17px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,system-ui,sans-serif;-webkit-text-size-adjust:100%;overflow:hidden;overscroll-behavior:none}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:17px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,system-ui,sans-serif;-webkit-text-size-adjust:100%;overflow:hidden;overscroll-behavior:none;touch-action:manipulation}
 button{font:inherit;color:inherit;cursor:pointer}
 a{color:var(--accent)}
 img{color:transparent}

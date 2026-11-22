@@ -203,6 +203,28 @@ enum Interests {
     ]
 }
 
+/// A local stand-in for the Kiwix servers, for the first-run smoke test (Tools/Tests/first-run-smoke.sh).
+/// It exists only in Debug builds, only in a test home (OFFLINEKIT_HOME), and only for a loopback address given in
+/// OFFLINEKIT_TEST_SERVER; in a Release build `base` is always nil and nothing here can redirect a download.
+enum LocalTestServer {
+    static let base: URL? = {
+        #if DEBUG
+        guard KitLocation.testHome != nil,
+              let raw = ProcessInfo.processInfo.environment["OFFLINEKIT_TEST_SERVER"], let url = URL(string: raw),
+              url.scheme == "http", url.host == "127.0.0.1" else { return nil }
+        return url
+        #else
+        return nil
+        #endif
+    }()
+
+    /// Whether a plain-http address is the test server (the only plain-http download the app ever accepts).
+    static func allows(_ url: URL) -> Bool {
+        guard let base else { return false }
+        return url.scheme == "http" && url.host == base.host && url.port == base.port
+    }
+}
+
 /// The Kiwix OPDS catalog: every English archive with its latest version, size and download link.
 struct Catalog: Sendable {
     var entries: [CatalogEntry] { didSet { (index, latest) = Self.makeIndex(entries) } }
@@ -228,7 +250,10 @@ struct Catalog: Sendable {
         return (byFlavour, newest)
     }
 
-    static let feed = URL(string: "https://library.kiwix.org/catalog/v2/entries?lang=eng&count=-1")!
+    static var feed: URL {
+        LocalTestServer.base?.appending(path: "catalog/v2/entries")
+            ?? URL(string: "https://library.kiwix.org/catalog/v2/entries?lang=eng&count=-1")!
+    }
 
     /// Best entry for a pack name, by the picture preference.
     func entry(for name: String, pictures: PictureChoice) -> CatalogEntry? {

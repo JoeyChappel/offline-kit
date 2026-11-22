@@ -224,12 +224,15 @@ final class PassageStore: @unchecked Sendable {
     /// ("power outage" in an encyclopedia) is counted first, cheaply and only up to `broadLimit`, and skipped when
     /// it reaches it (the title search finds the article named for it), and a leads-only index looks titles up in
     /// a separate index of titles instead of filtering every passage by its title column.
-    func search(terms: [String], phrases: [String], limit: Int) -> [IndexHit] {
+    /// `combinations` are further all-words searches, tried right after the whole question: a follow-up's own words
+    /// with its conversation's topic ("altitude boil").
+    func search(terms: [String], phrases: [String], limit: Int, combinations: [[String]] = []) -> [IndexHit] {
         guard !terms.isEmpty else { return [] }
         func quoted(_ words: [String]) -> String { words.map { "\"\($0)\"" }.joined(separator: " ") }
         let common = Set(terms.filter { isCommon($0) })
         // Each query with the words every hit of it must contain, and whether it may be too broad to rank.
         var queries: [(match: String, words: [String], check: Bool)] = [(quoted(terms), terms, false)]
+        queries += combinations.filter { !$0.isEmpty && $0 != terms }.map { (quoted($0), $0, $0.allSatisfy(common.contains)) }
         // Long questions: the pairs with an uncommon word first, and at most four.
         let pairs = phrases.map { ($0, $0.split(separator: " ").map(String.init)) }
             .sorted { $0.1.filter(common.contains).count < $1.1.filter(common.contains).count }
@@ -654,6 +657,9 @@ final class AnswerIndex: @unchecked Sendable {
     func store(for archive: ZimArchive) -> PassageStore? {
         condition.withLock { stores[archive.uuid.lowercased()] }
     }
+
+    /// True while a question is being answered (other background work, such as making artwork, waits too).
+    var isAsking: Bool { condition.withLock { asking > 0 } }
 
     /// A question is being answered: indexing waits until it's done. Calls nest; balance each with `endAsk`.
     func beginAsk() { condition.withLock { asking += 1 } }

@@ -261,9 +261,9 @@ extension Notification.Name {
 
 @MainActor @Observable
 final class GameLibrary {
-    private(set) var games: [Game] = []
-    private(set) var favorites: Set<String> = []
-    private(set) var lastPlayed: [String: Date] = [:]
+    private(set) var games: [Game] = [] { didSet { shelvesCache = nil } }
+    private(set) var favorites: Set<String> = [] { didSet { shelvesCache = nil } }
+    private(set) var lastPlayed: [String: Date] = [:] { didSet { shelvesCache = nil } }
     var issue: String?
     /// What Add Games is copying right now ("Adding Beneath a Steel Sky…"), or nil.
     private(set) var adding: String?
@@ -286,6 +286,45 @@ final class GameLibrary {
                 guard let self, let game = self.games.first(where: { $0.url.path == path }) ?? GameRef(path: path).game else { return }
                 self.recordPlayed(game)
             }
+        }
+    }
+
+    /// The Play screen's rows, worked out from the list: Continue playing, Favorites, Recently played, one per system.
+    struct Shelves {
+        var continuing: [(game: Game, date: Date)] = []
+        var favorites: [Game] = []
+        var recent: [Game] = []
+        var systems: [(system: GameSystem, games: [Game])] = []
+    }
+    @ObservationIgnored private var shelvesCache: Shelves?
+    /// Bumped when a save appeared or went away without the list changing (a game window closed), so the screen asks again.
+    private(set) var savesRevision = 0
+
+    /// Grouped once per change of the list, favorites or play history, not on every redraw of the Play screen
+    /// (300 games cost ~400 ms of main-thread time each time they were filtered, sorted and grouped again).
+    var shelves: Shelves {
+        _ = savesRevision
+        if let shelvesCache { return shelvesCache }
+        let all = games
+        var result = Shelves()
+        result.continuing = all.compactMap { game in game.resumeState.map { (game, $0.date) } }.sorted { $0.1 > $1.1 }
+        // `games` is already in title order (the scan sorts it), so filtering keeps it in order.
+        result.favorites = all.filter { favorites.contains($0.id) }
+        result.recent = all.filter { lastPlayed[$0.id] != nil }.sorted { (lastPlayed[$0.id] ?? .distantPast) > (lastPlayed[$1.id] ?? .distantPast) }
+        let bySystem = Dictionary(grouping: all, by: \.system)
+        result.systems = GameSystem.allCases.compactMap { system in bySystem[system].map { (system, $0) } }
+        shelvesCache = result
+        return result
+    }
+
+    /// Looks at the save files again (a handful of stat calls); redraws the Play screen only if Continue playing changed.
+    func refreshSaves() {
+        guard let cached = shelvesCache else { return }
+        let now = games.compactMap { game in game.resumeState.map { (game.id, $0.date) } }.sorted { $0.1 > $1.1 }
+        let before = cached.continuing.map { ($0.game.id, $0.date) }
+        if now.count != before.count || zip(now, before).contains(where: { $0.0 != $1.0 || $0.1 != $1.1 }) {
+            shelvesCache = nil
+            savesRevision += 1
         }
     }
 
@@ -900,6 +939,7 @@ final class GameSession {
         guard !isRunning else { return }
         if let other = GameSession.current, other !== self { other.stop(because: .replaced) }
         GameSession.current = self
+        GameArtworkGate.shared.gameWillStart()   // a title-screen capture gives up the one emulator slot (GameTitleCards)
         Self.stopOnQuit()
         failure = nil
         ending = nil

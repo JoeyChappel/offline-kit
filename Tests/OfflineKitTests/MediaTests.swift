@@ -340,3 +340,26 @@ struct MediaScanTests {
         #expect(MediaInfoStore.friendlyGenre([]) == nil)
     }
 }
+
+@Suite struct HitPauseWatchdogTests {
+    @Test func releasesAfterStillnessAndResumesOnMovement() {
+        var w = HitPauseWatchdog()
+        let t0 = Date()
+        let paused = w.phase(moving: true, now: t0)
+        #expect(paused)
+        #expect(!w.shouldRelease(now: t0.addingTimeInterval(0.3)))
+        // Offset keeps changing: never released.
+        _ = w.offsetChanged(now: t0.addingTimeInterval(0.4))
+        #expect(!w.shouldRelease(now: t0.addingTimeInterval(0.8)))
+        // Phase never ends and the offset stands still.
+        #expect(w.shouldRelease(now: t0.addingTimeInterval(0.95)))
+        // Movement resumes while the phase is still moving: pause again.
+        let resumed = w.offsetChanged(now: t0.addingTimeInterval(1.0))
+        #expect(resumed)
+        #expect(!w.shouldRelease(now: t0.addingTimeInterval(1.1)))
+        // A real end clears it.
+        let ended = w.phase(moving: false, now: t0.addingTimeInterval(1.2))
+        #expect(!ended)
+        #expect(!w.shouldRelease(now: t0.addingTimeInterval(9)))
+    }
+}

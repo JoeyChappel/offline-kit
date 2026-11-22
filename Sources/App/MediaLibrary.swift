@@ -318,6 +318,19 @@ final class MediaLibrary {
         }
     }
 
+    /// Generated art is ready (AutoArtwork): shown unless the item has its own cover, a video shows where it was stopped,
+    /// or the files brought art of their own (see ArtworkRules).
+    func setGeneratedArtwork(_ path: String?, art: GeneratedArt, for item: MediaItem) {
+        let key = item.progressKey
+        guard var value = info[key] else { return }
+        value.art = art.rawValue
+        if let path {
+            value.thumb = ArtworkRules.thumb(kind: item.kind, current: value.thumb, currentArt: info[key]?.art,
+                                             still: item.kind == .video ? stills[key] : nil, generated: path)
+        }
+        if info[key] != value { info[key] = value }
+    }
+
     /// The featured item and rows for the Netflix-style screens.
     /// `includeBooks: false` for the web view and Apple TV, which can't open books yet.
     func catalog(filter: MediaFilter = .all, includeBooks: Bool = true) -> (featured: MediaItem?, shelves: [MediaShelf]) {

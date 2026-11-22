@@ -95,12 +95,15 @@ struct HTMLTextTests {
     @Test("A stray < is handled the way the old expressions handled it")
     func strayLessThan() {
         // Archive HTML escapes "<" as &lt;, so this is rare. The old expressions turned <p> and </p> into line breaks
-        // first and kept the stray "<" as text; the scanner reads a tag up to the next ">" (the one closing </p>).
+        // first and kept the stray "<" as text; the scanner keeps a "<" that no letter, "/", "!" or "?" follows.
         let html = "<p>Children under 5 years and adults over 65 are at risk when it is hot; keep the room temperature < 26 degrees if you can.</p><p>\(SampleHTML.sentence)</p>"
-        withKnownIssue("HTMLText drops the text after an unescaped \"<\" up to the next \">\"; LegacyHTMLText kept it") {
-            #expect(HTMLText.paragraphs(html) == LegacyHTMLText.paragraphs(html))
-        }
+        #expect(HTMLText.paragraphs(html) == LegacyHTMLText.paragraphs(html))
+        #expect(HTMLText.paragraphs(html).first?.hasSuffix("temperature < 26 degrees if you can.") == true)
         #expect(HTMLText.paragraphs(html).last == SampleHTML.sentence)
+        // Tags, closing tags, comments and declarations still go.
+        let tagged = "<!DOCTYPE html><p>Keep children under 5 years in the shade<!-- note --> when it is hot<?php x ?> and give them water to drink often.</p>"
+        #expect(HTMLText.paragraphs(tagged) == ["Keep children under 5 years in the shade when it is hot and give them water to drink often."])
+        #expect(HTMLText.paragraphs(tagged) == LegacyHTMLText.paragraphs(tagged))
     }
 
     @Test("stripTags and decodeEntities")
@@ -302,5 +305,52 @@ struct AnswerIndexTests {
         let sources = Retriever.retrieve(question: "how do I reset a tripped GFCI outlet", archives: [zim], budgetChars: 4_000)
         #expect(sources.first?.ref.title == "Ground fault circuit interrupter")
         #expect(sources.first?.text.contains("reset") == true)
+    }
+
+    @Test("A follow-up is searched with its topic: \"Should I put ice on it?\" after a burn question reads Burns")
+    func followUpRetrieval() async throws {
+        _ = try TestSupport.testHome()
+        let zim = try archive()
+        AnswerIndex.shared.load([zim])
+        let ready = await eventually(timeout: 30) { AnswerIndex.shared.store(for: zim) != nil }
+        try #require(ready, "the index didn't finish")
+        let first = Retriever.retrieve(question: "What should I do for a burn?", archives: [zim], budgetChars: 4_000)
+        #expect(first.first?.ref.title == "Burns")
+        var previous = Turn(question: "What should I do for a burn?")
+        previous.status = .done
+        previous.sources = first
+        let query = AskModel.searchQuery(for: "Should I put ice on it?", after: previous)
+        #expect(query.carried == ["burn"])
+        let sources = Retriever.retrieve(query: query, archives: [zim], budgetChars: 4_000)
+        #expect(sources.first?.ref.title == "Burns")
+        #expect(sources.first?.text.contains("ice") == true)
+    }
+
+    @Test("A leads-only index's article is read past its lead: the First aid section answers \"what should I do\"")
+    func sectionsAfterLead() throws {
+        _ = try TestSupport.testHome()
+        let zim = try archive()
+        let hit = IndexHit(path: "Burns", title: "Burns", heading: "", text: "", lead: true, order: 0, bm25: 1)
+        let candidate = Retriever.IndexedCandidate(archive: zim, hit: hit, score: 5, coverage: 1)
+        let query = SearchQuery("What should I do for a burn?")
+        #expect(query.wantsSteps)
+        let passages = Retriever.sectionPassages(candidate, score: 5, query: query)
+        #expect(passages.first?.heading == "First aid")
+        #expect(passages.first?.text.contains("cool running water") == true)
+        #expect(passages.allSatisfy { $0.order > 0 }, "after the lead, which the index already has")
+    }
+
+    @Test("\"A burn from boiling water\" reads Burns first, not the article about boiling water")
+    func circumstanceRanksLower() async throws {
+        _ = try TestSupport.testHome()
+        let zim = try archive()
+        AnswerIndex.shared.load([zim])
+        let ready = await eventually(timeout: 30) { AnswerIndex.shared.store(for: zim) != nil }
+        try #require(ready, "the index didn't finish")
+        var query = SearchQuery("What should I do for a burn from boiling water?")
+        query.relate(Retriever.related(to: query.text))
+        let sources = Retriever.retrieve(query: query, archives: [zim], budgetChars: 4_000)
+        #expect(sources.first?.ref.title == "Burns", "\(sources.map(\.ref.title))")
+        #expect(AskModel.conditionStrength(sources, question: "What should I do for a burn from boiling water?", query: query) >= 1)
     }
 }

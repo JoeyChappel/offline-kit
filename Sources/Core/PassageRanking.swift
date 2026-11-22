@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 import NaturalLanguage
 
@@ -66,16 +67,288 @@ final class SemanticRanker: @unchecked Sendable {
                 if words.count > 10_000 { words.removeAll(keepingCapacity: true) }
                 words[w] = v
             } else { continue }
-            for i in 0..<min(v.count, sum.count) { sum[i] += v[i] }
+            vDSP_vadd(sum, 1, v, 1, &sum, 1, vDSP_Length(min(v.count, sum.count)))
             count += 1
         }
         return count > 0 ? sum : nil
     }
 
+    /// The mean word vector of each text (nil for a text with no known word), in English; nil without the English
+    /// embedding. For comparing an answer's sentences with its sources (`CitationChecker`).
+    func vectors(_ texts: [String]) -> [[Float]?]? {
+        lock.withLock {
+            guard let embedding = embedding(.english) else { return nil }
+            return texts.map { vector($0, embedding) }
+        }
+    }
+
     static func cosine(_ a: [Float], _ b: [Float]) -> Double {
+        let n = vDSP_Length(min(a.count, b.count))
         var dot: Float = 0, na: Float = 0, nb: Float = 0
-        for i in 0..<min(a.count, b.count) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+        vDSP_dotpr(a, 1, b, 1, &dot, n)
+        vDSP_svesq(a, 1, &na, n)
+        vDSP_svesq(b, 1, &nb, n)
         return na > 0 && nb > 0 ? Double(dot / (na.squareRoot() * nb.squareRoot())) : 0
+    }
+
+    /// The vector scaled to length 1 (for many cosines against it: then a dot product is the cosine).
+    static func normalized(_ v: [Float]) -> [Float] {
+        var squares: Float = 0
+        vDSP_svesq(v, 1, &squares, vDSP_Length(v.count))
+        guard squares > 0 else { return v }
+        var scale = 1 / squares.squareRoot()
+        var out = [Float](repeating: 0, count: v.count)
+        vDSP_vsmul(v, 1, &scale, &out, 1, vDSP_Length(v.count))
+        return out
+    }
+
+    static func dot(_ a: [Float], _ b: [Float]) -> Double {
+        var d: Float = 0
+        vDSP_dotpr(a, 1, b, 1, &d, vDSP_Length(min(a.count, b.count)))
+        return Double(d)
+    }
+}
+
+/// Checks each cited sentence of an answer against the passage it cites, and fixes what the passage doesn't support.
+///
+/// The model sometimes cites a source that doesn't say what the sentence says ("Remove rings before the area swells
+/// [2]" with [2] an Everest thread). For each sentence with a "[n]", the sentence's words are looked for in passage n
+/// (first five letters, longer words counting more) and the sentence is compared with each of the passage's sentences
+/// by meaning (the word embeddings the retriever reranks with). A citation the passage supports stays. One it doesn't
+/// is moved to another source only when that source clearly supports the sentence, and otherwise dropped; support
+/// is never added where there was none. Sentences with fewer than three content words ("Call 911 [1].") are left
+/// as they are: too little to judge. About a millisecond for a whole answer once the sources are prepared.
+final class CitationChecker {
+    /// What the check did to one answer.
+    struct Report: Sendable, Equatable, Codable {
+        /// Citation marks in sentences long enough to judge, and how many of them their passage supported.
+        var checked = 0, supported = 0
+        /// Marks moved to a source that supports the sentence, and marks dropped.
+        var repointed = 0, dropped = 0
+        /// Marks left alone: their sentence was too short to judge.
+        var unchecked = 0
+        var changes: [Change] = []
+        /// Time the final check took.
+        var milliseconds = 0.0
+
+        /// The share of judged marks their passage supported, before the check changed anything.
+        var supportedBefore: Double { checked == 0 ? 1 : Double(supported) / Double(checked) }
+        /// The same after: marks moved count as supported, dropped ones are gone.
+        var supportedAfter: Double {
+            let left = checked - dropped
+            return left == 0 ? 1 : Double(supported + repointed) / Double(left)
+        }
+    }
+
+    struct Change: Sendable, Equatable, Codable {
+        let sentence: String
+        let from: [Int]
+        let to: [Int]
+    }
+
+    /// A sentence the passage supports: this share of its content words is in the passage, or a smaller share
+    /// (`looseOverlap`) with one of the passage's sentences close in meaning (`closeMeaning`). Averaged word vectors
+    /// put most sentences of a topic at 0.7 to 0.85, so meaning only tips a near miss; the words decide. Set from
+    /// spot checks of Gemma 4 E4B answers: at 0.5, paraphrases like "give them warm, sweet drinks" for "Hot sweet
+    /// drinks" lost their citation.
+    static let supportedOverlap = 0.4
+    static let looseOverlap = 0.3
+    static let closeMeaning = 0.8
+    /// Another source clearly supports it: at least this share of its words, this much more than the cited one, and
+    /// close in meaning when the embedding is there.
+    static let clearOverlap = 0.65
+    static let clearMargin = 0.25
+    static let clearMeaning = 0.75
+    /// Fewer content words than this and a sentence isn't judged.
+    static let minimumWords = 3
+
+    private struct Prepared {
+        let id: Int
+        /// The start (up to five letters) of every word in its title and passage: a sentence's word is found when
+        /// its `Retriever.key` is one of them, at the start of a word ("cool" in "cooling", not in "school").
+        let starts: Set<Substring>
+        /// Its sentences' vectors, scaled to length 1.
+        let vectors: [[Float]]
+    }
+
+    private let sources: [Prepared]
+    private let ids: Set<Int>
+    private let hasVectors: Bool
+    private var cache: [String: [Int: (overlap: Double, meaning: Double)]] = [:]
+
+    init(sources: [Source]) {
+        let ranker = SemanticRanker.shared
+        var prepared: [Prepared] = []
+        var vectorsFound = false
+        for source in sources {
+            let text = (source.ref.title + ". " + source.text).lowercased()
+            var starts = Set<Substring>()
+            for word in text.split(whereSeparator: { !$0.isLetter && !$0.isNumber }) {
+                for n in 1...min(5, word.count) { starts.insert(word.prefix(n)) }
+            }
+            let sentences = Self.sentences(source.text)
+            let vectors = ranker.vectors(sentences)?.compactMap { $0 }.map(SemanticRanker.normalized) ?? []
+            if !vectors.isEmpty { vectorsFound = true }
+            prepared.append(Prepared(id: source.id, starts: starts, vectors: vectors))
+        }
+        self.sources = prepared
+        ids = Set(sources.map(\.id))
+        hasVectors = vectorsFound
+    }
+
+    /// One citation group in an answer: "[1]", "[2][3]", "[1, 2]", with the numbers it names.
+    private struct Group {
+        let range: Range<String.Index>
+        let numbers: [Int]
+    }
+
+    private static let groupPattern = try! NSRegularExpression(pattern: #"(?:\s*\[\d+(?:\s*[,–-]\s*\d+)*\])+"#)
+    private static let numberPattern = try! NSRegularExpression(pattern: #"\[(\d+(?:\s*[,–-]\s*\d+)*)\]"#)
+
+    /// The answer with its citations checked. While it streams (`final: false`), a citation at the very end may still
+    /// grow ("[1]" before "[2]" arrives) and is left for the next pass.
+    func apply(_ answer: String, final: Bool) -> (text: String, report: Report) {
+        let started = Date()
+        var report = Report()
+        let ns = answer as NSString
+        let matches = Self.groupPattern.matches(in: answer, range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty, !sources.isEmpty else { return (answer, report) }
+        var out = ""
+        var cursor = answer.startIndex
+        var claimFrom = answer.startIndex
+        var previousClaim = ""
+        for m in matches {
+            guard let range = Range(m.range, in: answer) else { continue }
+            if !final, answer.distance(from: range.upperBound, to: answer.endIndex) < 2 { break }
+            let numbers = Self.numbers(in: String(answer[range]))
+            var claim = Self.claim(in: answer, before: range.lowerBound, from: claimFrom)
+            if Retriever.terms(claim).isEmpty { claim = previousClaim }   // "[1]" on its own, after another citation
+            previousClaim = claim
+            claimFrom = range.upperBound
+            out += answer[cursor..<range.lowerBound]
+            cursor = range.upperBound
+            let kept = judge(claim: claim, cited: numbers, final: final, report: &report)
+            if kept == numbers {
+                out += answer[range]
+            } else {
+                report.changes.append(Change(sentence: claim.trimmingCharacters(in: .whitespacesAndNewlines), from: numbers, to: kept))
+                if !kept.isEmpty { out += " " + kept.map { "[\($0)]" }.joined() }
+            }
+        }
+        out += answer[cursor...]
+        report.milliseconds = Date().timeIntervalSince(started) * 1000
+        return (out, report)
+    }
+
+    /// Which of the cited sources to keep for a sentence: the ones that support it, or the one source that clearly
+    /// does when none of them do, or none.
+    #if DEBUG
+    private static let traceScores = ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE_CITATIONS"] != nil
+    #endif
+
+    private func judge(claim: String, cited: [Int], final: Bool, report: inout Report) -> [Int] {
+        let words = Retriever.terms(claim)
+        guard words.count >= Self.minimumWords else {
+            report.unchecked += cited.count
+            return cited
+        }
+        let scores = support(claim: claim, words: words)
+        report.checked += cited.count
+        #if DEBUG
+        if final, Self.traceScores {
+            let line = scores.keys.sorted().map { String(format: "[%d]%@ %.2f/%.2f", $0, cited.contains($0) ? "*" : "", scores[$0]!.overlap, scores[$0]!.meaning) }
+            FileHandle.standardError.write(Data(("citation: \(line.joined(separator: "  "))  \(claim.prefix(90))\n").utf8))
+        }
+        #endif
+        var kept: [Int] = []
+        for n in cited where ids.contains(n) && !kept.contains(n) {
+            guard let s = scores[n], supports(s) else { continue }
+            kept.append(n)
+        }
+        report.supported += kept.count
+        if !kept.isEmpty {
+            report.dropped += cited.count - kept.count
+            return kept
+        }
+        let bestCited = cited.compactMap { scores[$0]?.overlap }.max() ?? 0
+        if let best = scores.filter({ !cited.contains($0.key) }).max(by: { $0.value.overlap < $1.value.overlap }),
+           best.value.overlap >= Self.clearOverlap, best.value.overlap >= bestCited + Self.clearMargin,
+           !hasVectors || best.value.meaning >= Self.clearMeaning {
+            report.repointed += 1
+            report.dropped += cited.count - 1
+            return [best.key]
+        }
+        report.dropped += cited.count
+        return []
+    }
+
+    private func supports(_ s: (overlap: Double, meaning: Double)) -> Bool {
+        s.overlap >= Self.supportedOverlap || (s.overlap >= Self.looseOverlap && s.meaning >= Self.closeMeaning)
+    }
+
+    /// Each source's support for a sentence: the weighted share of its words in the passage, and how close in meaning
+    /// it is to the passage's closest sentence (0 without the embedding).
+    private func support(claim: String, words: [String]) -> [Int: (overlap: Double, meaning: Double)] {
+        if let known = cache[claim] { return known }
+        let vector = (hasVectors ? SemanticRanker.shared.vectors([claim])?.first ?? nil : nil).map(SemanticRanker.normalized)
+        var result: [Int: (overlap: Double, meaning: Double)] = [:]
+        for source in sources {
+            var total = 0.0, found = 0.0
+            for word in words {
+                let w = word.count >= 6 ? 1.5 : 1.0
+                total += w
+                // Long words also by their first four letters: "sealing" and "sealed", "warmer" and "warm".
+                if source.starts.contains(Substring(Retriever.key(word))) || (word.count >= 6 && source.starts.contains(word.prefix(4))) {
+                    found += w
+                }
+            }
+            let meaning = vector.map { v in source.vectors.map { SemanticRanker.dot(v, $0) }.max() ?? 0 } ?? 0
+            result[source.id] = (total > 0 ? found / total : 0, meaning)
+        }
+        if cache.count > 200 { cache.removeAll() }
+        cache[claim] = result
+        return result
+    }
+
+    /// The sentence a citation group belongs to: back from the group to the end of the sentence before it (a line
+    /// break, or ". ", "! ", "? " ending a sentence), not before the previous group.
+    static func claim(in text: String, before end: String.Index, from floor: String.Index) -> String {
+        var i = end
+        // Step over the sentence's own closing punctuation ("water. [1]").
+        while i > floor, let c = text[text.index(before: i)...].first, c == " " || c == "." || c == "!" || c == "?" {
+            i = text.index(before: i)
+        }
+        var start = i
+        while start > floor {
+            let prev = text.index(before: start)
+            let c = text[prev]
+            if c == "\n" { break }
+            if (c == "." || c == "!" || c == "?") && start < text.endIndex && text[start] == " " { break }
+            start = prev
+        }
+        return String(text[start..<i]).trimmingCharacters(in: .whitespaces)
+    }
+
+    static func numbers(in group: String) -> [Int] {
+        var found: [Int] = []
+        for m in numberPattern.matches(in: group, range: NSRange(group.startIndex..., in: group)) {
+            guard let r = Range(m.range(at: 1), in: group) else { continue }
+            for part in group[r].split(separator: ",") {
+                let ends = part.split(whereSeparator: { $0 == "-" || $0 == "–" }).compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+                if ends.count == 2, ends[0] <= ends[1], ends[1] - ends[0] < 20 { found += Array(ends[0]...ends[1]) } else { found += ends }
+            }
+        }
+        var seen = Set<Int>()
+        return found.filter { seen.insert($0).inserted }
+    }
+
+    /// A passage's sentences, for comparing meaning.
+    static func sentences(_ text: String) -> [String] {
+        var out: [String] = []
+        text.enumerateSubstrings(in: text.startIndex..., options: .bySentences) { sub, _, _, _ in
+            if let sub, sub.count > 20 { out.append(sub) }
+        }
+        return out.isEmpty ? [text] : out
     }
 }
 

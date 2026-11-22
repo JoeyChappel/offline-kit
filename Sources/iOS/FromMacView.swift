@@ -63,6 +63,7 @@ struct FromMacView: View {
                     Menu {
                         Button("Use a Different Mac", systemImage: "laptopcomputer") { transfers.forgetMac() }
                     } label: { Image(systemName: "ellipsis.circle") }
+                    .accessibilityLabel("More")
                 }
             }
         }

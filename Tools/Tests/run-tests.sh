@@ -27,7 +27,11 @@ code=$?
 elapsed=$(( SECONDS - started ))
 
 echo "== Offline Kit unit tests =="
-grep -E '^.{0,4}(error:|.*: error:)' "$log" | grep -v '^warning' | head -20
+# XCTest lists every Objective-C class in the process (objc_copyClassList) to find test cases. That sets up the Swift
+# classes in ContactsUICore, loaded with the system frameworks, and CNContactStore's +initialize then checks Contacts
+# access, which fails in the unhosted test process and logs CoreData errors about contactsd and AddressBook. App code
+# never calls Contacts (no such errors or TCC requests in app runs), so those lines are left out here.
+grep -E '^.{0,4}(error:|.*: error:)' "$log" | grep -v '^warning' | grep -vE 'contactsd|AddressBook' | head -20
 grep -E 'recorded an issue' "$log" | grep -v 'known issue' | sed -E 's/^[^A-Za-z]*//' | head -40
 known=$(grep -cE 'recorded a known issue' "$log")
 grep -E 'Test run with [0-9]+ tests' "$log" | sed -E 's/^[^A-Za-z]*//' | tail -1

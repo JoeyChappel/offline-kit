@@ -10,11 +10,19 @@ struct KitCareView: View {
     @Environment(GameLibrary.self) private var games
     @State private var report: CheckupReport?
     @State private var scanning = false
-    @State private var section = CareSection.overview
+    @State private var section = CareSection.initial
     @State private var showingRecommendations = false
     private enum CareSection: String, CaseIterable, Identifiable {
         case overview = "Overview", references = "References", storage = "Storage"
         var id: Self { self }
+        /// Overview, or in debug builds the tab named by -kitSection (references, storage) for screenshots.
+        static var initial: CareSection {
+            #if DEBUG
+            if let name = UserDefaults.standard.string(forKey: "kitSection"),
+               let match = allCases.first(where: { $0.rawValue.lowercased() == name.lowercased() }) { return match }
+            #endif
+            return .overview
+        }
     }
     /// A checkup was asked for while one ran (a fix finished, the library changed): run once more after it.
     @State private var scanAgain = false
@@ -45,6 +53,7 @@ struct KitCareView: View {
                         case .references:
                             savedReferences(report)
                             AnswerIndexCard().id("answer-index")
+                            ArtworkCard().id("artwork")
                             RefreshCard().id("refresh")
                             AgesCard(ages: report.ages, staleMonths: $staleMonths).id("ages")
                         case .storage:

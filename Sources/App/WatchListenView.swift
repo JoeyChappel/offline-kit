@@ -51,6 +51,11 @@ struct WatchListenView: View {
         self.section = section
         _filter = State(initialValue: section ?? .all)
         #if DEBUG
+        // Test hook: -watchFilter video|music|books|audiobooks opens the iPhone's Watch tab on that chip.
+        if section == nil, let value = UserDefaults.standard.string(forKey: "watchFilter"),
+           let chosen = MediaFilter.allCases.first(where: { $0.rawValue == value }) {
+            _filter = State(initialValue: chosen)
+        }
         // Test hook: -musicBrowse songs|artists|genres opens Music on that tab (for profiling the long lists).
         if section == .music, let value = UserDefaults.standard.string(forKey: "musicBrowse"),
            let browse = MusicBrowse.allCases.first(where: { $0.rawValue.lowercased() == value.lowercased() }) {
@@ -250,7 +255,13 @@ struct WatchListenView: View {
         #if os(macOS)
         .overlay(alignment: .bottom) { SendNoticeBanner() }
         #endif
+        #if os(iOS)
+        // The page has its own big title; a second one in the navigation bar showed twice once the picture reached the top.
+        .navigationTitle("")
+        .navigationBarTitleDisplayMode(.inline)
+        #else
         .navigationTitle(title)
+        #endif
         .toolbar {
             // A rescan with things already showing: a small spinner, so a change that's on its way doesn't look missed.
             ToolbarItem {
@@ -486,6 +497,8 @@ struct WatchListenView: View {
                     }
                 }
             }
+            // The chips scroll to the screen's edge, not to the page margin where "Music" and "Books" were cut off.
+            .scrollClipDisabled()
             }
             if filter == .music {
                 Picker("Browse music", selection: $musicBrowse) { ForEach(MusicBrowse.allCases) { Text($0.rawValue).tag($0) } }
@@ -502,6 +515,7 @@ struct WatchListenView: View {
                             }
                         }.padding(.vertical, 8).padding(.horizontal, 2)
                     }
+                    .scrollClipDisabled()
                 }
             }
             ViewThatFits(in: .horizontal) {

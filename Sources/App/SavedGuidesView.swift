@@ -4,57 +4,22 @@ import SwiftUI
 struct SavedGuidesSection: View {
     @Environment(Household.self) private var household
     @Environment(Library.self) private var library
+    @Environment(KitNavigation.self) private var navigation
     @Environment(\.openArticle) private var openArticle
     @State private var showBinder = false
 
     var body: some View {
-        @Bindable var household = household
-        let guides = household.data.extra.savedGuides
-        VStack(alignment: .leading, spacing: 16) {
-            SectionCard(symbol: "books.vertical", title: "Print the binder",
-                        subtitle: "One printable PDF with a cover and contents, emergency numbers, the power-out guide, these guides and your supplies list. Paper still works when every device is dead.") {
-                Button { showBinder = true } label: { Label("Print the Binder…", systemImage: "printer") }
-                    .buttonStyle(.borderedProminent)
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Guides & binder").font(.title.bold())
+                Text("Keep useful articles together. Make a paper backup when you’re ready.").font(.callout).foregroundStyle(.secondary)
             }
-
-            if guides.isEmpty {
-                ContentUnavailableView {
-                    Label("No saved guides yet", systemImage: "bookmark")
-                } description: {
-                    Text("Open an article in Library and choose Save Guide. Saved guides are listed here and go into the printed binder.")
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 20) {
+                    savedGuides.frame(minWidth: 420, maxWidth: .infinity)
+                    paperBackup.frame(minWidth: 280, maxWidth: 350)
                 }
-                .frame(maxWidth: .infinity).card(padding: 18)
-            }
-
-            ForEach($household.data.extra.savedGuides) { $guide in
-                let book = library.book(guide.ref.bookID)
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(alignment: .top, spacing: 12) {
-                        if let book { BookIcon(book: book, size: 38) } else { KitSymbol("bookmark.fill") }
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(guide.ref.title.isBlank ? "Untitled" : guide.ref.title).font(.headline)
-                            Text(book?.shortTitle ?? "\(guide.bookTitle) · archive not connected")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer(minLength: 8)
-                        Button("Open") { openArticle(guide.ref) }
-                            .buttonStyle(.bordered)
-                            .disabled(book == nil)
-                        Menu {
-                            Button("Move Up") { move(guide.id, by: -1) }.disabled(guides.first?.id == guide.id)
-                            Button("Move Down") { move(guide.id, by: 1) }.disabled(guides.last?.id == guide.id)
-                            Divider()
-                            Button("Remove", role: .destructive) {
-                                household.data.extra.savedGuides.removeAll { $0.id == guide.id }
-                            }
-                        } label: { Image(systemName: "ellipsis.circle") }
-                        .menuStyle(.button).buttonStyle(.borderless).menuIndicator(.hidden).fixedSize()
-                        .accessibilityLabel("More")
-                    }
-                    TextField("Notes, like “Use this for the tornado shelter”", text: $guide.notes, axis: .vertical)
-                        .lineLimit(1...4).textFieldStyle(.roundedBorder)
-                }
-                .card(padding: 16)
+                VStack(alignment: .leading, spacing: 18) { savedGuides; paperBackup }
             }
         }
         .sheet(isPresented: $showBinder) { BinderSheet() }
@@ -77,6 +42,91 @@ struct SavedGuidesSection: View {
             }
         }
         #endif
+    }
+
+    private var savedGuides: some View {
+        @Bindable var household = household
+        let guides = household.data.extra.savedGuides
+        return VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("Saved guides").font(.title2.bold())
+                Spacer(minLength: 0)
+                Text("\(guides.count) \(guides.count == 1 ? "guide" : "guides")").font(.callout).foregroundStyle(.secondary)
+            }
+            if guides.isEmpty {
+                ContentUnavailableView {
+                    Label("Your useful articles, kept together", systemImage: "bookmark")
+                } description: {
+                    Text("Open an article in Library and choose Save Guide. Add your notes here and include guides in your printed binder.")
+                } actions: {
+                    Button("Browse Library", systemImage: "books.vertical") { navigation.selection = .library }
+                        .buttonStyle(.borderedProminent)
+                }.frame(maxWidth: .infinity).card(padding: 18)
+            }
+            ForEach($household.data.extra.savedGuides) { $guide in
+                let book = library.book(guide.ref.bookID)
+                VStack(alignment: .leading, spacing: 10) {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 12) {
+                            guideIdentity(guide, book: book).frame(minWidth: 220)
+                            Spacer(minLength: 8)
+                            guideActions(guide, book: book)
+                        }
+                        VStack(alignment: .leading, spacing: 12) {
+                            guideIdentity(guide, book: book)
+                            guideActions(guide, book: book)
+                        }
+                    }
+                    TextField("Notes, like “Use this for the tornado shelter”", text: $guide.notes, axis: .vertical)
+                        .lineLimit(1...4).textFieldStyle(.roundedBorder)
+                }
+                .card(padding: 16)
+            }
+            Label("Saved guides stay in the order you choose.", systemImage: "list.bullet")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private func guideIdentity(_ guide: SavedGuide, book: Book?) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            if let book { BookIcon(book: book, size: 38) } else { KitSymbol("bookmark.fill") }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(guide.ref.title.isBlank ? "Untitled" : guide.ref.title).font(.headline)
+                Text(book?.shortTitle ?? "\(guide.bookTitle) · archive not connected")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func guideActions(_ guide: SavedGuide, book: Book?) -> some View {
+        HStack(spacing: 10) {
+            Button("Open") { openArticle(guide.ref) }.buttonStyle(.bordered).disabled(book == nil)
+            Menu {
+                Button("Move Up") { move(guide.id, by: -1) }.disabled(household.data.extra.savedGuides.first?.id == guide.id)
+                Button("Move Down") { move(guide.id, by: 1) }.disabled(household.data.extra.savedGuides.last?.id == guide.id)
+                Divider()
+                Button("Remove", role: .destructive) {
+                    household.data.extra.savedGuides.removeAll { $0.id == guide.id }
+                }
+            } label: { Image(systemName: "ellipsis.circle") }
+                .menuStyle(.button).buttonStyle(.borderless).menuIndicator(.hidden).fixedSize()
+                .accessibilityLabel("More")
+        }
+    }
+
+    private var paperBackup: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Image(systemName: "book").font(.largeTitle).foregroundStyle(.tint)
+            Text("Your paper backup").font(.title2.bold())
+            Text("One PDF with a cover and contents, your selected emergency information, the power-out guide, saved guides and supplies.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Button { showBinder = true } label: { Label("Print the Binder…", systemImage: "printer") }
+                .buttonStyle(.borderedProminent)
+            Text(household.data.extra.savedGuides.isEmpty ? "You can build a binder before saving any guides." : "Choose which sections to include before printing.")
+                .font(.caption).foregroundStyle(.secondary)
+            Label("Review household details before printing or sharing.", systemImage: "lock")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }.frame(maxWidth: .infinity, alignment: .leading).card(padding: 20)
     }
 
     private func move(_ id: String, by offset: Int) {

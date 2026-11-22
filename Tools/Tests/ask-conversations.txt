@@ -1,13 +1,69 @@
-# Ask conversation benchmark (okit --ask-bench): three conversations of a question and two follow-ups.
-# Topics the synthetic test archives and the real MDWiki, Stack Exchange and iFixit archives both cover.
-What should I do for a burn from boiling water?
-Should I put ice on it?
-What if it blisters?
+# Ask conversation benchmark (okit --ask-bench, okit --followup-check): 16 conversations of 2 to 4 turns.
+# Health, repair, food safety, outdoor and household topics the real MDWiki, iFixit and Stack Exchange archives
+# cover (and the synthetic test archives partly cover), with short, pronoun-led follow-ups.
+#
+# One question per line; "---" starts a new conversation. After "=>", what an on-topic source is about:
+# groups separated by ";", each a list of word starts separated by "|". A source (its title and passage) is on
+# topic when every group has a match, so "boil; altitude|elevation" needs both boiling and altitude.
+# "=> none" marks a question the library doesn't cover: the answer should say so.
+What should I do for a burn from boiling water? => burn|scald
+Should I put ice on it? => burn|scald; ice|cold
+What if it blisters? => burn|scald; blister
 ---
-How do I fix a leaking faucet?
-What tools do I need for that?
-What if it still drips afterward?
+How do I fix a leaking faucet? => faucet|tap; leak|drip
+What tools do I need for that? => faucet|tap; tool|wrench|screwdriver|plier
+What if it still drips afterward? => faucet|tap; drip|leak
 ---
-How can I purify water without power?
-How long should I boil it?
-Is that different at high altitude?
+How can I purify water without power? => water; purif|boil|filter|disinfect|bleach|chlor
+How long should I boil it? => water; boil
+Is that different at high altitude? => boil; altitude|elevation
+---
+How long can cooked rice sit out? => rice
+What about chicken? => chicken|poultry
+How long does it keep in the fridge? => chicken|poultry|meat; fridge|refrigerat
+---
+Is food in the freezer safe after a power outage? => freez|frozen; power|outage|thaw
+What about the fridge? => fridge|refrigerat; power|outage|safe|spoil|temperature
+Can I refreeze it if it thawed? => refreez|thaw
+---
+How do I bring down a fever? => fever
+What about kids? => fever; child|kid|infant|pediatric|baby
+How much ibuprofen is safe for them? => ibuprofen; child|kid|pediatric|infant|dose
+---
+How do I keep a tent dry in the rain? => tent; rain|wet|dry|waterproof
+What about condensation inside it? => tent; condensation
+Does a ground sheet help with that? => tent; ground|footprint|tarp
+---
+What are the signs of hypothermia? => hypotherm
+How do I warm someone up? => hypotherm|rewarm
+What about kids? => hypotherm|cold; child|kid|infant|baby
+---
+My car battery is dead. How do I jump start it? => jump; batter
+What if it still won't start after that? => start; batter|starter|alternator|crank
+How long should I let it run afterward? => batter|alternator|charg; run|idl|driv
+---
+How do I reset a tripped GFCI outlet? => gfci
+Why does it keep tripping? => gfci|breaker; trip
+Is it safe to replace it myself? => gfci|outlet|receptacle; replac|install|wir
+---
+When should I plant tomatoes? => tomato
+How often should I water them? => tomato; water
+Why are the leaves turning yellow? => tomato; yellow
+---
+How do I treat a bee sting? => sting|bee
+What if they're allergic? => allerg|anaphyla; sting|bee|venom|insect
+---
+How do I get rid of mold in the bathroom? => mold|mould
+Does bleach work on it? => bleach; mold|mould
+Is it dangerous to breathe? => mold|mould; health|breath|spore|allerg|toxic|lung|respirat|inhal
+---
+How do I can tomatoes safely at home? => canning|canned|canner|jar|preserv; tomato
+Do I need a pressure canner for that? => pressure; canning|canner|canned|jar
+How long do they keep? => canning|canned|canner|jar|preserv; keep|last|stor|shelf|year|month
+---
+I think I sprained my ankle. What should I do? => sprain|ankle
+Should I use heat or ice on it? => sprain|ankle; ice|heat|cold
+When can I walk on it again? => sprain|ankle; walk|weight|recover|heal
+---
+Who won the 1966 FIFA World Cup? => none
+Who was their captain? => none

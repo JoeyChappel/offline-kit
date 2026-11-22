@@ -65,7 +65,10 @@ final class TempDir {
 }
 
 /// Waits for `condition` (polling), up to `timeout` seconds. True if it became true.
-func eventually(timeout: Double = 3, _ condition: () -> Bool) async -> Bool {
+/// Runs on the caller's actor, so a main-actor test can read main-actor state in `condition` (without
+/// `isolation` the polling ran on the global executor: a data race the Thread Sanitizer reported).
+func eventually(timeout: Double = 3, isolation: isolated (any Actor)? = #isolation,
+                _ condition: () -> Bool) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
         if condition() { return true }

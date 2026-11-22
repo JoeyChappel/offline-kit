@@ -47,6 +47,9 @@ struct OnboardingView: View {
     @State private var chosen: Set<String> = []          // pack names ticked in Review
     @State private var reviewedAreas: Set<SubjectArea> = []
     @State private var startedSummary: StartedSummary?
+    @State private var interestsWide = false
+    @State private var reviewWide = false
+    @State private var collapsedReviewAreas: Set<SubjectArea> = []
     let dismiss: () -> Void
 
     private let steps = 6
@@ -61,18 +64,23 @@ struct OnboardingView: View {
                 Text(step < steps ? "\(step + 1) of \(steps)" : "Setup complete").font(.caption).foregroundStyle(.secondary)
             }.padding(24)
             ProgressView(value: Double(min(step + 1, steps)), total: Double(steps)).padding(.horizontal, 24)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    switch step {
-                    case 0: welcome
-                    case 1: howItWorks
-                    case 2: interests
-                    case 3: storage
-                    case 4: answers
-                    case 5: review
-                    default: started
+            Group {
+                if step == steps - 1 {
+                    review.padding(24)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 22) {
+                            switch step {
+                            case 0: welcome
+                            case 1: howItWorks
+                            case 2: interests
+                            case 3: storage
+                            case 4: answers
+                            default: started
+                            }
+                        }.padding(24)
                     }
-                }.padding(24)
+                }
             }
             footer
         }
@@ -80,7 +88,7 @@ struct OnboardingView: View {
         .interactiveDismissDisabled(step == 0 || step == steps)
         #if os(macOS)
         // Flexible height: the steps scroll, so a smaller window still shows the whole sheet with its buttons.
-        .frame(width: 640)
+        .frame(width: [2, 3, steps - 1].contains(step) ? 900 : 640)
         .frame(minHeight: 480, idealHeight: 700)
         .fileImporter(isPresented: $pickingFolder, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result {
@@ -101,10 +109,10 @@ struct OnboardingView: View {
             // Without Ollama or Apple Intelligence, the built-in model is the only way to get answers.
             wantsModel = (model.ollamaModels ?? []).isEmpty && !AppleEngine.isAvailable
                 && LocalModels.installed(libraryFolders: library.folders).isEmpty
-            let cache = (KitLocation.portableRoot ?? URL.cachesDirectory.appending(path: "OfflineKit"))
-                .appending(path: ".kiwix-catalog.xml")
+            let cache = KitRefresh.catalogCache
             do { catalog = try await Catalog.load(cache: cache) } catch { catalogError = error.localizedDescription }
             #if DEBUG
+            if let script = UserDefaults.standard.string(forKey: "onboardingScript") { await runScript(script) }
             // Test hook: -onboardingStep N opens at that step.
             let start = UserDefaults.standard.integer(forKey: "onboardingStep")
             if start > 0 { step = min(start, steps - 1); if step == steps - 1 { preselect() } }
@@ -136,65 +144,125 @@ struct OnboardingView: View {
         explanation("Check every source", "Numbered citations open the original saved article.", "checkmark.shield")
     }
 
-    @ViewBuilder private var interests: some View {
-        KitHeading(eyebrow: "BUILD YOUR KIT", title: "What matters to your family?",
-                   subtitle: "Choose as many areas as you like. We’ve ticked two common starting points. You’ll see exactly what each includes, and its size, before anything downloads.")
-        ForEach(SubjectArea.allCases) { item in
-            let on = areas.contains(item)
-            Button {
-                if on { areas.remove(item) } else { areas.insert(item) }
-            } label: {
-                HStack(spacing: 12) {
-                    KitSymbol(item.symbol)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.title).foregroundStyle(.primary)
-                        Text(item.subtitle).font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: on ? "checkmark.square.fill" : "square")
-                        .imageScale(.large).foregroundStyle(Color.accentColor)
-                }.card(padding: 9)
-            }.buttonStyle(.plain)
-            .accessibilityAddTraits(on ? .isSelected : [])
+    private var interests: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            KitHeading(eyebrow: "BUILD YOUR KIT", title: "What would you like in your kit?",
+                       subtitle: "Choose as many areas as you like. Review the exact downloads and sizes before anything starts.")
+            Pill(text: "\(areas.count) \(areas.count == 1 ? "area" : "areas") selected", symbol: "checkmark.circle", tint: .accentColor)
+            Text(areas.isEmpty ? "Choose at least one area to continue." : "You can change any choice before downloading.")
+                .font(.callout).foregroundStyle(areas.isEmpty ? Color.orange : Color.secondary)
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 12), count: interestsWide ? 2 : 1), spacing: 12) {
+                ForEach(SubjectArea.allCases) { item in
+                    interestChoice(item)
+                }
+            }
+        }
+        .onGeometryChange(for: Bool.self) { $0.size.width >= 660 } action: { interestsWide = $0 }
+    }
+
+    private func interestChoice(_ item: SubjectArea) -> some View {
+        let on = areas.contains(item)
+        return Button {
+            if on { areas.remove(item) } else { areas.insert(item) }
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                KitSymbol(item.symbol)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(item.title).font(.headline).foregroundStyle(.primary)
+                    Text(item.subtitle).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: on ? "checkmark.square.fill" : "square")
+                    .imageScale(.large).foregroundStyle(Color.accentColor)
+            }.frame(maxWidth: .infinity, minHeight: 65, alignment: .leading).card(padding: 14)
+                .overlay { RoundedRectangle(cornerRadius: Design.corner).stroke(on ? Color.accentColor.opacity(0.7) : .clear, lineWidth: 1.5) }
+        }.buttonStyle(.plain).accessibilityAddTraits(on ? .isSelected : [])
+    }
+
+    private var storage: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            KitHeading(eyebrow: "WHERE TO KEEP IT", title: "Where should your library live?",
+                       subtitle: "Choose a place for your offline references and media.")
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 20) {
+                    storageLocations.frame(minWidth: 340, maxWidth: .infinity)
+                    startingLibrary.frame(minWidth: 260, maxWidth: 320)
+                }
+                VStack(alignment: .leading, spacing: 18) { storageLocations; startingLibrary }
+            }
+            if let estimate = estimatedBytes {
+                if let destination, destination.cachedFreeSpace < estimate + 1_000_000_000 {
+                    Label("Not enough room on \(destination.name): your choices need about \(bytes(estimate)). Choose a USB drive, or pick fewer items on the next screens.",
+                          systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                }
+            }
+            if let destination, destination.isFAT32 {
+                Label("This drive can’t hold files over 4 GB, so some items won’t fit. Choose This Mac, or reformat the drive as exFAT in Disk Utility.",
+                      systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
         }
     }
 
-    @ViewBuilder private var storage: some View {
-        KitHeading(eyebrow: "WHERE TO KEEP IT", title: "Choose where your library lives.",
-                   subtitle: "Libraries can be large. A USB drive works well, and Offline Kit can run straight from it on any Apple silicon Mac with macOS 26 or later.")
-        ForEach(locations) { location in
-            let on = destination == location
-            Button { destination = location } label: {
-                HStack(spacing: 12) {
-                    KitSymbol(location.symbol)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(location.name).foregroundStyle(.primary)
-                        Text("\(bytes(location.cachedFreeSpace)) free")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    Image(systemName: on ? "largecircle.fill.circle" : "circle")
-                        .imageScale(.large).foregroundStyle(Color.accentColor)
-                }.card(padding: 12)
-            }.buttonStyle(.plain)
-            .accessibilityAddTraits(on ? .isSelected : [])
-        }
-        #if os(macOS)
-        Button { pickingFolder = true } label: { Label("Choose a USB Drive or Folder…", systemImage: "folder.badge.plus") }
-        #endif
-        if let estimate = estimatedBytes {
-            if let destination, destination.cachedFreeSpace < estimate + 1_000_000_000 {
-                Label("Not enough room on \(destination.name): your choices need about \(bytes(estimate)). Choose a USB drive, or pick fewer items on the next screens.",
-                      systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-            } else {
-                Text("Your choices need about \(bytes(estimate)) to start. You can add or remove items on the next screens.")
-                    .foregroundStyle(.secondary)
+    private var storageLocations: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("SAVE LOCATION").font(.caption.weight(.semibold)).tracking(1).foregroundStyle(.secondary)
+            ForEach(locations) { location in
+                let on = destination == location
+                Button { destination = location } label: {
+                    HStack(spacing: 12) {
+                        KitSymbol(location.symbol)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(location.name).font(.headline).foregroundStyle(.primary)
+                            Text("\(bytes(location.cachedFreeSpace)) free").font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: on ? "largecircle.fill.circle" : "circle").imageScale(.large).foregroundStyle(Color.accentColor)
+                    }.card(padding: 14)
+                        .overlay { RoundedRectangle(cornerRadius: Design.corner).stroke(on ? Color.accentColor.opacity(0.6) : .clear) }
+                }.buttonStyle(.plain).accessibilityAddTraits(on ? .isSelected : [])
             }
+            #if os(macOS)
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Use a USB drive or another folder", systemImage: "externaldrive").font(.headline)
+                Text("Choose a location you can keep connected while downloading.").font(.callout).foregroundStyle(.secondary)
+                Button { pickingFolder = true } label: { Label("Choose a USB Drive or Folder…", systemImage: "folder.badge.plus") }
+                    .buttonStyle(.bordered)
+            }.card(padding: 16)
+            #endif
         }
-        if let destination, destination.isFAT32 {
-            Label("This drive can’t hold files over 4 GB, so some items won’t fit. Choose This Mac, or reformat the drive as exFAT in Disk Utility.",
-                  systemImage: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-        }
+    }
+
+    private var startingLibrary: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Your starting library").font(.headline)
+            if let estimate = estimatedBytes {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("About \(bytes(estimate))").font(.title.bold()).foregroundStyle(.tint).monospacedDigit()
+                    Text("Estimated download size").font(.caption).foregroundStyle(.secondary)
+                }
+            } else if catalogError != nil {
+                Text("Estimate unavailable").font(.title3.weight(.semibold))
+                Text("The online download list couldn’t be loaded. You can review choices later.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ProgressView("Loading download estimate…").controlSize(.small)
+            }
+            Divider()
+            Text("Selected location").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+            if let destination {
+                Label(destination.name, systemImage: destination.symbol).font(.headline)
+                Text("\(bytes(destination.cachedFreeSpace)) free").font(.callout).foregroundStyle(.secondary).monospacedDigit()
+            } else {
+                Text("Choose a save location.").font(.callout).foregroundStyle(.secondary)
+            }
+            Text("You can add or remove items on the next screens.").font(.callout).foregroundStyle(.secondary)
+            Divider()
+            #if os(macOS)
+            Text("A library on a USB drive can travel with you. Offline Kit can run from a drive on Apple silicon Macs with macOS 26 or later. Copy my kit can include the app later.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            #endif
+            Text("Continue to choose an answer model and review downloads before anything starts.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }.card(padding: 18)
     }
 
     @ViewBuilder private var answers: some View {
@@ -274,18 +342,37 @@ struct OnboardingView: View {
         return "The suggested starter set is about 10 GB\(model)."
     }
 
-    @ViewBuilder private var review: some View {
-        KitHeading(eyebrow: "REVIEW", title: "Here’s what will download.",
-                   subtitle: "Untick anything you don’t want. Videos and very large collections start unticked. You can add more anytime in Get Resources.")
-        Picker("Include", selection: $pictures) {
-            ForEach(PictureChoice.allCases) { Text($0.label).tag($0) }
+    private var review: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            if reviewWide { reviewHeading }
+            HStack(alignment: .top, spacing: 20) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if !reviewWide { reviewHeading; downloadSummary }
+                        Picker("Include", selection: $pictures) {
+                            ForEach(PictureChoice.allCases) { Text($0.label).tag($0) }
+                        }.pickerStyle(.segmented)
+                        Text(pictures.explanation).font(.caption).foregroundStyle(.secondary)
+                        reviewGroups
+                    }
+                }
+                if reviewWide { ScrollView { downloadSummary }.frame(width: 280) }
+            }
         }
-        .pickerStyle(.segmented)
-        Text(pictures.explanation).font(.caption).foregroundStyle(.secondary)
+        .onGeometryChange(for: Bool.self) { $0.size.width >= 760 } action: { reviewWide = $0 }
+    }
+
+    private var reviewHeading: some View {
+        KitHeading(eyebrow: "REVIEW", title: "Review your downloads.",
+                   subtitle: "Untick anything you don’t want. Nothing downloads until you choose Download.")
+    }
+
+    @ViewBuilder private var reviewGroups: some View {
         if let catalog {
             ForEach(SubjectArea.allCases.filter(areas.contains)) { area in
-                VStack(alignment: .leading, spacing: 8) {
-                    Label(area.title, systemImage: area.symbol).font(.headline)
+                DisclosureGroup(isExpanded: Binding(get: { !collapsedReviewAreas.contains(area) }, set: {
+                    if $0 { collapsedReviewAreas.remove(area) } else { collapsedReviewAreas.insert(area) }
+                })) {
                     ForEach(area.packs.filter { !isInstalled($0.name) }) { pack in
                         if let entry = catalog.entry(for: pack.name, pictures: pictures) {
                             Toggle(isOn: Binding(get: { chosen.contains(pack.name) },
@@ -304,6 +391,8 @@ struct OnboardingView: View {
                             #endif
                         }
                     }
+                } label: {
+                    Label(area.title, systemImage: area.symbol).font(.headline)
                 }.card(padding: 14)
             }
             if wantsModel {
@@ -313,12 +402,41 @@ struct OnboardingView: View {
                     Text(bytes(LocalModels.recommended.size)).monospacedDigit().foregroundStyle(.secondary)
                 }.card(padding: 14)
             }
+            Text("Resources shared by more than one area are downloaded once.").font(.caption).foregroundStyle(.secondary)
         } else if let catalogError {
             Label("Can’t reach the online download list right now. \(catalogError) You can choose resources later in Get Resources.",
                   systemImage: "wifi.exclamationmark").foregroundStyle(.orange)
         } else {
             ProgressView("Loading what’s available…")
         }
+    }
+
+    private var downloadSummary: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Your download").font(.headline)
+            if catalog != nil {
+                Text(totalBytes == 0 ? "Nothing selected" : bytes(totalBytes)).font(.title.bold()).foregroundStyle(.tint).monospacedDigit()
+                Text("Total to download").font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text(catalogError == nil ? "Loading download sizes…" : "Download sizes unavailable").font(.callout).foregroundStyle(.secondary)
+            }
+            Divider()
+            if let destination {
+                Label(destination.name, systemImage: destination.symbol).font(.headline)
+                Text("\(bytes(destination.cachedFreeSpace)) free").font(.callout).monospacedDigit().foregroundStyle(.secondary)
+                if catalog != nil && !fits {
+                    Text("Needs \(bytes(totalBytes)); only \(bytes(destination.cachedFreeSpace)) free on \(destination.name). Untick some items or choose Text only.")
+                        .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    Button("Use a USB Drive Instead…") { step = 3 }.font(.caption.weight(.semibold)).buttonStyle(.borderless).foregroundStyle(Color.accentColor)
+                }
+            } else {
+                Text("Choose a save location.").font(.callout).foregroundStyle(.secondary)
+                Button("Choose Location…") { step = 3 }.buttonStyle(.borderless)
+            }
+            Divider()
+            Text("Videos and very large collections start unticked.").font(.caption).foregroundStyle(.secondary)
+            Text("Downloads continue in the background.").font(.caption).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity, alignment: .leading).card(padding: 18)
     }
 
     @ViewBuilder private var started: some View {
@@ -354,35 +472,26 @@ struct OnboardingView: View {
                 if step < steps { Button("Skip for now") { finish(start: false) }.buttonStyle(.borderless).help("Close setup. You can choose what to download anytime in Get Resources.") }
             }
             Spacer()
-            if step == steps - 1 && catalog != nil {
-                VStack(alignment: .trailing, spacing: 3) {
-                    Text(totalBytes == 0 ? "Nothing selected" : "\(bytes(totalBytes)) to download").font(.callout.weight(.medium))
-                    if let destination {
-                        if fits {
-                            Text("\(bytes(destination.cachedFreeSpace)) free on \(destination.name) · Downloads continue in the background")
-                                .font(.caption).foregroundStyle(.secondary)
-                        } else {
-                            Text("Needs \(bytes(totalBytes)); only \(bytes(destination.cachedFreeSpace)) free on \(destination.name). Untick some items or choose Text only.")
-                                .font(.caption).foregroundStyle(.orange).multilineTextAlignment(.trailing)
-                            Button("Use a USB Drive Instead…") { step = 3 }.font(.caption.weight(.semibold)).buttonStyle(.borderless).foregroundStyle(Color.accentColor)
-                        }
-                    }
-                }
-            }
             if step == steps {
                 Button("Done") { navigation.selection = .library; dismiss() }
                     .buttonStyle(.bordered).controlSize(.large)
             }
-            Button(primaryTitle) {
-                if step == steps { navigation.getResources(nil); dismiss() }
-                else if step == steps - 1 { finish(start: true) }
-                else { advance() }
-            }
+            Button(primaryTitle) { primaryAction() }
             .buttonStyle(.borderedProminent).controlSize(.large)
             .keyboardShortcut(.defaultAction)
-            .disabled((step == 2 && areas.isEmpty) || (step == 3 && destination == nil)
-                      || (step == steps - 1 && catalog != nil && (!fits || totalBytes == 0)))
+            .disabled(primaryDisabled)
         }.padding(24)
+    }
+
+    private var primaryDisabled: Bool {
+        (step == 2 && areas.isEmpty) || (step == 3 && destination == nil)
+            || (step == steps - 1 && catalog != nil && (!fits || totalBytes == 0))
+    }
+
+    private func primaryAction() {
+        if step == steps { navigation.getResources(nil); dismiss() }
+        else if step == steps - 1 { finish(start: true) }
+        else { advance() }
     }
 
     private var primaryTitle: String {
@@ -463,6 +572,8 @@ struct OnboardingView: View {
             if wantsModel, LocalModels.installed(libraryFolders: library.folders).isEmpty {
                 downloads.enqueue(model: LocalModels.recommended, to: LocalModels.folder(forLibrary: folder))
             }
+            // The person just chose what to download: Get Resources must not tick its own defaults on top.
+            navigation.resourcesPreselected = true
             navigation.getResources(nil)
             startedSummary = StartedSummary(items: entries.count + (wantsModel ? 1 : 0), bytes: totalBytes, place: destination.name)
             step = steps          // confirmation screen
@@ -485,6 +596,36 @@ struct OnboardingView: View {
 
     private func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
 }
+
+#if DEBUG
+extension OnboardingView {
+    /// Test hook: -onboardingScript "next,next,areas:emergency+health,pictures:noPictures,model:off,back,wait:3,next,download,done"
+    /// presses the setup's buttons for you, one every -onboardingGap seconds (default 2), so a run can be photographed with
+    /// -snapshot. The primary button respects the same rules as the real one: a step that can't continue stays put.
+    /// next, back, skip, download (the last Review step), progress (Show Progress), done; areas:a+b, pictures:full|noPictures|summaries,
+    /// model:on|off, location:N (the Nth save location), wait:S.
+    fileprivate func runScript(_ script: String) async {
+        let gap = Double(UserDefaults.standard.string(forKey: "onboardingGap") ?? "") ?? 2
+        for raw in script.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces) }) {
+            let parts = raw.split(separator: ":", maxSplits: 1).map(String.init)
+            let action = parts.first ?? "", argument = parts.count > 1 ? parts[1] : ""
+            try? await Task.sleep(for: .seconds(action == "wait" ? Double(argument) ?? 1 : gap))
+            switch action {
+            case "next", "download": if !primaryDisabled { primaryAction() }
+            case "progress": if step == steps { primaryAction() }
+            case "back": if step > 0 && step < steps { step -= 1 }
+            case "skip": if step > 0 && step < steps { finish(start: false) }
+            case "done": if step == steps { navigation.selection = .library; dismiss() }
+            case "areas": areas = Set(argument.split(separator: "+").compactMap { SubjectArea(rawValue: String($0)) })
+            case "pictures": if let value = PictureChoice(rawValue: argument) { pictures = value }
+            case "model": wantsModel = argument == "on"
+            case "location": if let index = Int(argument), locations.indices.contains(index) { destination = locations[index] }
+            default: break
+            }
+        }
+    }
+}
+#endif
 
 extension Notification.Name {
     /// Posted by Settings › Show Welcome Again.

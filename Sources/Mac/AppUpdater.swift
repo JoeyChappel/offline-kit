@@ -208,8 +208,24 @@ final class AppUpdater {
         } catch {
             if (error as? URLError)?.code == .cancelled { phase = .available(manifest); return }
             NSLog("Update failed: %@", String(describing: error))
+            Self.saveFailure(error, manifest: manifest)
             phase = .failed(Self.describe(error, checking: false), manifest)
         }
+    }
+
+    /// The last failed update, kept beside the Updates folder (which each attempt clears) so it can be read later.
+    nonisolated static var failureLog: URL { KitLocation.caches.appending(path: "update-failure.txt") }
+
+    nonisolated private static func saveFailure(_ error: Error, manifest: UpdateManifest) {
+        let info = Bundle.main.infoDictionary
+        let text = """
+        \(ISO8601DateFormatter().string(from: Date()))
+        From \(info?["CFBundleShortVersionString"] as? String ?? "?") (\(info?["CFBundleVersion"] as? String ?? "?")) to \(manifest.version) (\(manifest.build))
+        \(String(describing: error))
+
+        """
+        try? FileManager.default.createDirectory(at: failureLog.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? text.write(to: failureLog, atomically: true, encoding: .utf8)
     }
 
     private func download(_ manifest: UpdateManifest) async throws -> URL {
@@ -342,22 +358,24 @@ final class AppUpdater {
               let info = NSDictionary(contentsOf: newApp.appending(path: "Contents/Info.plist")) else {
             throw UpdateError.damaged
         }
-        guard info["CFBundleIdentifier"] as? String == bundleID,
-              info["CFBundleVersion"] as? String == String(manifest.build) else {
-            throw UpdateError.wrongApp
+        let foundID = info["CFBundleIdentifier"] as? String, foundBuild = info["CFBundleVersion"] as? String
+        guard foundID == bundleID, foundBuild == String(manifest.build) else {
+            throw UpdateError.wrongApp("expected \(bundleID) build \(manifest.build), the download is \(foundID ?? "unnamed") build \(foundBuild ?? "unknown")")
         }
 
         var code: SecStaticCode?
         var req: SecRequirement?
-        guard SecStaticCodeCreateWithPath(newApp as CFURL, [], &code) == errSecSuccess, let code,
-              SecRequirementCreateWithString(requirement as CFString, [], &req) == errSecSuccess, let req else {
-            throw UpdateError.unsigned
-        }
+        let opened = SecStaticCodeCreateWithPath(newApp as CFURL, [], &code)
+        guard opened == errSecSuccess, let code else { throw UpdateError.unsigned("couldn’t read the app’s signature (error \(opened))") }
+        let parsed = SecRequirementCreateWithString(requirement as CFString, [], &req)
+        guard parsed == errSecSuccess, let req else { throw UpdateError.unsigned("couldn’t set up the check (error \(parsed))") }
         let flags = SecCSFlags(rawValue: kSecCSCheckAllArchitectures | kSecCSCheckNestedCode | kSecCSStrictValidate)
         var problem: Unmanaged<CFError>?
-        guard SecStaticCodeCheckValidityWithErrors(code, flags, req, &problem) == errSecSuccess else {
-            if let problem { NSLog("Update signature: %@", String(describing: problem.takeRetainedValue())) }
-            throw UpdateError.unsigned
+        let checked = SecStaticCodeCheckValidityWithErrors(code, flags, req, &problem)
+        guard checked == errSecSuccess else {
+            let reason = problem.map { String(describing: $0.takeRetainedValue()) } ?? "error \(checked)"
+            NSLog("Update signature: %@", reason)
+            throw UpdateError.unsigned("error \(checked): \(reason)")
         }
         // Not downloaded by a browser, so there's no quarantine flag to clear, but a copy carried over from
         // somewhere else could have one: it would make macOS open the app from a temporary copy.
@@ -388,10 +406,11 @@ final class AppUpdater {
     }
 
     enum UpdateError: Error {
-        case server(Int), damaged, wrongApp, unsigned, temporaryCopy, notAllowed
+        /// wrongApp and unsigned carry what was found, so a failure says which check failed and why.
+        case server(Int), damaged, wrongApp(String), unsigned(String), temporaryCopy, notAllowed
     }
 
-    nonisolated private static func describe(_ error: Error, checking: Bool) -> String {
+    nonisolated static func describe(_ error: Error, checking: Bool) -> String {
         if let url = error as? URLError {
             switch url.code {
             case .notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost,
@@ -408,8 +427,10 @@ final class AppUpdater {
                 : "The downloads page didn’t answer properly (error \(status)). Try again later."
         case .damaged:
             return "The download didn’t arrive intact, so nothing was changed. Try again."
-        case .wrongApp, .unsigned:
-            return "The download didn’t pass Offline Kit’s safety check (it isn’t signed by Offline Kit’s developer), so it wasn’t installed."
+        case .wrongApp(let detail):
+            return "The download wasn’t the Offline Kit build it should be, so it wasn’t installed. Try again, or download it in your browser. (Details: \(String(detail.prefix(200))))"
+        case .unsigned(let detail):
+            return "The download didn’t pass Offline Kit’s signature check, so it wasn’t installed. Try again, or download it in your browser. (Details: \(String(detail.prefix(200))))"
         case .temporaryCopy:
             return "Offline Kit is running from the disk image or a temporary copy, so it can’t update itself. Move it to Applications first, or download the new version and drag it there."
         case .notAllowed:

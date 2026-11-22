@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 #if canImport(AppKit)
 import AppKit
 #elseif canImport(UIKit)
@@ -11,6 +12,66 @@ struct Source: Identifiable, Hashable, Sendable {
     let ref: ArticleRef
     let bookTitle: String
     let text: String
+}
+
+/// What a search looks for: the question's words and two-word phrases, and for a follow-up ("is that different at
+/// high altitude?") words carried over from the conversation's topic ("boil water"), which count for less.
+struct SearchQuery: Hashable, Sendable {
+    /// What passages are compared with by meaning: the question, with any carried words after it.
+    var text: String
+    /// The question's own words first, then the carried ones.
+    var terms: [String]
+    /// Adjacent pairs within the question, and within the carried words (never across them).
+    var phrases: [String]
+    /// Words carried from earlier in the conversation.
+    var carried: Set<String> = []
+    /// Searches for a follow-up that need every one of their words: the question's words with the topic's.
+    var combinations: [[String]] = []
+    /// The carried words that are nouns where they were first asked, so the next follow-up carries them first.
+    var nouns: Set<String> = []
+    /// Articles the last answer's sources came from (`ArticleRef.id`): when they still match, they get a lift,
+    /// so a follow-up keeps reading the same guide.
+    var preferred: Set<String> = []
+    /// Words that count for less than the rest of the question, with how much: a circumstance clause ("from boiling
+    /// water", "while hiking") says where the problem came from, not what it is, so an article named for the burn
+    /// beats a thread named for the boiling water.
+    var lighter: [String: Double] = [:]
+    /// What references call the question's everyday words ("burn": "scald", "thermal burn"; "can't breathe": "asthma"),
+    /// set for health questions (`Retriever.related`). Searched, and a bonus where they match, never a requirement.
+    var related: [String] = []
+    /// The question asks what to do ("what should I do for…", "how do I treat…"): sections headed Treatment,
+    /// Management or First aid answer it.
+    var wantsSteps = false
+
+    init(_ question: String) {
+        text = question
+        terms = Retriever.terms(question)
+        phrases = Retriever.phrases(terms)
+        lighter = Retriever.circumstance(question, terms: terms)
+        wantsSteps = Retriever.asksWhatToDo(question)
+        related = terms.compactMap { Retriever.spellings[$0] }.filter { !terms.contains($0) }
+    }
+
+    /// Adds what references call the question's everyday words (`related`), and compares passages with them too.
+    mutating func relate(_ words: [String]) {
+        let new = words.filter { !related.contains($0) && !terms.contains($0) }
+        guard !new.isEmpty else { return }
+        related += new
+        text += " " + new.joined(separator: " ")
+    }
+
+    var isFollowUp: Bool { !carried.isEmpty }
+
+    /// How much a carried word counts against one of the question's own.
+    static let carriedWeight = 0.5
+    /// How much a title named only for a follow-up's carried topic is lifted, against one named for the question.
+    static let carriedTitleWeight = 0.75
+    /// How much a word of a circumstance clause counts.
+    static let circumstanceWeight = 0.6
+    /// How much a related word adds where it matches, against one of the question's own.
+    static let relatedWeight = 0.5
+    /// The lift for a passage from one of the last answer's sources.
+    static let preferredLift = 1.15
 }
 
 /// Finds passages in the offline archives that are relevant to a question.
@@ -47,16 +108,17 @@ enum Retriever {
 
     /// Search, shortlist and read: synchronous. Call it off the main actor.
     static func retrieve(question: String, archives: [ZimArchive], budgetChars: Int, maxSources: Int = 6) -> [Source] {
-        let terms = Self.terms(question)
-        guard !terms.isEmpty else { return [] }
+        retrieve(query: SearchQuery(question), archives: archives, budgetChars: budgetChars, maxSources: maxSources)
+    }
+
+    static func retrieve(query: SearchQuery, archives: [ZimArchive], budgetChars: Int, maxSources: Int = 6) -> [Source] {
+        guard !query.terms.isEmpty else { return [] }
         AnswerIndex.shared.beginAsk()
         defer { AnswerIndex.shared.endAsk() }
-        let phrases = Self.phrases(terms)
-        let gathered = archives.map { gather(in: $0, terms: terms, phrases: phrases, cancelled: { false }) }
-        let picks = shortlist(from: gathered, terms: terms, phrases: phrases)
-        let passages = picks.flatMap { passages(for: $0, terms: terms, phrases: phrases) }
-        return assemble(articlePassages: passages, archives: archives, question: question, terms: terms, phrases: phrases,
-                        budgetChars: budgetChars, maxSources: maxSources)
+        let gathered = archives.map { gather(in: $0, query: query, cancelled: { false }) }
+        let picks = shortlist(from: gathered, query: query)
+        let passages = picks.flatMap { passages(for: $0, query: query) }
+        return assemble(articlePassages: passages, archives: archives, query: query, budgetChars: budgetChars, maxSources: maxSources)
     }
 
     /// Same result as `retrieve`, with independent archives searched (and articles read) at the same time.
@@ -64,11 +126,15 @@ enum Retriever {
     /// by archive id, for the same question.
     static func retrieveConcurrently(question: String, archives: [ZimArchive], budgetChars: Int, maxSources: Int = 6,
                                      reusing known: [String: Gathered] = [:]) async -> (sources: [Source], gathered: [String: Gathered]) {
-        let terms = Self.terms(question)
-        guard !terms.isEmpty else { return ([], known) }
+        await retrieveConcurrently(query: SearchQuery(question), archives: archives, budgetChars: budgetChars,
+                                   maxSources: maxSources, reusing: known)
+    }
+
+    static func retrieveConcurrently(query: SearchQuery, archives: [ZimArchive], budgetChars: Int, maxSources: Int = 6,
+                                     reusing known: [String: Gathered] = [:]) async -> (sources: [Source], gathered: [String: Gathered]) {
+        guard !query.terms.isEmpty else { return ([], known) }
         AnswerIndex.shared.beginAsk()
         defer { AnswerIndex.shared.endAsk() }
-        let phrases = Self.phrases(terms)
         #if DEBUG
         let started = Date()
         #endif
@@ -76,7 +142,7 @@ enum Retriever {
         var found: [Gathered?] = archives.map { known[$0.uuid] }
         await withTaskGroup(of: (Int, Gathered).self) { group in
             for (i, archive) in archives.enumerated() where found[i] == nil {
-                group.addTask { (i, gather(in: archive, terms: terms, phrases: phrases, cancelled: { Task.isCancelled })) }
+                group.addTask { (i, gather(in: archive, query: query, cancelled: { Task.isCancelled })) }
             }
             for await (i, g) in group { found[i] = g }
         }
@@ -88,11 +154,11 @@ enum Retriever {
         let searched = Date()
         #endif
 
-        let picks = shortlist(from: gathered, terms: terms, phrases: phrases)
+        let picks = shortlist(from: gathered, query: query)
         var read = [[Passage]](repeating: [], count: picks.count)
         await withTaskGroup(of: (Int, [Passage]).self) { group in
             for (i, pick) in picks.enumerated() {
-                group.addTask { (i, passages(for: pick, terms: terms, phrases: phrases)) }
+                group.addTask { (i, passages(for: pick, query: query)) }
             }
             for await (i, p) in group { read[i] = p }
         }
@@ -100,8 +166,8 @@ enum Retriever {
         #if DEBUG
         let readDone = Date()
         #endif
-        let sources = assemble(articlePassages: read.flatMap { $0 }, archives: archives, question: question, terms: terms,
-                               phrases: phrases, budgetChars: budgetChars, maxSources: maxSources)
+        let sources = assemble(articlePassages: read.flatMap { $0 }, archives: archives, query: query,
+                               budgetChars: budgetChars, maxSources: maxSources)
         #if DEBUG
         if ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil {
             let indexed = gathered.filter { !$0.indexed.isEmpty || AnswerIndex.shared.store(for: $0.archive) != nil }.count
@@ -124,6 +190,7 @@ enum Retriever {
             let started = Date()
             #endif
             _ = SemanticRanker.shared.similarities(question: "boil water", texts: ["Boiling water makes it safe to drink."])
+            _ = nouns(in: "How do I boil water?")
             _ = ParagraphCache.shared.get(archive: "", path: "")
             await withTaskGroup(of: Void.self) { group in
                 for archive in archives {
@@ -150,25 +217,34 @@ enum Retriever {
 
     /// Searches one archive: its answer index when that's ready, else libzim (full-text first, exact phrases then
     /// broader queries, then titles).
-    private static func gather(in archive: ZimArchive, terms: [String], phrases: [String], cancelled: () -> Bool) -> Gathered {
+    private static func gather(in archive: ZimArchive, query: SearchQuery, cancelled: () -> Bool) -> Gathered {
+        let terms = query.terms, phrases = query.phrases
         if let store = AnswerIndex.shared.store(for: archive) {
+            // A related word is its own search ("epistaxis"), never added to the all-words one.
+            let combinations = query.combinations + query.related.map { $0.split(separator: " ").map(String.init) }
             return Gathered(archive: archive, fullText: [], titles: [],
-                            indexed: indexed(store.search(terms: terms, phrases: phrases, limit: indexHits),
-                                             archive: archive, terms: terms, phrases: phrases))
+                            indexed: indexed(store.search(terms: terms, phrases: phrases, limit: indexHits, combinations: combinations),
+                                             archive: archive, query: query))
         }
         var fullText: [Candidate] = []
         if archive.hasFullTextIndex {
             // libzim matches ALL words, so a long question can miss the obvious article.
             // Search each two-word phrase on its own, then the whole question, then its most specific words.
             var seen = Set<String>(), seenTitles = Set<String>()
-            let queries = phrases.map { ($0, 5) } + queryVariants(terms).map { ($0, 10) }
-            for (query, limit) in queries {
+            // A follow-up's own words with the topic's come right after the whole question.
+            var variants = queryVariants(terms)
+            if !query.combinations.isEmpty {
+                variants.insert(contentsOf: query.combinations.map { $0.joined(separator: " ") }, at: 1)
+            }
+            let queries = phrases.map { ($0, 5) } + variants.map { ($0, 10) } + query.related.map { ($0, 5) }
+            for (search, limit) in queries {
                 if cancelled() { break }
-                for hit in archive.search(query, limit: limit, snippetsExcept: seen)
+                for hit in archive.search(search, limit: limit, snippetsExcept: seen)
                 where seen.insert(hit.path).inserted && seenTitles.insert(hit.title.lowercased()).inserted && !isListing(hit) {
                     var (score, coverage) = relevance(title: hit.title, snippet: hit.snippet, xapian: hit.score,
-                                                      terms: terms, phrases: phrases)
-                    titleBonus(hit.title, terms: terms, score: &score, coverage: &coverage)
+                                                      terms: terms, phrases: phrases, carried: query.carried,
+                                                      lighter: query.lighter, related: query.related)
+                    titleBonus(hit.title, query: query, score: &score, coverage: &coverage)
                     fullText.append(Candidate(archive: archive, hit: hit, score: score, coverage: coverage))
                 }
                 if seen.count >= 20 { break }
@@ -177,36 +253,52 @@ enum Retriever {
         // Titles too, in every archive: some (like the Zimgit guides) have no full-text index at all, and an
         // article named for the topic ("Bowline") beats a forum post that happens to mention it.
         var titles: [Candidate] = []
-        let specific = terms.max { $0.count < $1.count } ?? ""
+        // A follow-up's titles are looked up by its own words: the topic's alone found the last answer's articles.
+        let own = query.isFollowUp ? terms.filter { !query.carried.contains($0) } : terms
+        let specific = own.max { $0.count < $1.count } ?? ""
         var seenPaths = Set(fullText.map(\.hit.path))
-        for query in Set([terms.prefix(3).joined(separator: " "), specific]) where !query.isEmpty {
+        var titleQueries = Set([own.prefix(3).joined(separator: " "), specific])
+        if let combined = query.combinations.first { titleQueries.insert(combined.joined(separator: " ")) }
+        titleQueries.formUnion(query.related)
+        for title in titleQueries where !title.isEmpty {
             if cancelled() { break }
-            for hit in archive.suggest(query, limit: 3) where seenPaths.insert(hit.path).inserted && !isListing(hit) {
-                var (score, coverage) = relevance(title: hit.title, snippet: "", xapian: 0, terms: terms, phrases: phrases)
-                titleBonus(hit.title, terms: terms, score: &score, coverage: &coverage)
+            for hit in archive.suggest(title, limit: 3) where seenPaths.insert(hit.path).inserted && !isListing(hit) {
+                var (score, coverage) = relevance(title: hit.title, snippet: "", xapian: 0, terms: terms, phrases: phrases,
+                                                  carried: query.carried, lighter: query.lighter, related: query.related)
+                titleBonus(hit.title, query: query, score: &score, coverage: &coverage)
                 titles.append(Candidate(archive: archive, hit: hit, score: score, coverage: coverage))
             }
         }
         return Gathered(archive: archive, fullText: fullText, titles: titles)
     }
 
-    /// An article named exactly for part of the question ("Heat stroke") is on topic.
-    private static func titleBonus(_ title: String, terms: [String], score: inout Double, coverage: inout Double) {
+    /// An article named exactly for part of the question ("Heat stroke"), or for what references call it ("Epistaxis"
+    /// for a nosebleed), is on topic. Named only for a circumstance ("Boiling water" for a burn from boiling water) or
+    /// only for a follow-up's carried topic (the last answer's "GFCI outlet keeps tripping" for "is it safe to replace
+    /// it?"), it gets a smaller lift.
+    private static func titleBonus(_ title: String, query: SearchQuery, score: inout Double, coverage: inout Double) {
         let titleTerms = Self.terms(title)
-        if !titleTerms.isEmpty && titleTerms.allSatisfy({ t in terms.contains { $0.hasPrefix(String(t.prefix(5))) } }) {
-            score += 2 + Double(titleTerms.count)
-            coverage = max(coverage, 1)
+        guard !titleTerms.isEmpty else { return }
+        let words = query.terms + query.related.flatMap { $0.split(separator: " ").map(String.init) }
+        var weight = 1.0
+        for t in titleTerms {
+            guard let match = words.first(where: { $0.hasPrefix(key(t)) }) else { return }
+            weight = min(weight, (query.lighter[match] ?? 1) * (query.carried.contains(match) ? SearchQuery.carriedTitleWeight : 1))
         }
+        score += (2 + Double(titleTerms.count)) * weight
+        if weight == 1 { coverage = max(coverage, 1) }
     }
 
     /// Index passages scored on the same scale as search hits, so indexed and searched archives (and PDF pages)
     /// compete fairly. BM25 stands in for libzim's own score; the opening section gets a small lift.
-    private static func indexed(_ hits: [IndexHit], archive: ZimArchive, terms: [String], phrases: [String]) -> [IndexedCandidate] {
+    private static func indexed(_ hits: [IndexHit], archive: ZimArchive, query: SearchQuery) -> [IndexedCandidate] {
+        let terms = query.terms
         let best = max(hits.map(\.bm25).max() ?? 1, 0.0001)
         return hits.filter { !isListing(path: $0.path, title: $0.title) }.map { hit in
             var (score, coverage) = plainRelevance(title: hit.title.lowercased(), text: searchableText(hit),
-                                                   xapian: Int(100 * hit.bm25 / best), terms: terms, phrases: phrases)
-            titleBonus(hit.title, terms: terms, score: &score, coverage: &coverage)
+                                                   xapian: Int(100 * hit.bm25 / best), terms: terms, phrases: query.phrases,
+                                                   carried: query.carried, lighter: query.lighter, related: query.related)
+            titleBonus(hit.title, query: query, score: &score, coverage: &coverage)
             if hit.lead { score += 0.3 }
             // A tie between the same article in a full index and a leads-only one (WikiMed and Wikipedia): the full
             // one has the rest of the article too.
@@ -232,11 +324,20 @@ enum Retriever {
             case .indexed(_, let passages): passages[0].archive
             }
         }
+
+        /// The article's `ArticleRef.id`.
+        var id: String {
+            switch self {
+            case .article(let c): c.archive.uuid.lowercased() + "/" + c.hit.path
+            case .indexed(_, let passages): passages[0].archive.uuid.lowercased() + "/" + passages[0].hit.path
+            }
+        }
     }
 
     /// Keep articles that mention most of the question; cap each archive so none dominates.
     /// Weak matches are dropped: no source is better than a misleading one.
-    private static func shortlist(from gathered: [Gathered], terms: [String], phrases: [String]) -> [Pick] {
+    private static func shortlist(from gathered: [Gathered], query: SearchQuery) -> [Pick] {
+        let terms = query.terms, phrases = query.phrases
         var picks: [(pick: Pick, score: Double, coverage: Double)] =
             (gathered.flatMap(\.fullText) + gathered.flatMap(\.titles)).map { (.article($0), $0.score, $0.coverage) }
         // Indexed passages count per article: the article's best passage, and how much of the question its passages
@@ -252,10 +353,15 @@ enum Retriever {
                 let passages = byArticle[path]!
                 let joined = passages.prefix(5).map { searchableText($0.hit) }.joined(separator: " ")
                 let (_, together) = plainRelevance(title: passages[0].hit.title.lowercased(), text: joined, xapian: 0,
-                                                   terms: terms, phrases: phrases)
+                                                   terms: terms, phrases: phrases, carried: query.carried,
+                                                   lighter: query.lighter, related: query.related)
                 let score = passages.map(\.score).max() ?? 0
                 picks.append((.indexed(score: score, passages), score, max(together, passages.map(\.coverage).max() ?? 0)))
             }
+        }
+        // The last answer's articles, when they still match, come before ones that match about as well.
+        if !query.preferred.isEmpty {
+            for i in picks.indices where query.preferred.contains(picks[i].pick.id) { picks[i].score *= SearchQuery.preferredLift }
         }
         let bestCoverage = picks.map(\.coverage).max() ?? 0
         let floor = max(0.5, min(0.6, bestCoverage))
@@ -291,17 +397,23 @@ enum Retriever {
     }
 
     /// The passages of one picked article, each scored: the article's score twice, plus the passage's own match.
-    private static func passages(for pick: Pick, terms: [String], phrases: [String]) -> [Passage] {
+    private static func passages(for pick: Pick, query: SearchQuery) -> [Passage] {
+        let terms = query.terms, phrases = query.phrases
         switch pick {
         case .article(let c):
-            return articlePassages(c, terms: terms, phrases: phrases)
+            return articlePassages(c, query: query)
         case .indexed(let score, let hits):
-            return hits.compactMap { c in
+            // A leads-only index holds an article's lead alone; the sections after it (Treatment, Management) are
+            // where the steps are, so a picked article's best few are read now.
+            let later = hits.first.map { $0.hit.text.isEmpty ? sectionPassages($0, score: score, query: query) : [] } ?? []
+            return later + hits.compactMap { c in
                 // A leads-only index reads the lead back from the archive: one small read, only for picked articles.
                 guard let text = c.hit.text.isEmpty ? PassageStore.leadText(archive: c.archive, path: c.hit.path) : c.hit.text
                 else { return nil }
                 // The section heading counts like a title: "Treatment" answers "how do I treat…".
-                let (own, _) = textRelevance(title: c.hit.heading.lowercased(), text: text.lowercased(), terms: terms, phrases: phrases)
+                var (own, _) = textRelevance(title: c.hit.heading.lowercased(), text: text.lowercased(), terms: terms, phrases: phrases,
+                                             carried: query.carried, lighter: query.lighter, related: query.related)
+                own += stepsBonus(heading: c.hit.heading, query: query)
                 let ref = ArticleRef(bookID: c.archive.uuid.lowercased(), path: c.hit.path, title: c.hit.title)
                 return Passage(score: score * 2 + own + (c.hit.lead ? 0.3 : 0), ref: ref, book: c.archive.title,
                                text: text, order: c.hit.order, heading: c.hit.heading)
@@ -309,8 +421,39 @@ enum Retriever {
         }
     }
 
+    /// The best two paragraphs after the lead of an article from a leads-only index, each with its section heading,
+    /// scored like index passages. Cached per article, so a follow-up reading the same article doesn't read it again.
+    static func sectionPassages(_ c: IndexedCandidate, score: Double, query: SearchQuery) -> [Passage] {
+        let key = "#sections#" + c.hit.path
+        var blocks: [(heading: String, text: String)]
+        if let cached = ParagraphCache.shared.get(archive: c.archive.uuid, path: key) {
+            blocks = cached.paragraphs.compactMap { line in
+                let parts = line.split(separator: "\u{1D}", maxSplits: 1).map(String.init)
+                return parts.count == 2 ? (parts[0], parts[1]) : nil
+            }
+        } else {
+            guard let content = c.archive.content(atPath: c.hit.path), content.mimeType.hasPrefix("text/html") else { return [] }
+            let html = String(decoding: content.data.prefix(maxHTMLBytes), as: UTF8.self)
+            blocks = HTMLText.sections(html).compactMap { section in
+                guard let heading = section.heading, !AnswerIndexPolicy.skippedSections.contains(heading.lowercased()) else { return nil }
+                return (heading, section.text)
+            }
+            ParagraphCache.shared.put(archive: c.archive.uuid, path: key, finalPath: c.hit.path,
+                                      paragraphs: blocks.map { $0.heading + "\u{1D}" + $0.text })
+        }
+        let ref = ArticleRef(bookID: c.archive.uuid.lowercased(), path: c.hit.path, title: c.hit.title)
+        let scored = blocks.enumerated().map { i, block -> (Int, Double) in
+            let (own, _) = textRelevance(title: block.heading.lowercased(), text: block.text.lowercased(), terms: query.terms,
+                                         phrases: query.phrases, carried: query.carried, lighter: query.lighter, related: query.related)
+            return (i, own + stepsBonus(heading: block.heading, query: query))
+        }
+        return scored.filter { $0.1 > 1 }.sorted { $0.1 > $1.1 }.prefix(2).map { i, own in
+            Passage(score: score * 2 + own, ref: ref, book: c.archive.title, text: blocks[i].text, order: i + 1, heading: blocks[i].heading)
+        }
+    }
+
     /// The best paragraphs of one article, read from its HTML (or the paragraph cache).
-    private static func articlePassages(_ c: Candidate, terms: [String], phrases: [String]) -> [Passage] {
+    private static func articlePassages(_ c: Candidate, query: SearchQuery) -> [Passage] {
         let finalPath: String, paragraphs: [String]
         if let cached = ParagraphCache.shared.get(archive: c.archive.uuid, path: c.hit.path) {
             (finalPath, paragraphs) = cached
@@ -329,7 +472,8 @@ enum Retriever {
         guard !paragraphs.isEmpty else { return [] }
 
         let scored = paragraphs.enumerated().map { (i, p) -> (Int, Double) in
-            let (s, _) = relevance(title: "", snippet: p, xapian: 0, terms: terms, phrases: phrases)
+            let (s, _) = relevance(title: "", snippet: p, xapian: 0, terms: query.terms, phrases: query.phrases, carried: query.carried,
+                                   lighter: query.lighter, related: query.related)
             return (i, s + (i == 0 ? 0.3 : 0))   // lead paragraph usually defines the topic
         }
         let best = scored.filter { $0.1 > 0.5 }.sorted { $0.1 > $1.1 }.prefix(3)
@@ -345,8 +489,9 @@ enum Retriever {
 
     /// Adds PDF and built-in guide passages to the article passages, re-ranks them by meaning, drops weak and
     /// repeated ones, and fills the budget with the best: at most three passages from any one article.
-    private static func assemble(articlePassages: [Passage], archives: [ZimArchive], question: String, terms: [String],
-                                 phrases: [String], budgetChars: Int, maxSources: Int) -> [Source] {
+    private static func assemble(articlePassages: [Passage], archives: [ZimArchive], query: SearchQuery,
+                                 budgetChars: Int, maxSources: Int) -> [Source] {
+        let terms = query.terms, phrases = query.phrases
         var passages = articlePassages
         let perArticle = max(600, budgetChars / 3)
 
@@ -356,7 +501,8 @@ enum Retriever {
             guard !chunks.isEmpty else { continue }
             var best: [(chunk: PDFIndex.Chunk, score: Double)] = []
             for chunk in chunks {
-                let (score, coverage) = textRelevance(title: chunk.title.lowercased(), text: chunk.lower, terms: terms, phrases: phrases)
+                let (score, coverage) = textRelevance(title: chunk.title.lowercased(), text: chunk.lower, terms: terms, phrases: phrases,
+                                                      carried: query.carried, lighter: query.lighter, related: query.related)
                 if coverage >= 0.6 { best.append((chunk, score)) }
             }
             var perDocument = Set<String>()
@@ -371,11 +517,22 @@ enum Retriever {
 
         // 3c. Offline Kit's built-in power-out guide (food, generators, water). Scored like a PDF page, a little higher:
         // it's short, on topic and from official sources.
+        // Not when it matched only the question's circumstance ("boiling water" in a burn from boiling water).
+        let subject = terms.filter { query.lighter[$0] == nil }.map(key)
         for match in PowerOutGuide.matches(terms: terms, phrases: phrases) {
+            if !query.lighter.isEmpty {
+                let text = (match.ref.title + " " + match.text).lowercased()
+                guard subject.contains(where: text.contains) else { continue }
+            }
             passages.append(Passage(score: match.score * 4, ref: match.ref, book: PowerOutGuide.bookTitle,
                                     text: String(match.text.prefix(perArticle))))
         }
         guard !passages.isEmpty else { return [] }
+
+        // The last answer's articles, when they still match.
+        if !query.preferred.isEmpty {
+            for i in passages.indices where query.preferred.contains(passages[i].ref.id) { passages[i].score *= SearchQuery.preferredLift }
+        }
 
         // 4. Meaning: the best few dozen passages, re-ranked against the question.
         passages.sort { $0.score > $1.score }
@@ -383,7 +540,7 @@ enum Retriever {
         #if DEBUG
         let rerankStart = Date()
         #endif
-        if let similarity = SemanticRanker.shared.similarities(question: question, texts: passages.map { $0.ref.title + ". " + $0.heading + ". " + $0.text }) {
+        if let similarity = SemanticRanker.shared.similarities(question: query.text, texts: passages.map { $0.ref.title + ". " + $0.heading + ". " + $0.text }) {
             // How far each passage is from the others in meaning, in standard deviations, worth up to 20% either way.
             let mean = similarity.reduce(0, +) / Double(similarity.count)
             let deviation = (similarity.map { ($0 - mean) * ($0 - mean) }.reduce(0, +) / Double(similarity.count)).squareRoot()
@@ -461,7 +618,7 @@ enum Retriever {
         guard !words.isEmpty else { return 0 }
         return sources.filter { source in
             let title = source.ref.title.lowercased()
-            let hits = words.filter { title.contains(String($0.prefix(5))) }.count
+            let hits = words.filter { title.contains(key($0)) }.count
             return Double(hits) >= Double(words.count) / 2
         }.count
     }
@@ -521,25 +678,67 @@ enum Retriever {
 
     /// Title matches count most, exact phrases beat scattered words, longer words are more specific.
     /// Returns (score, coverage) where coverage is the weighted share of question words present.
-    static func relevance(title: String, snippet: String, xapian: Int,
-                          terms: [String], phrases: [String]) -> (Double, Double) {
+    static func relevance(title: String, snippet: String, xapian: Int, terms: [String], phrases: [String],
+                          carried: Set<String> = [], lighter: [String: Double] = [:], related: [String] = []) -> (Double, Double) {
         plainRelevance(title: title.lowercased(), text: HTMLText.stripTags(snippet).lowercased(), xapian: xapian,
-                       terms: terms, phrases: phrases)
+                       terms: terms, phrases: phrases, carried: carried, lighter: lighter, related: related)
+    }
+
+    /// What a question word is looked for as in titles and passages: its first five letters, without a plural "s"
+    /// ("eggs" finds "egg", "tires" finds "tire"; "tomatoes" and "tomato" share "tomat" anyway).
+    @inline(__always) static func key(_ term: String) -> String {
+        if term.count >= 4, term.count <= 5, term.hasSuffix("s"), !term.hasSuffix("ss"), !term.hasSuffix("us"), !term.hasSuffix("is") {
+            return String(term.dropLast())
+        }
+        return String(term.prefix(5))
+    }
+
+    /// A word's weight: longer words are more specific; words carried from earlier in a conversation, and words of a
+    /// circumstance clause (`lighter`), count for less.
+    @inline(__always) static func weight(_ term: String, carried: Set<String>, lighter: [String: Double] = [:]) -> Double {
+        var w = term.count >= 6 ? 1.5 : 1.0
+        if !carried.isEmpty, carried.contains(term) { w *= SearchQuery.carriedWeight }
+        if !lighter.isEmpty, let less = lighter[term] { w *= less }
+        return w
+    }
+
+    /// A phrase's weight: the lightest of its words' (a phrase of a circumstance clause counts for less).
+    @inline(__always) private static func phraseWeight(_ phrase: String, lighter: [String: Double]) -> Double {
+        guard !lighter.isEmpty else { return 1 }
+        return phrase.split(separator: " ").map { lighter[String($0)] ?? 1 }.min() ?? 1
+    }
+
+    /// Related words found in the title and in the text, weighted (single words by their first five letters,
+    /// longer names whole). They add to a match, never count against one.
+    @inline(__always) private static func relatedMatch(_ related: [String], title: String, text: String) -> (title: Double, any: Double) {
+        var inTitle = 0.0, inAny = 0.0
+        for r in related {
+            let w = (r.count >= 6 ? 1.5 : 1.0) * SearchQuery.relatedWeight
+            let k = r.contains(" ") ? r : key(r)
+            if title.contains(k) { inTitle += w; inAny += w } else if text.contains(k) { inAny += w }
+        }
+        return (inTitle, inAny)
     }
 
     /// `relevance` for plain, already-lowercased text (index passages): no tag stripping.
-    static func plainRelevance(title t: String, text s: String, xapian: Int,
-                               terms: [String], phrases: [String]) -> (Double, Double) {
+    static func plainRelevance(title t: String, text s: String, xapian: Int, terms: [String], phrases: [String],
+                               carried: Set<String> = [], lighter: [String: Double] = [:], related: [String] = []) -> (Double, Double) {
         var total = 0.0, inTitle = 0.0, inAny = 0.0
         for term in terms {
-            let w = term.count >= 6 ? 1.5 : 1.0
+            let w = weight(term, carried: carried, lighter: lighter)
             total += w
-            let stem = String(term.prefix(5))
+            let stem = key(term)
             if t.contains(stem) { inTitle += w; inAny += w } else if s.contains(stem) { inAny += w }
+        }
+        if !related.isEmpty {
+            let r = relatedMatch(related, title: t, text: s)
+            inTitle = min(total, inTitle + r.title)
+            inAny = min(total, inAny + r.any)
         }
         var phraseScore = 0.0
         for p in phrases {
-            if t.contains(p) { phraseScore += 3 } else if s.contains(p) { phraseScore += 1.5 }
+            if t.contains(p) { phraseScore += 3 * phraseWeight(p, lighter: lighter) }
+            else if s.contains(p) { phraseScore += 1.5 * phraseWeight(p, lighter: lighter) }
         }
         let coverage = total > 0 ? inAny / total : 0
         let score = 3 * (inTitle / max(total, 1)) + 2 * coverage + phraseScore + Double(xapian) / 200
@@ -547,18 +746,110 @@ enum Retriever {
     }
 
     /// `relevance` for plain, already-lowercased text (PDF pages): no tag stripping, so thousands of pages stay fast.
-    static func textRelevance(title: String, text: String, terms: [String], phrases: [String]) -> (Double, Double) {
+    static func textRelevance(title: String, text: String, terms: [String], phrases: [String],
+                              carried: Set<String> = [], lighter: [String: Double] = [:], related: [String] = []) -> (Double, Double) {
         var total = 0.0, inTitle = 0.0, inAny = 0.0
         for term in terms {
-            let w = term.count >= 6 ? 1.5 : 1.0
+            let w = weight(term, carried: carried, lighter: lighter)
             total += w
-            let stem = String(term.prefix(5))
+            let stem = key(term)
             if title.contains(stem) { inTitle += w; inAny += w } else if text.contains(stem) { inAny += w }
         }
+        if !related.isEmpty {
+            let r = relatedMatch(related, title: title, text: text)
+            inTitle = min(total, inTitle + r.title)
+            inAny = min(total, inAny + r.any)
+        }
         var phraseScore = 0.0
-        for p in phrases where text.contains(p) || title.contains(p) { phraseScore += 1.5 }
+        for p in phrases where text.contains(p) || title.contains(p) { phraseScore += 1.5 * phraseWeight(p, lighter: lighter) }
         let coverage = total > 0 ? inAny / total : 0
         return (3 * (inTitle / max(total, 1)) + 2 * coverage + phraseScore, coverage)
+    }
+
+    // MARK: Question shape
+
+    /// "What should I do for…", "how do I treat…", "what to do if…", "first aid for…".
+    static func asksWhatToDo(_ question: String) -> Bool {
+        question.range(of: #"\bwhat (should|do|can|must) (i|we|you|they) do\b|\bwhat to do\b|\bhow (do|should|can) (i|we|you) (treat|help|handle|care for)\b|\b(treat|treating|treatment)\b|\bfirst aid\b"#,
+                       options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    private static let stepsHeading = try! NSRegularExpression(
+        pattern: #"\b(treatment|treatments|management|first aid|what to do|self-care|home care|emergency|care)\b"#, options: [.caseInsensitive])
+
+    /// A lift for a section headed Treatment, Management or First aid when the question asks what to do.
+    static func stepsBonus(heading: String, query: SearchQuery) -> Double {
+        guard query.wantsSteps, !heading.isEmpty else { return 0 }
+        let range = NSRange(heading.startIndex..., in: heading)
+        guard stepsHeading.firstMatch(in: heading, range: range) != nil else { return 0 }
+        return heading.lowercased().contains("avoid") ? 1 : 2
+    }
+
+    /// Words that only set the scene: those after "from", "while", "during", "after" or "before" once the question
+    /// has named its subject ("a burn from boiling water", "see a bear while hiking", "use a generator during a power
+    /// outage"), up to the end of the sentence. Each counts `SearchQuery.circumstanceWeight` as much. Nothing when the
+    /// clause would hold most of the question's words.
+    static func circumstance(_ question: String, terms: [String]) -> [String: Double] {
+        let lower = question.lowercased()
+        guard let match = circumstancePattern.firstMatch(in: lower, range: NSRange(lower.startIndex..., in: lower)),
+              let head = Range(match.range(at: 1), in: lower), let tail = Range(match.range(at: 2), in: lower) else { return [:] }
+        let before = Set(Self.terms(String(lower[head])))
+        let scene = Self.terms(String(lower[tail])).filter { !before.contains($0) && terms.contains($0) }
+        guard before.count >= 1, !scene.isEmpty, scene.count < terms.count, before.count + 1 >= scene.count else { return [:] }
+        return Dictionary(uniqueKeysWithValues: scene.map { ($0, SearchQuery.circumstanceWeight) })
+    }
+
+    /// The sentence before a circumstance word (group 1), and the clause after it (group 2).
+    private static let circumstancePattern = try! NSRegularExpression(
+        pattern: #"(?:^|[.?!]\s+)([^.?!]*?\b[a-z]{3,}[^.?!]*?)\s+(?:from|while|during|after|before)\s+([^.?!]+)"#)
+
+    /// American and British spellings, both ways: "mold" also finds "Is it safe to eat mouldy bread?".
+    static let spellings: [String: String] = {
+        let pairs = [("mold", "mould"), ("moldy", "mouldy"), ("tire", "tyre"), ("tires", "tyres"), ("odor", "odour"),
+                     ("color", "colour"), ("gray", "grey"), ("aluminum", "aluminium"), ("fiber", "fibre"), ("center", "centre"),
+                     ("liter", "litre"), ("diarrhea", "diarrhoea"), ("anemia", "anaemia"), ("pediatric", "paediatric"),
+                     ("esophagus", "oesophagus"), ("fetus", "foetus"), ("plow", "plough"), ("cozy", "cosy"), ("faucet", "tap")]
+        var map: [String: String] = [:]
+        for (a, b) in pairs { map[a] = b; if a != "faucet" { map[b] = a } }
+        return map
+    }()
+
+    // MARK: Health questions
+
+    /// Everyday words for injuries and symptoms, and what medical references call them. A question that has one is a
+    /// health question (`AskModel.isHealthQuestion`), and its search adds these as related words (`SearchQuery.relate`).
+    static let layTerms: [(pattern: NSRegularExpression, related: [String])] = [
+        (#"\bburn(s|ed)?\b|\bscald"#, ["scald", "thermal burn"]),
+        (#"\b(deep |bad )?cuts?\b(?!\s+(off|out|up|down|back|open|it|them|the|a|an|some)\b)|\bgash|\bsliced (my|his|her|their|open)"#,
+         ["wound", "laceration", "bleeding"]),
+        (#"\b(can'?t|cannot|can not|couldn'?t|trouble|hard to|difficulty|struggling to|not) breath|\bshort(ness)? of breath|\bwheez"#,
+         ["shortness of breath", "asthma", "choking"]),
+        (#"\bnose ?bleed|\bbloody nose|\bnose (is )?bleeding"#, ["nosebleed", "epistaxis"]),
+        (#"\bfaint(s|ed|ing)?\b|\bpass(ed|es)? out\b|\bblack(ed)? out\b"#, ["syncope", "fainting"]),
+        (#"\bthrow(ing|s)? up\b|\bthrew up\b|\bpuk(e|ed|ing)\b"#, ["vomiting"]),
+        (#"\bheart attack"#, ["myocardial infarction"]),
+        (#"\bbroken (bone|arm|leg|wrist|ankle|finger|toe|rib|collarbone|hand|foot|nose)|\bbroke (my|his|her|their) "#, ["fracture"]),
+        (#"\b(hit|bump(ed)?|bang(ed)?|hurt) (my|his|her|their) head|\bhead (injury|bump)"#, ["head injury", "concussion"]),
+        (#"\ballergic reaction|\bthroat (is )?(closing|swelling)"#, ["anaphylaxis"]),
+        (#"\bchok(e|es|ed)\b"#, ["choking"]),
+        (#"\bstung\b|\b(bee|wasp|hornet|jellyfish) stings?\b"#, ["sting"]),
+        (#"\bswallowed\b"#, ["poisoning", "foreign body"]),
+    ].map { (try! NSRegularExpression(pattern: $0.0, options: [.caseInsensitive]), $0.1) }
+
+    /// What medical references call the question's everyday injury and symptom words, in order, without repeats.
+    static func related(to question: String) -> [String] {
+        let range = NSRange(question.startIndex..., in: question)
+        var out: [String] = []
+        for (pattern, related) in layTerms where pattern.firstMatch(in: question, range: range) != nil {
+            for r in related where !out.contains(r) { out.append(r) }
+        }
+        return out
+    }
+
+    /// True when the question uses one of the everyday injury or symptom words `layTerms` knows.
+    static func hasLayHealthTerm(_ question: String) -> Bool {
+        let range = NSRange(question.startIndex..., in: question)
+        return layTerms.contains { $0.pattern.firstMatch(in: question, range: range) != nil }
     }
 
     // MARK: Text scoring
@@ -568,6 +859,29 @@ enum Retriever {
         return text.lowercased()
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { $0.count > 1 && !stopwords.contains($0) && seen.insert($0).inserted }
+    }
+
+    /// The nouns in a question, lowercased ("purify water without power": water, power), by Apple's on-device
+    /// tagger: about a millisecond once it's loaded (`warm` loads it).
+    static func nouns(in text: String) -> Set<String> {
+        let tagger = NLTagger(tagSchemes: [.lexicalClass])
+        tagger.string = text
+        var found = Set<String>()
+        tagger.enumerateTags(in: text.startIndex..<text.endIndex, unit: .word, scheme: .lexicalClass,
+                             options: [.omitWhitespace, .omitPunctuation]) { tag, range in
+            if tag == .noun { found.insert(text[range].lowercased()) }
+            return true
+        }
+        return found
+    }
+
+    /// Words the question rules out ("without power", "no electricity"): not the topic.
+    static func negated(in text: String) -> Set<String> {
+        let pattern = try! NSRegularExpression(pattern: #"\b(?:without|no|not|never)\s+(?:a |an |the |any )?([a-z0-9]+)"#,
+                                               options: [.caseInsensitive])
+        return Set(pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
+            Range($0.range(at: 1), in: text).map { text[$0].lowercased() }
+        })
     }
 
     /// Strict query first, then the longest (most specific) words.
@@ -633,6 +947,10 @@ enum HTMLText {
     private static let headingMark: UInt8 = 0x01
 
     @inline(__always) private static func lower(_ c: UInt8) -> UInt8 { c >= 0x41 && c <= 0x5A ? c | 0x20 : c }
+    /// A letter, "/", "!" or "?": what may follow "<" in a tag, a closing tag, a comment or a declaration.
+    @inline(__always) private static func startsTag(_ c: UInt8) -> Bool {
+        (c | 0x20 >= 0x61 && c | 0x20 <= 0x7A) || c == slash || c == 0x21 || c == 0x3F
+    }
     @inline(__always) private static func isAlnum(_ c: UInt8) -> Bool {
         (c >= 0x30 && c <= 0x39) || (c | 0x20 >= 0x61 && c | 0x20 <= 0x7A)
     }
@@ -762,8 +1080,10 @@ enum HTMLText {
         while i < end {
             guard let open = find(lt, b, from: i, end: end) else { appendText(b, i..<end, to: &out); break }
             appendText(b, i..<open, to: &out)
-            // A tag runs to the first ">" and holds at least one character; anything else is text.
-            guard let close = find(gt, b, from: open + 1, end: end), close > open + 1 else {
+            // A tag starts with a letter, "/", "!" or "?" right after the "<" (as in HTML itself), runs to the first ">"
+            // and holds at least one character; anything else is text, like the "<" in "keep it < 26 degrees".
+            guard open + 1 < end, startsTag(b[open + 1]),
+                  let close = find(gt, b, from: open + 1, end: end), close > open + 1 else {
                 out.append(lt)
                 i = open + 1
                 continue

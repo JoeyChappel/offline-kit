@@ -40,7 +40,7 @@ struct GamesView: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            ScrollView {
+            HitPausingScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     KitHeading(eyebrow: "THE GAMES SHELF", title: "A little time to play.",
                                subtitle: "Your favorites, ready for a quiet moment. Everything plays on this device.")
@@ -167,6 +167,7 @@ struct GamesView: View {
         // LibraryWatcher already rescans on changes; this only catches what it can't see (a drive that came back
         // while the app was in the back), and skips the scan when no Games folder changed.
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            games.refreshSaves()
             Task { await games.reloadIfChanged(library: library) }
         }
         #endif
@@ -175,15 +176,8 @@ struct GamesView: View {
     // MARK: Shelves
 
     private var shelves: some View {
-        let all = games.games
-        let continuing = all.compactMap { game in game.resumeState.map { (game, $0.date) } }
-            .sorted { $0.1 > $1.1 }
-        // `games.games` is already in title order (the scan sorts it), so filtering keeps it in order.
-        let favorites = all.filter { games.favorites.contains($0.id) }
-        let recent = all.filter { games.lastPlayed[$0.id] != nil }
-            .sorted { (games.lastPlayed[$0.id] ?? .distantPast) > (games.lastPlayed[$1.id] ?? .distantPast) }
-        let bySystem = Dictionary(grouping: all, by: \.system)
-        let systems = GameSystem.allCases.filter { bySystem[$0] != nil }
+        let rows = games.shelves
+        let continuing = rows.continuing, favorites = rows.favorites, recent = rows.recent
         var order = 0
         func next() -> Double { defer { order += 1 }; return Double(min(order, 6)) * 0.06 }
         return VStack(alignment: .leading, spacing: 30) {
@@ -205,8 +199,7 @@ struct GamesView: View {
                 shelf("Recently played", symbol: "clock", count: nil, route: nil) { tiles(Array(recent.prefix(10))) }
                     .appearFade(delay: next())
             }
-            ForEach(systems) { system in
-                let list = bySystem[system] ?? []
+            ForEach(rows.systems, id: \.system) { system, list in
                 shelf(system.name, symbol: system.artSymbol, count: list.count, route: .system(system), tint: system.tint) { tiles(list) }
                     .appearFade(delay: next())
             }
@@ -608,11 +601,13 @@ private struct GameTileLink: View {
     }
 }
 
-/// The game's saved picture when it has one, else its system's colors and symbol with the title set on it.
+/// The game's saved picture when it has one (its last frame), else its generated title screen (GameTitleCards), else
+/// its system's colors and symbol with the title set on it.
 private struct GameArtwork: View {
     let game: Game
     @State private var loaded: CGImage?
     private static let pixels = 768
+    private var titleScreen: String? { GameArtStore.shared.titleScreen(for: game) }
     var body: some View {
         ZStack {
             if let thumbnail {
@@ -625,17 +620,21 @@ private struct GameArtwork: View {
         .aspectRatio(1.4, contentMode: .fit)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .accessibilityHidden(true)
-        // Read and shrunk off the main thread by the shared cache, and again when a new save changes the picture.
-        .task(id: "\(game.id)|\(game.savedStamp)") {
-            let path = game.thumbnailURL.path
-            if let hit = ImageCache.shared.cached(path, pixels: Self.pixels) { loaded = hit; return }
-            let result = await ImageCache.shared.image(path, pixels: Self.pixels)
-            guard !Task.isCancelled else { return }
-            loaded = result
+        // Read and shrunk off the main thread by the shared cache, and again when a new save changes the picture
+        // or a title screen arrives.
+        .task(id: "\(game.id)|\(game.savedStamp)|\(titleScreen ?? "")") {
+            for path in [game.thumbnailURL.path, titleScreen].compactMap({ $0 }) {
+                if let hit = ImageCache.shared.cached(path, pixels: Self.pixels) { loaded = hit; return }
+                let result = await ImageCache.shared.image(path, pixels: Self.pixels)
+                guard !Task.isCancelled else { return }
+                if let result { loaded = result; return }
+            }
+            loaded = nil
         }
     }
     private var thumbnail: Image? {
         let image = loaded ?? ImageCache.shared.cached(game.thumbnailURL.path, pixels: Self.pixels)
+            ?? titleScreen.flatMap { ImageCache.shared.cached($0, pixels: Self.pixels) }
         return image.map { Image(decorative: $0, scale: 1) }
     }
 }

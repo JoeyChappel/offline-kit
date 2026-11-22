@@ -167,6 +167,27 @@ extension View {
 
 // MARK: - Scrolling without hit testing
 
+/// Decides when HitPausingScrollView may stop pausing hit testing. A trackpad gesture whose end phase never arrives
+/// (a sheet or alert opened mid-gesture) would otherwise leave the phase on "interacting" and clicks dead until the
+/// next complete scroll. Pure, so it can be tested without a window.
+struct HitPauseWatchdog {
+    /// How long the offset may stand still while the phase says "moving" before clicks come back.
+    static let stillInterval: TimeInterval = 0.5
+    private(set) var phaseMoving = false
+    private(set) var lastChange = Date.distantPast
+
+    /// The scroll phase changed. Returns whether hit testing should be paused.
+    mutating func phase(moving: Bool, now: Date) -> Bool {
+        phaseMoving = moving
+        if moving { lastChange = now }
+        return moving
+    }
+    /// The offset changed. Returns true when this resumes a pause the watchdog had released (phase still moving).
+    mutating func offsetChanged(now: Date) -> Bool { lastChange = now; return phaseMoving }
+    /// True when the phase claims motion but the offset has been still long enough.
+    func shouldRelease(now: Date) -> Bool { phaseMoving && now.timeIntervalSince(lastChange) >= Self.stillInterval }
+}
+
 /// A ScrollView that turns hit testing off for its content while the content is moving (Mac only).
 /// SwiftUI re-runs hit testing on every frame a stationary pointer sits over moving content, to update hover. That
 /// walks every card's responders, and was about a tenth of the main thread's time while scrolling Watch and Books.
@@ -176,6 +197,8 @@ struct HitPausingScrollView<Content: View>: View {
     @ViewBuilder var content: () -> Content
     #if os(macOS)
     @State private var scrolling = false
+    /// Not state: it changes every frame of a scroll and must not redraw the content.
+    @State private var watch = WatchBox()
     #if DEBUG
     /// -noHitPause YES scrolls the old way, for before/after comparisons in one build.
     private static var disabled: Bool { UserDefaults.standard.bool(forKey: "noHitPause") }
@@ -184,12 +207,34 @@ struct HitPausingScrollView<Content: View>: View {
     #endif
     #endif
 
+    #if os(macOS)
+    private final class WatchBox { var state = HitPauseWatchdog(); var task: Task<Void, Never>? }
+
+    /// While the phase says moving, looks twice a second whether the offset has stood still; if so, clicks come back.
+    private func startWatchdog() {
+        guard watch.task == nil else { return }
+        let box = watch
+        watch.task = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                if box.state.shouldRelease(now: Date()) { scrolling = false }
+            }
+        }
+    }
+    #endif
+
     var body: some View {
         #if os(macOS)
         ScrollView(axes) { content().allowsHitTesting(!scrolling || Self.disabled) }
             .onScrollPhaseChange { _, phase in
                 let moving = phase == .interacting || phase == .decelerating || phase == .animating
-                if moving != scrolling { scrolling = moving }
+                let pause = watch.state.phase(moving: moving, now: Date())
+                if pause != scrolling { scrolling = pause }
+                if moving { startWatchdog() } else { watch.task?.cancel(); watch.task = nil }
+            }
+            // Cheap per frame (a class field, no redraw); lets a held-still gesture that resumes pause hit testing again.
+            .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.x + $0.contentOffset.y } action: { _, _ in
+                if watch.state.offsetChanged(now: Date()), !scrolling { scrolling = true }
             }
         #else
         ScrollView(axes) { content() }

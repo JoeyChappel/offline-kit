@@ -418,7 +418,7 @@ private struct GeneratorCalculator: View {
                                 }
                                 if item.custom {
                                     Button(role: .destructive) { store.items.removeAll { $0.id == item.id } } label: { Image(systemName: "trash") }
-                                        .buttonStyle(.borderless).help("Remove")
+                                        .buttonStyle(.borderless).help("Remove").accessibilityLabel("Remove \(item.name)")
                                 }
                             }
                             wattField($item.running)

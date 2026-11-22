@@ -38,7 +38,7 @@ final class DownloadJob: @MainActor Identifiable {
 
     /// "3.2 GB of 8.2 GB · 24 MB/s · 4 min left"
     var detail: String {
-        let fmt = { (b: Int64) in ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }
+        let fmt = DownloadSize.string
         switch state {
         case .queued: return "Waiting · \(fmt(total))"
         case .preparing: return "Contacting mirrors…"
@@ -297,7 +297,7 @@ final class DownloadManager {
             do {
                 let meta: Metalink
                 if job.metalinkURL.pathExtension == "meta4" {
-                    guard job.metalinkURL.scheme == "https" else { throw DownloadError.server("The mirror list isn’t on a secure address.") }
+                    guard job.metalinkURL.scheme == "https" || LocalTestServer.allows(job.metalinkURL) else { throw DownloadError.server("The mirror list isn’t on a secure address.") }
                     meta = try await Metalink.fetch(job.metalinkURL)
                 } else if let preset = job.presetMeta {
                     meta = preset
@@ -349,6 +349,16 @@ final class DownloadManager {
     }
 }
 
+/// File sizes for download progress: "0 KB" at the start, not the formatter's "Zero KB".
+enum DownloadSize {
+    static func string(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        formatter.allowsNonnumericFormatting = false
+        return formatter.string(fromByteCount: bytes)
+    }
+}
+
 /// Progress across every download in the list.
 struct DownloadSummary: Equatable {
     let count: Int
@@ -374,7 +384,7 @@ struct DownloadSummary: Equatable {
 
     /// "2.1 GB of 7.5 GB · about 12 min left"
     var detail: String {
-        let fmt = { (b: Int64) in ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }
+        let fmt = DownloadSize.string
         if isComplete { return "\(fmt(bytesTotal)) saved. Everything is in Library." }
         var parts = ["\(fmt(bytesDone)) of \(fmt(bytesTotal))"]
         if isRunning { parts.append(secondsLeft.map(Self.timeLeft) ?? "working out time left…") }

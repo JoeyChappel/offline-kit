@@ -5,7 +5,8 @@ import Testing
 private struct StubEngine: AnswerEngine {
     var sourceBudget: Int
     var promptBudget: Int
-    var displayName: String { "Stub" }
+    var name = "Stub"
+    var displayName: String { name }
     var runsOnDevice: Bool { true }
     func stream(instructions: String, prompt: String) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { $0.finish() }
@@ -72,6 +73,31 @@ struct AskPromptTests {
         #expect(history.count <= 5_000)
         #expect(history.hasSuffix(long.prefix(1_500).description))
         #expect(!history.contains("Question 1?"))
+    }
+
+    @Test("Each engine trims the history for its own room: a smaller model's trim doesn't shorten a larger one's")
+    func historyPerEngine() {
+        let model = AskModel()
+        let small = StubEngine(sourceBudget: 14_000, promptBudget: 4_000, name: "Built-in")
+        let large = StubEngine(sourceBudget: 14_000, promptBudget: 30_000, name: "Ollama")
+        let long = String(repeating: "word ", count: 290)
+        for i in 1...3 { model.turns.append(done("Question \(i)?", long)) }
+        let trimmed = model.conversationSoFar(engine: small, context: "")
+        #expect(!trimmed.contains("Question 1?"), "the small model's room holds one turn")
+        let full = model.conversationSoFar(engine: large, context: "")
+        #expect(full.hasPrefix("Q: Question 1?"), "the large model still gets all three")
+        #expect(model.conversationSoFar(engine: small, context: "") == trimmed)
+    }
+
+    @Test("New Conversation counts for the built-in model whichever engine answered, without starting it")
+    func newConversationCounts() {
+        let before = LlamaRuntime.conversationCount
+        let existed = LlamaRuntime.exists
+        let model = AskModel()
+        model.turns.append(done("Kept?", "Yes."))
+        model.clear()
+        #expect(LlamaRuntime.conversationCount > before, "a conversation being prepared sees the count move and stops")
+        #expect(LlamaRuntime.exists == existed, "counting never creates the runtime")
     }
 
     @Test("Small models keep the last two turns, short")

@@ -67,6 +67,18 @@ enum MediaCover {
         forgetCustomAnswers()
     }
 
+    /// Saves a picture made in the app ("Use Generated Cover") as the custom cover.
+    static func set(_ picture: CGImage, for item: MediaItem) throws {
+        let target = customURL(for: item)
+        guard let destination = CGImageDestinationCreateWithURL(target as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
+            throw CoverError.cantWrite
+        }
+        CGImageDestinationAddImage(destination, picture, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw CoverError.cantWrite }
+        CoverStamp.shared.value += 1
+        forgetCustomAnswers()
+    }
+
     /// Removes the custom cover; the original art (embedded, cover.jpg or video still) shows again.
     static func reset(for item: MediaItem) {
         try? FileManager.default.removeItem(at: customURL(for: item))
@@ -115,6 +127,30 @@ struct CoverArtButtons: View {
                 Task { await media.reload(library: library) }
             }
         }
+        GeneratedArtButtons(item: item)
+    }
+}
+
+/// "Pick Another Frame" and "Reset Artwork" for a movie's generated picture; "Use Generated Cover" for music and books
+/// that came with art of their own (see AutoArtwork).
+struct GeneratedArtButtons: View {
+    let item: MediaItem
+    @Environment(MediaLibrary.self) private var media
+
+    var body: some View {
+        let info = media.info[item.progressKey]
+        if AutoArtwork.canPickFrame(item, info: info) {
+            Button("Pick Another Frame", systemImage: "film.stack") { AutoArtwork.shared.pickAnotherFrame(item) }
+                .help("Show a different moment from this video")
+        }
+        if AutoArtwork.canResetFrame(item, info: info) {
+            Button("Reset Artwork", systemImage: "arrow.counterclockwise") { AutoArtwork.shared.resetFrame(item) }
+                .help("Go back to the picture Offline Kit chose")
+        }
+        if AutoArtwork.canUseGeneratedCover(item, info: info) {
+            Button("Use Generated Cover", systemImage: "textformat") { AutoArtwork.shared.useGeneratedCover(item) }
+                .help("Show a cover with the title and genre instead of the art that came with it")
+        }
     }
 }
 
@@ -140,6 +176,7 @@ struct MediaCardMenu: ViewModifier {
                         Task { await media.reload(library: library) }
                     }
                 }
+                GeneratedArtButtons(item: item)
             }
     }
 }

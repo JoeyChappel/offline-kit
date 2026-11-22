@@ -344,7 +344,11 @@ final class WebServer: @unchecked Sendable {
         if let preferred, let at = order.firstIndex(of: preferred) { order.remove(at: at); order.insert(preferred, at: 0) }
         for candidate in order where Self.isPortFree(candidate) {
             do {
-                let params = NWParameters.tcp
+                // No Nagle delay: small writes (game sound chunks, WebSocket pongs, short JSON) go out at once instead of
+                // waiting to be batched, which added tens of milliseconds to streamed games.
+                let tcp = NWProtocolTCP.Options()
+                tcp.noDelay = true
+                let params = NWParameters(tls: nil, tcp: tcp)
                 // Lets the server take back its port while the last run's connections are still winding down.
                 // isPortFree has already made sure no other program is listening on it.
                 params.allowLocalEndpointReuse = true

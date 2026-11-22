@@ -142,10 +142,16 @@ struct PowerOutSection: View {
     @State private var pickingStart = false
     @State private var startPick = Date()
     @State private var confirmEnd = false
+    @State private var selectedGuide: GuideSection?
     let openWaterCalculator: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Power out").font(.title.bold())
+                Text("Start the clock, work through your checklist, and find the guidance you need.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             if power.isActive {
                 TimelineView(.periodic(from: .now, by: 30)) { context in
                     VStack(alignment: .leading, spacing: 16) {
@@ -156,16 +162,32 @@ struct PowerOutSection: View {
             } else {
                 startCard
             }
-            ForEach(PowerOutGuide.sections) { section in
-                if section.id == PowerOutGuide.checklistID {
-                    checklist(section)
-                } else {
-                    guideCard(section)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 20) {
+                    if let section = PowerOutGuide.section(PowerOutGuide.checklistID) {
+                        checklist(section).frame(minWidth: 420, maxWidth: .infinity)
+                    }
+                    guidanceRoutes.frame(minWidth: 280, maxWidth: 360)
+                }
+                VStack(alignment: .leading, spacing: 18) {
+                    if let section = PowerOutGuide.section(PowerOutGuide.checklistID) { checklist(section) }
+                    guidanceRoutes
                 }
             }
             if power.isActive { endButton }
         }
         .sheet(isPresented: $pickingStart) { startPicker }
+        .sheet(item: $selectedGuide) { section in
+            NavigationStack {
+                ScrollView { guideCard(section).padding(24) }
+                    .background(Design.canvas)
+                    .navigationTitle(section.title)
+                    .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { selectedGuide = nil } } }
+            }
+            #if os(macOS)
+            .frame(width: 720, height: 720)
+            #endif
+        }
         .task { await power.refreshPermission() }
         #if DEBUG
         // Test hooks: -powerOutHoursAgo 5 starts power-out mode as if the power went out 5 hours ago.
@@ -319,11 +341,42 @@ struct PowerOutSection: View {
 
     // MARK: Guide
 
+    private var guidanceRoutes: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            KitCardHeader(symbol: "book", title: "Guidance", subtitle: "Open a topic for the full guidance and sources.")
+            ForEach([PowerOutGuide.foodID, PowerOutGuide.generatorID, PowerOutGuide.waterID, PowerOutGuide.returnsID], id: \.self) { id in
+                if let section = PowerOutGuide.section(id) {
+                    Button { selectedGuide = section } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: section.symbol).foregroundStyle(.tint).frame(width: 24)
+                            Text(routeTitle(section)).font(.callout.weight(.semibold)).multilineTextAlignment(.leading)
+                            Spacer(minLength: 0)
+                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+                        }.padding(12).contentShape(Rectangle())
+                            .background(Design.canvas, in: RoundedRectangle(cornerRadius: 10))
+                            .overlay { RoundedRectangle(cornerRadius: 10).stroke(Design.border) }
+                    }.buttonStyle(.plain)
+                }
+            }
+            Text("Sources checked \(SafetySources.checkedOn). Links need internet.").font(.caption).foregroundStyle(.secondary)
+        }.card(padding: 18)
+    }
+
+    private func routeTitle(_ section: GuideSection) -> String {
+        switch section.id {
+        case PowerOutGuide.foodID: "Fridge & freezer food"
+        case PowerOutGuide.generatorID: "Generator safety & carbon monoxide"
+        case PowerOutGuide.waterID: "Drinking water"
+        case PowerOutGuide.returnsID: "When power returns"
+        default: section.title
+        }
+    }
+
     private func guideCard(_ section: GuideSection) -> some View {
         SectionCard(symbol: section.symbol, title: section.title, subtitle: section.intro) {
             BulletList(items: section.points).font(.callout)
             if section.id == PowerOutGuide.waterID {
-                Button { openWaterCalculator() } label: { Label("Open the Bleach Calculator", systemImage: "drop") }
+                Button { selectedGuide = nil; openWaterCalculator() } label: { Label("Open the Bleach Calculator", systemImage: "drop") }
                     .buttonStyle(.bordered)
             }
             SourceList(sources: section.sources)
@@ -331,7 +384,20 @@ struct PowerOutSection: View {
     }
 
     private func checklist(_ section: GuideSection) -> some View {
-        SectionCard(symbol: section.symbol, title: section.title, subtitle: section.intro) {
+        let checked = section.points.filter { power.done.contains($0) }.count
+        return VStack(alignment: .leading, spacing: 14) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) {
+                    KitCardHeader(symbol: section.symbol, title: section.title, subtitle: section.intro)
+                    Spacer(minLength: 0)
+                    Text("\(checked) of \(section.points.count) checked").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    KitCardHeader(symbol: section.symbol, title: section.title, subtitle: section.intro)
+                    Text("\(checked) of \(section.points.count) checked").font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+            Divider()
             ForEach(section.points, id: \.self) { item in
                 let on = power.done.contains(item)
                 Toggle(isOn: Binding(get: { on }, set: { if $0 { power.done.insert(item) } else { power.done.remove(item) } })) {
@@ -341,7 +407,7 @@ struct PowerOutSection: View {
                 .padding(.vertical, 2)
             }
             SourceList(sources: section.sources)
-        }
+        }.card(padding: 18)
     }
 
     // MARK: Formatting

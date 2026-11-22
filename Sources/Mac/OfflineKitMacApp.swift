@@ -162,6 +162,8 @@ struct OfflineKitMacApp: App {
                     }
                     share.attach(library: library, model: model, media: media)
                     share.attach(games: games)
+                    // Covers, title cards and title screens for media without art, in the background (AutoArtwork).
+                    AutoArtwork.shared.attach(media: media, games: games, nowPlaying: nowPlaying, library: library)
                     #if DEBUG
                     LaunchTiming.mark("before library.reload")
                     #endif

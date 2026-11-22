@@ -143,6 +143,32 @@ build/Build/Products/Debug/okit --download zimgit-water_en /tmp/okit-test
 
 Debug builds accept `-autoAsk "question"` at launch to ask automatically (used for simulator testing).
 
+### Ask benchmarks and checks (okit)
+
+Run them on a Debug `okit` with `OFFLINEKIT_HOME=<test home>` (a folder with `OfflineKit/Library` holding the archives and `Models`; symlinked files need an old modification time, e.g. `touch -h -t 202611010000`, or they count as still downloading) and `OFFLINEKIT_NO_OLLAMA=1`. `OFFLINEKIT_GREEDY=1` makes answers repeatable, `OFFLINEKIT_NO_INDEX=1` searches with libzim instead of the answer index, `OFFLINEKIT_TRACE=1` prints where a question's time goes.
+
+- `--ask-bench Tools/Tests/ask-conversations.txt [--wait 5] [--gap 3] [--out r.json] [--sources-only]`: Ask end to end in a fresh process, as a person uses it: first word per turn, prompt and reused tokens, memory. It also scores each turn: the share of its top three sources on the expected topic (each question's `=> word|word; word` in the file), valid citations, "not in your library" said when it should be (`=> none`), and answers that repeat the instructions. `--sources-only` runs Ask's source search per turn without answering, for retrieval changes.
+- `--followup-check Tools/Tests/ask-conversations.txt`: each conversation's second answer with and without the saved conversation state; greedy answers must be identical.
+- `--bench Tools/Tests/ask-bench-questions.txt [--ttfw]`: retrieval time and source size per question, two passes; `--ttfw` adds time to first word.
+- `--llama-bench <questions.txt> [--tokens 128]`: the built-in model's prompt and generation speed and memory.
+- `--search-cold "query" […]`: each archive's first libzim search against later ones.
+- `--index-build <file.zim> [--seconds 60]`: the app's answer-index builder on one archive: articles a second and CPU.
+- `--index-bench <file.zim> [--limit N] [--depth full|leads] [--questions q.txt]`: index build and query timings.
+- `--html-check <file.zim> [--articles N]`: the byte scanner against the regular expressions it replaced, article by article, with timings. `OFFLINEKIT_HTML_LIST=1` lists every differing article, `OFFLINEKIT_HTML_ONLY=<path>` checks one.
+
+Test archives, no downloads: `Tools/Tests/make-tiny-zim.py` writes `Tests/Fixtures/tiny.zim` (six articles, the unit tests' fixture; `--index` writes `tiny-indexed.zim` with a full-text index), and `Tools/Tests/make-test-zim/make-test-zim.py <folder>` writes `practical.zim` (about 300 health, repair and food articles) and `encyclopedia.zim` (about 20,000 short articles), or with `--big N` a Wikipedia-sized archive for index scale tests.
+
+## First-run smoke test
+
+```bash
+Tools/Tests/first-run-smoke.sh [--drop] [--keep] [--no-build]
+```
+
+Walks a brand-new user through setup with no internet: builds the Debug app, writes test archives, starts `Tools/Tests/first-run-server.py` (a fake Kiwix catalog, metalinks with real SHA-256 and piece hashes, and Range downloads on a free 127.0.0.1 port), then launches the app in a fresh `OFFLINEKIT_HOME`. Run 1 presses through the setup screens (`-onboardingScript`), downloads, and waits for the answer index; run 2 reopens the app and asks a question (`-autoAsk`). It checks sizes, checksums, no leftover partial files, an index per archive and a cited source, then cleans up. `--drop` throttles the server and stops it mid-download to check recovery; `--keep` leaves the screenshots (`shots/`, one PNG per window per time in `-snapshotAt`), logs and test home in a folder it prints. Needs a logged-in desktop session (the app opens windows). Takes about 3 minutes with the build.
+
+- **Test server override:** `OFFLINEKIT_TEST_SERVER=http://127.0.0.1:<port>` points the catalog and downloads at the local server. It works only in Debug builds, only with `OFFLINEKIT_HOME` set, and only for 127.0.0.1 (`LocalTestServer` in `Catalog.swift`); a Release build ignores it.
+- **Setup hook:** `-onboardingScript "next,next,areas:emergency+health,pictures:noPictures,model:off,back,wait:3,download,progress,done"` presses the buttons (`-onboardingGap` seconds apart, default 2). `-onboardingStep N` opens at a step.
+
 ## Unit tests
 
 ```bash
@@ -170,7 +196,7 @@ Offline Kit is GPLv3 (see `LICENSE`); `THIRD-PARTY-NOTICES.md` lists every bundl
 ## Known gaps
 
 - Short questions ("treat a burn") can pull loosely related Q&A alongside the right article. The model mostly ignores them, but the sources list shows them.
-- Each question is retrieved on its own; follow-ups don't carry context yet.
+- Follow-ups carry the conversation's topic words by rule (`AskModel.searchQuery`); a follow-up that changes the subject in a few words ("what about chicken?" after rice) still carries the old subject at half weight.
 - No bundled model for iPhones without Apple Intelligence (next step: MLX or llama.cpp with a ~3B model).
 - Documents vault and kids' media aren't in the app yet.
 - iPhone downloads only run while the app is open (no background transfer yet).

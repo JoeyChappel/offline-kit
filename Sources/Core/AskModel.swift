@@ -42,6 +42,10 @@ struct Turn: Identifiable, Equatable {
     var cutShort = false
     /// The topic the question was scoped to, so Try Again asks it the same way.
     var scope: SubjectTopic?
+    /// What its sources were searched for (with a follow-up's carried topic words), for the next follow-up.
+    var query: SearchQuery?
+    /// What checking the answer's citations against their passages did (`CitationChecker`).
+    var citations: CitationChecker.Report?
 }
 
 @MainActor @Observable
@@ -88,9 +92,10 @@ final class AskModel {
     private var learnTask: Task<Void, Never>?
     /// The engine that answered last, told when the conversation starts over.
     private var lastEngine: AnswerEngine?
-    /// The oldest turn the conversation history still includes. Older turns are dropped a few at a time, so the
-    /// history keeps the same beginning for several turns (and the model's saved state of it stays usable).
-    private var historyStart: UUID?
+    /// The oldest turn the conversation history still includes, per engine (`technicalName`): each has its own
+    /// room for it. Older turns are dropped a few at a time, so the history keeps the same beginning for several
+    /// turns (and the model's saved state of it stays usable).
+    private var historyStarts: [String: UUID] = [:]
     private var requestID = UUID()
 
     /// http(s) to localhost, a ".local" name or a private IPv4 address.
@@ -115,7 +120,7 @@ final class AskModel {
     }
 
     /// Who Ask is. Shared by questions asked here and over Wi-Fi sharing (which never gets personal context).
-    static let instructions = """
+    nonisolated static let instructions = """
     You are the calm, steady guide inside Offline Kit, a family's offline emergency library. The internet may be \
     down and help may be far away. The person asking may be scared, rushed or unsure what to do.
     How you speak:
@@ -133,7 +138,7 @@ final class AskModel {
     only sources that actually answer the question. Ignore the rest completely: don't mention them, list them \
     or stretch them to fit.
     - Base answers on the useful sources. Cite them inline like [1] or [2][3]. Every step or fact taken from a \
-    source carries its citation.
+    source carries its citation. Cite only this question's numbered sources: an earlier answer is not a source.
     - If you're told about the person, household, skills or supplies, use it where it changes the answer: match \
     the detail to their skills, work with what they have, and mention a missing supply only when it matters. \
     Leave out personal details that don't affect this question; never force them in.
@@ -141,7 +146,7 @@ final class AskModel {
     library." Say it before anything else: no steps, tips or advice before it. Then you may add a short answer \
     from general knowledge under the heading "Not from the library:". Never write uncited steps outside that \
     heading. If the sources help with part of it, answer that part from them with citations and put only the \
-    rest under that heading.
+    rest under that heading, without the "couldn't find" sentence. Nothing under that heading carries a citation.
     - For "what if" and hypothetical questions: state your assumptions, reason step by step from established \
     facts, and keep the scenario exactly as the person set it up across follow-ups. When they change or correct \
     it, restate the new scenario in one line before answering. Don't simplify their setup into an easier one.
@@ -150,14 +155,14 @@ final class AskModel {
     it and suggest writing it in Prepare afterward.
     - Mention a part of Offline Kit only when it directly helps (for example Emergency info for phone numbers and \
     radio frequencies, or Prepare for their checklist). Don't end answers with "find more in your library" lines.
-    - Only for medical, electrical, gas, chemical or structural safety topics, end with one line telling them to \
-    double-check the cited article and get professional help when it's available. Leave it off everyday topics \
+    - Only when the topic is medical, electrical, gas, chemical or structural safety, end with this line: \
+    "Double-check the cited article and get professional help when it's available." Leave it off everyday topics \
     like cooking, knots, camping, gardening, cars or how-to questions.
     - Write the heading as plain text exactly "Not from the library:" (no bold, no other wording).
     """
 
     /// Added when someone may be in danger right now.
-    static let emergencyInstructions = """
+    nonisolated static let emergencyInstructions = """
 
     THIS MAY BE AN EMERGENCY. Someone may be in danger right now.
     - Start with the single most important action, in a few words.
@@ -165,6 +170,48 @@ final class AskModel {
     - If calling 911, Poison Help or 988 is right, make that step 1.
     - Stay calm and reassuring.
     """
+
+    /// True when an answer repeats a run of eight words from Ask's own instructions (the sentences answers are
+    /// told to write, like "Not from the library:", don't count): the model printed its instructions back.
+    nonisolated static func echoesInstructions(_ answer: String) -> Bool { echoStart(answer) != nil }
+
+    /// Where an answer starts repeating Ask's instructions: the start of the line with the first run of eight of
+    /// their words in it. Nil when it doesn't. A few microseconds for a whole answer.
+    nonisolated static func echoStart(_ answer: String) -> String.Index? {
+        var words: [(word: String, start: String.Index)] = []
+        var i = answer.startIndex
+        while i < answer.endIndex {
+            guard answer[i].isLetter || answer[i].isNumber else { i = answer.index(after: i); continue }
+            var j = i
+            while j < answer.endIndex, answer[j].isLetter || answer[j].isNumber { j = answer.index(after: j) }
+            words.append((answer[i..<j].lowercased(), i))
+            i = j
+        }
+        guard words.count >= echoRun else { return nil }
+        for k in 0...(words.count - echoRun) where instructionRuns.contains(words[k..<(k + echoRun)].map(\.word).joined(separator: " ")) {
+            let at = words[k].start
+            return answer[..<at].lastIndex(of: "\n").map { answer.index(after: $0) } ?? answer.startIndex
+        }
+        return nil
+    }
+
+    private nonisolated static let echoRun = 8
+
+    private nonisolated static func echoWords(_ text: String) -> [String] {
+        text.lowercased().split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
+    }
+
+    /// Every eight-word run of the instructions, less those inside the sentences an answer is told to write.
+    private nonisolated static let instructionRuns: Set<String> = {
+        func runs(_ text: String) -> Set<String> {
+            let w = echoWords(text)
+            guard w.count >= echoRun else { return [] }
+            return Set((0...(w.count - echoRun)).map { w[$0..<($0 + echoRun)].joined(separator: " ") })
+        }
+        return runs(instructions).union(runs(emergencyInstructions))
+            .subtracting(runs("I couldn't find this in your offline library. Not from the library:"))
+            .subtracting(runs("Double-check the cited article and get professional help when it's available."))
+    }()
 
     /// The answer model Ask will use, in plain words, with its technical name for a tooltip.
     func engineLabel(libraryFolders: [URL]) -> (name: String, detail: String) {
@@ -258,6 +305,12 @@ final class AskModel {
 
     /// Picks an engine. Automatic prefers Ollama (bigger model and context) when it's running.
     func resolveEngine() async -> AnswerEngine? {
+        #if DEBUG
+        // Test hook (test home only): OFFLINEKIT_TEST_ENGINE=echo answers with a script that exercises Ask's guards.
+        if KitLocation.testHome != nil, ProcessInfo.processInfo.environment["OFFLINEKIT_TEST_ENGINE"] == "echo" {
+            return EchoTestEngine()
+        }
+        #endif
         // Only Automatic and Ollama look for Ollama; the other choices never wait on it.
         let ollama: AnswerEngine? = await {
             guard choice == .auto || choice == .ollama, let url = URL(string: ollamaHost),
@@ -297,8 +350,10 @@ final class AskModel {
         stop()
         if !turns.isEmpty { clearedTurns = turns; clearedAt = Date() }
         turns.removeAll()
-        historyStart = nil
+        historyStarts = [:]
         lastEngine?.forgetConversation()
+        // The built-in model may hold this conversation even when another engine answered last.
+        if !(lastEngine is LlamaEngine) { LlamaEngine.forgetSavedConversation() }
     }
 
     /// Undo for New Conversation. Does nothing if a new question has been asked since.
@@ -306,7 +361,7 @@ final class AskModel {
         guard let saved = clearedTurns, turns.isEmpty else { clearedTurns = nil; return }
         turns = saved
         clearedTurns = nil
-        historyStart = nil
+        historyStarts = [:]
     }
 
     func dismissUndo() { clearedTurns = nil }
@@ -355,12 +410,7 @@ final class AskModel {
         turn.isEmergency = emergency
         turns.append(turn)
         let index = turns.count - 1
-        // A short follow-up ("would we notice it first?") is searched together with the question before it.
-        let previous = turns.dropLast().last(where: { $0.status == .done })?.question
-        let searchText = previous.map { Self.isFollowUp(question) ? $0 + " " + question : question } ?? question
-        // The bare question is always tried first; the merged one is the fallback for a follow-up.
-        let retrievalQuestion = scope.map { "\($0.title): \(question)" } ?? question
-        let aboutKit = Self.isAboutKit(question)
+        let previous = Array(turns.dropLast().filter { $0.status == .done })
         let request = UUID()
         requestID = request
 
@@ -378,16 +428,6 @@ final class AskModel {
                 try? await Task.sleep(for: .milliseconds(300))
                 guard !Task.isCancelled, self.requestID == request else { return }
             }
-            // Movies, comics and sports encyclopedias match everyday words ("Water & Power", "The App") and crowd
-            // out real answers; leave them out unless the question is about entertainment.
-            let wantsEntertainment = Self.matches(#"\b(movie|film|actor|actress|comic|superhero|sport|team|player|league|game|football|soccer|baseball|basketball|hockey|tennis|golf)s?\b"#, question)
-            let allArchives = library.books
-                .filter { book in scope.map { $0.area.contains(archiveName: book.archive.name) } ?? true }
-                .filter { wantsEntertainment || !Self.isEntertainment($0.archive.name) }
-                .map(\.archive)
-            // Health questions search the medical references first (MedlinePlus, WikiMed, MDWiki, the medical PDFs).
-            let medical = Self.isHealthQuestion(question) ? allArchives.filter { Self.isMedical($0.name) } : []
-            let archives = allArchives
             let kit = Self.kitSummary(library)
 
             let resolved = await resolveEngine()
@@ -414,181 +454,327 @@ final class AskModel {
 
             // Personal context and history share the model's window with the sources, which get the rest of it:
             // too much text would only be refused and asked again with less.
-            let small = engine.sourceBudget < 10_000
-            var budget = max(2_000, small ? engine.sourceBudget - context.count - earlier.count
-                                          : min(engine.sourceBudget, engine.promptBudget - context.count - earlier.count))
-            // A follow-up usually needs the model's keyword search below (its words lean on the question before):
-            // start writing it now, on the model, while the library is searched. Cancelled if it isn't needed.
-            let earlyKeywords: Task<String?, Never>? = !aboutKit && !emergency && searchText != question
-                ? Task { await Self.searchWords(for: searchText, engine: engine) } : nil
-            defer { earlyKeywords?.cancel() }
-            // Questions about the kit itself are answered from the kit description; a keyword search only adds noise.
-            var sources: [Source] = []
-            // What the searches for this exact question found, per archive: a later pass reuses it.
-            var searched: [String: Retriever.Gathered] = [:]
+            let budget = Self.sourceBudget(engine: engine, context: context, history: earlier)
             #if DEBUG
             let traceStart = Date()
             func trace(_ what: String) { AskTrace.log(String(format: "%6.0f ms  ", Date().timeIntervalSince(traceStart) * 1000) + what) }
-            trace("searching")
             #else
             func trace(_ what: @autoclosure () -> String) {}
             #endif
-            if !aboutKit, !medical.isEmpty {
-                let result = await Retriever.retrieveConcurrently(question: retrievalQuestion, archives: medical, budgetChars: budget)
-                sources = result.sources
-                searched = result.gathered
-                trace("medical search: \(sources.count) sources")
-            }
-            if !aboutKit, Retriever.strength(sources, question: question) == 0 {
-                let result = await Retriever.retrieveConcurrently(question: retrievalQuestion, archives: archives,
-                                                                  budgetChars: budget, reusing: searched)
-                sources = result.sources
-                searched = result.gathered
-                trace("search: \(sources.count) sources, strength \(Retriever.strength(sources, question: question))")
-            }
-            if Task.isCancelled { return }
-            // A follow-up the bare question didn't answer: search it together with the question before it.
-            if !aboutKit, searchText != question, Retriever.strength(sources, question: question) == 0 {
-                let merged = scope.map { "\($0.title): \(searchText)" } ?? searchText
-                let found = await Retriever.retrieveConcurrently(question: merged, archives: archives, budgetChars: budget).sources
-                if Retriever.strength(found, question: searchText) > 0 { sources = found }
-                trace("follow-up search with the question before: strength \(Retriever.strength(found, question: searchText))")
-            }
-            if Task.isCancelled { return }
-            // The search missed (a misspelling like "carpel tunel", or everyday words the articles don't use):
-            // try the spell-checked question, then a model-written keyword search, and keep whichever finds more.
-            if !aboutKit, Retriever.strength(sources, question: searchText) == 0 {
-                var alternatives: [String] = []
-                if let fixed = Retriever.spellCorrected(searchText) { alternatives.append(fixed) }
-                trace("spelling checked")
-                let keywords: String?
-                if let earlyKeywords { keywords = await earlyKeywords.value } else if !emergency { keywords = await Self.searchWords(for: searchText, engine: engine) } else { keywords = nil }
-                if let keywords { alternatives.append(keywords) }
-                trace("search words: \(alternatives)")
-                var best = 0
-                for alternative in alternatives where !Task.isCancelled {
-                    let query = scope.map { "\($0.title): \(alternative)" } ?? alternative
-                    let found = await Retriever.retrieveConcurrently(question: query, archives: archives, budgetChars: budget).sources
-                    let strength = Retriever.strength(found, question: alternative)
-                    if strength > best {
-                        best = strength
-                        sources = found
-                        turns[index].searchedFor = alternative
-                    }
-                }
-                if Task.isCancelled { return }
-                trace("alternative searches done")
-            }
-            // Not needed after all: stop it now, so the answer doesn't wait for it.
-            earlyKeywords?.cancel()
-            // Still nothing, but PDF and reference packs are being read for the first time: give them a moment
-            // rather than answering "not in the library" about books that are about to be searchable.
-            if !aboutKit, Retriever.strength(sources, question: searchText) == 0, PDFIndex.shared.isBuilding {
-                var waited = 0
-                while PDFIndex.shared.isBuilding, waited < 80 {
-                    try? await Task.sleep(for: .milliseconds(250))
-                    guard !Task.isCancelled, self.requestID == request else { return }
-                    waited += 1
-                }
-                // Same question as the first search: only the PDF pages and guide are new, so reuse the archive searches.
-                let found = await Retriever.retrieveConcurrently(question: retrievalQuestion, archives: archives,
-                                                                 budgetChars: budget, reusing: searched).sources
-                if Task.isCancelled { return }
-                if Retriever.strength(found, question: question) > 0 { sources = found }
-            }
+            guard let found = await Self.findSources(question: question, scope: scope, previous: previous, library: library,
+                                                     engine: engine, budget: budget, emergency: emergency,
+                                                     isCurrent: { [weak self] in self?.requestID == request })
+            else { return }
+            let sources = found.sources
+            turns[index].searchedFor = found.searchedFor
+            turns[index].query = found.query
             turns[index].sources = sources
             turns[index].status = .answering
 
-            var current = sources
-            var history = earlier
             // The built-in model may still be loading: say so instead of looking stuck.
             if let llama = engine as? LlamaEngine { turns[index].waking = !llama.isReady }
-            for attempt in 0..<3 {
-                // The answer is shown about ten times a second, not on every token: each change redraws the answer.
-                var lastShown = Date.distantPast
-                var unshown: String?
-                do {
-                    let head = Self.promptHead(context: context, history: history)
-                    let prompt = head + Self.promptQuestion(question: question, sources: current)
-                    let notes = StreamNotes()
-                    trace("answering: prompt \(prompt.count) chars (context \(context.count), history \(history.count))")
-                    for try await text in engine.stream(instructions: instructions, prompt: prompt, notes: notes, head: head) {
-                        if Task.isCancelled { break }
-                        if turns[index].waking { turns[index].waking = false }
-                        if lastShown == .distantPast { trace("first words") }
-                        let now = Date()
-                        if now.timeIntervalSince(lastShown) >= Self.answerRefresh {
-                            turns[index].answer = text
-                            lastShown = now
-                            unshown = nil
-                        } else {
-                            unshown = text
-                        }
+            var firstShown = false
+            let result = await Self.answer(question: question, sources: sources, engine: engine, instructions: instructions,
+                                           context: context, history: earlier, keepsConversation: true,
+                show: { [weak self] text in
+                    guard let self, !Task.isCancelled, self.requestID == request, self.turns.indices.contains(index) else { return false }
+                    if self.turns[index].waking { self.turns[index].waking = false }
+                    if !firstShown, !text.isEmpty { firstShown = true; trace("first words") }
+                    self.turns[index].answer = text
+                    return true
+                },
+                sourcesChanged: { [weak self] current in
+                    guard let self, self.requestID == request, self.turns.indices.contains(index) else { return }
+                    self.turns[index].sources = current
+                },
+                trace: { trace($0) })
+            guard !Task.isCancelled, self.requestID == request, turns.indices.contains(index) else { return }
+            turns[index].citations = result.citations
+            switch result.outcome {
+            case .stopped:
+                return
+            case .empty:
+                turns[index].answer = ""
+                fail(index, Self.emptyMessage)
+            case .tooLong:
+                fail(index, Self.tooLongMessage)
+            case .failed(let message):
+                fail(index, message)
+            case .answered(let cutShort):
+                turns[index].answer = result.text
+                turns[index].cutShort = cutShort
+                turns[index].status = .done
+                turns[index].finished = Date()
+                household?.log(question: question, answer: turns[index].answer, sources: result.sources.map(\.ref.title))
+                if let household, !emergency {
+                    // Run after this turn's task ends (the defer above), so a new question is never refused.
+                    learnTask = Task(priority: .utility) { [weak self] in
+                        await self?.learn(from: question, engine: engine, household: household, turn: index)
+                        // Then (with anything just noted in the context) get the follow-up's start ready.
+                        guard !Task.isCancelled else { return }
+                        self?.prepareFollowUp(engine: engine, household: household, kit: kit)
                     }
-                    guard !Task.isCancelled else { return }
-                    if let unshown { turns[index].answer = unshown }
-                    // The model finished but wrote nothing (or only a hidden "thinking" part): say so, with Try Again.
-                    if turns[index].answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        turns[index].answer = ""
-                        fail(index, Self.emptyMessage)
-                        return
-                    }
-                    turns[index].cutShort = notes.cutShort
-                    turns[index].status = .done
-                    turns[index].finished = Date()
-                    household?.log(question: question, answer: turns[index].answer, sources: current.map(\.ref.title))
-                    if let household, !emergency {
-                        // Run after this turn's task ends (the defer above), so a new question is never refused.
-                        learnTask = Task(priority: .utility) { [weak self] in
-                            await self?.learn(from: question, engine: engine, household: household, turn: index)
-                            // Then (with anything just noted in the context) get the follow-up's start ready.
-                            guard !Task.isCancelled else { return }
-                            self?.prepareFollowUp(engine: engine, household: household, kit: kit)
-                        }
-                    } else {
-                        prepareFollowUp(engine: engine, household: household, kit: kit)
-                    }
-                    return
-                } catch where (AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error)) && attempt < 2 {
-                    guard !Task.isCancelled, self.requestID == request else { return }
-                    // Too much text for the model: drop the older conversation first, then the weakest sources.
-                    turns[index].answer = ""
-                    if attempt == 0, !history.isEmpty {
-                        history = String(history.suffix(history.count / 3))
-                    } else if current.count > 1 {
-                        history = ""
-                        budget /= 2
-                        current = Array(current.prefix(max(1, current.count / 2)))
-                        turns[index].sources = current
-                    } else if !history.isEmpty {
-                        history = ""
-                    } else {
-                        fail(index, Self.tooLongMessage)
-                        return
-                    }
-                } catch {
-                    if Task.isCancelled { break }
-                    if let unshown, turns.indices.contains(index) { turns[index].answer = unshown }
-                    if AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error) {
-                        fail(index, Self.tooLongMessage)
-                    } else {
-                        fail(index, error.localizedDescription)
-                    }
-                    return
+                } else {
+                    prepareFollowUp(engine: engine, household: household, kit: kit)
                 }
             }
-            guard !Task.isCancelled, self.requestID == request, turns.indices.contains(index) else { return }
-            if turns[index].status != .done { turns[index].status = .done; turns[index].finished = Date() }
         }
         return true
     }
 
+    /// How many characters of sources a question gets: what the model's window has left after the household context
+    /// and the conversation so far (which would only be refused and asked again with less), at least 2,000.
+    static func sourceBudget(engine: AnswerEngine, context: String, history: String) -> Int {
+        let small = engine.sourceBudget < 10_000
+        return max(2_000, small ? engine.sourceBudget - context.count - history.count
+                                : min(engine.sourceBudget, engine.promptBudget - context.count - history.count))
+    }
+
+    /// How answering a question ended.
+    enum AnswerOutcome: Equatable {
+        case answered(cutShort: Bool)
+        /// The model finished but wrote nothing (or only a hidden "thinking" part).
+        case empty
+        /// Too much text for the model even with the history and half the sources dropped.
+        case tooLong
+        case failed(String)
+        /// Cancelled, or `show` said the answer is no longer wanted.
+        case stopped
+    }
+
+    /// Answers a question from its sources with Ask's guards, for the Ask screen and Ask over Wi-Fi alike:
+    /// - The answer is shown about ten times a second (`show`, which returns false to stop), with its citations
+    ///   checked against the passages they cite (`CitationChecker`).
+    /// - When the model starts printing its instructions, the answer stops there; with little or nothing before it,
+    ///   the question is asked once more, plainly (`echoNudge`).
+    /// - Too much text for the model: the older conversation is dropped first, then the weakest half of the sources
+    ///   (`sourcesChanged` hears about it).
+    /// `keepsConversation` lets an engine that keeps the evaluated conversation reuse it (the Ask screen's
+    /// conversation); Wi-Fi questions stand alone and leave it alone.
+    static func answer(question: String, sources: [Source], engine: AnswerEngine, instructions: String, context: String,
+                       history: String, keepsConversation: Bool, show: (String) async -> Bool,
+                       sourcesChanged: ([Source]) async -> Void, trace: (String) -> Void)
+        async -> (outcome: AnswerOutcome, text: String, sources: [Source], citations: CitationChecker.Report?) {
+        var current = sources
+        var history = history
+        // Set after the model printed its instructions back instead of answering: the next try asks it plainly.
+        var echoed = false
+        var shownText = ""
+        for attempt in 0..<3 {
+            // The answer is shown about ten times a second, not on every token: each change redraws the answer.
+            var lastShown = Date.distantPast
+            var latest = ""
+            let checker = CitationChecker(sources: current)
+            do {
+                let head = promptHead(context: context, history: history)
+                let prompt = head + promptQuestion(question: question, sources: current) + (echoed ? echoNudge : "")
+                let notes = StreamNotes()
+                trace("answering: prompt \(prompt.count) chars (context \(context.count), history \(history.count))")
+                var cut: String?
+                for try await text in engine.stream(instructions: instructions, prompt: prompt, notes: notes,
+                                                    head: keepsConversation ? head : nil) {
+                    if Task.isCancelled { break }
+                    latest = text
+                    let now = Date()
+                    guard now.timeIntervalSince(lastShown) >= answerRefresh else { continue }
+                    // The model began printing its instructions: stop it there, keeping what came before.
+                    if let start = echoStart(text) {
+                        cut = String(text[..<start]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        break
+                    }
+                    shownText = checker.apply(text, final: false).text
+                    // Leaving the loop ends the engine's stream, which cancels generation.
+                    guard await show(shownText) else { return (.stopped, shownText, current, nil) }
+                    lastShown = now
+                }
+                guard !Task.isCancelled else { return (.stopped, shownText, current, nil) }
+                if cut == nil, let start = echoStart(latest) {
+                    cut = String(latest[..<start]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if let cut {
+                    trace("instructions echoed after \(cut.count) characters")
+                    // Little or nothing before it: ask once more, plainly. Otherwise the answer ends there.
+                    if cut.count < echoKeep, !echoed, attempt < 2 {
+                        echoed = true
+                        shownText = ""
+                        guard await show("") else { return (.stopped, "", current, nil) }
+                        continue
+                    }
+                    latest = cut
+                }
+                guard !latest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return (.empty, "", current, nil) }
+                let checked = checker.apply(latest, final: true)
+                trace(String(format: "citations: %d judged, %d supported, %d moved, %d dropped, %d too short to judge (%.1f ms)",
+                             checked.report.checked, checked.report.supported, checked.report.repointed, checked.report.dropped,
+                             checked.report.unchecked, checked.report.milliseconds))
+                shownText = checked.text
+                guard await show(shownText) else { return (.stopped, shownText, current, checked.report) }
+                return (.answered(cutShort: notes.cutShort), shownText, current, checked.report)
+            } catch where (AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error)) && attempt < 2 {
+                guard !Task.isCancelled else { return (.stopped, shownText, current, nil) }
+                // Too much text for the model: drop the older conversation first, then the weakest sources.
+                shownText = ""
+                guard await show("") else { return (.stopped, "", current, nil) }
+                if attempt == 0, !history.isEmpty {
+                    history = String(history.suffix(history.count / 3))
+                } else if current.count > 1 {
+                    history = ""
+                    current = Array(current.prefix(max(1, current.count / 2)))
+                    await sourcesChanged(current)
+                } else if !history.isEmpty {
+                    history = ""
+                } else {
+                    return (.tooLong, "", current, nil)
+                }
+            } catch {
+                if Task.isCancelled { return (.stopped, shownText, current, nil) }
+                if !latest.isEmpty { shownText = checker.apply(latest, final: true).text; _ = await show(shownText) }
+                if AppleEngine.isContextOverflow(error) || LlamaError.isContextOverflow(error) { return (.tooLong, shownText, current, nil) }
+                return (.failed(error.localizedDescription), shownText, current, nil)
+            }
+        }
+        return (.answered(cutShort: false), shownText, current, nil)
+    }
+
+    /// What the searches for a question found.
+    struct SourceSearch {
+        var sources: [Source]
+        /// The corrected or reworded search used instead of the question, when the question's own search missed.
+        var searchedFor: String?
+        /// The question's own search: for a follow-up, with the conversation's topic words.
+        var query: SearchQuery
+    }
+
+    /// Finds a question's sources: the medical references first for a health question, then the whole library, then
+    /// (when those miss) the spell-checked question and a model-written keyword search. A follow-up ("is that different
+    /// at high altitude?") is searched with the conversation's topic words added (`searchQuery`). `previous` holds the
+    /// conversation's answered turns, oldest first. Nil when cancelled or no longer current.
+    static func findSources(question: String, scope: SubjectTopic?, previous: [Turn], library: Library, engine: AnswerEngine,
+                            budget: Int, emergency: Bool, isCurrent: () -> Bool) async -> SourceSearch? {
+        var query = searchQuery(for: question, after: previous.last)
+        // What the model's keyword search reads for a follow-up: the question before it, then this one.
+        let searchText = query.isFollowUp ? (previous.last?.question ?? "") + " " + question : question
+        if let scope {
+            if query.isFollowUp {
+                query.text = "\(scope.title): " + query.text
+                query.terms = Retriever.terms(scope.title).filter { !query.terms.contains($0) } + query.terms
+            } else {
+                query = SearchQuery("\(scope.title): \(question)")
+            }
+        }
+        let aboutKit = Self.isAboutKit(question)
+        /// Sources clearly about the question. A follow-up's: about its own words and its topic together.
+        func strength(_ sources: [Source]) -> Int {
+            query.isFollowUp ? Self.followUpStrength(sources, query: query) : Retriever.strength(sources, question: question)
+        }
+        // Movies, comics and sports encyclopedias match everyday words ("Water & Power", "The App") and crowd
+        // out real answers; leave them out unless the question is about entertainment.
+        let wantsEntertainment = Self.matches(#"\b(movie|film|actor|actress|comic|superhero|sport|team|player|league|game|football|soccer|baseball|basketball|hockey|tennis|golf)s?\b"#, question)
+        let allArchives = library.books
+            .filter { book in scope.map { $0.area.contains(archiveName: book.archive.name) } ?? true }
+            .filter { wantsEntertainment || !Self.isEntertainment($0.archive.name) }
+            .map(\.archive)
+        // Health questions search the medical references first (MedlinePlus, WikiMed, MDWiki, the medical PDFs);
+        // so does a follow-up to one ("what about kids?" after a fever).
+        let health = Self.isHealthQuestion(question) || (query.isFollowUp && Self.isHealthQuestion(query.text))
+        let medical = health ? allArchives.filter { Self.isMedical($0.name) } : []
+        // A health question's everyday words are searched with what references call them ("burn": "scald").
+        if health { query.relate(Retriever.related(to: question)) }
+        let archives = allArchives
+        // A follow-up may need the model's keyword search below (its words lean on the question before): start
+        // writing it now, on the model, while the library is searched. Cancelled if it isn't needed.
+        let earlyKeywords: Task<String?, Never>? = !aboutKit && !emergency && query.isFollowUp
+            ? Task { await Self.searchWords(for: searchText, engine: engine) } : nil
+        defer { earlyKeywords?.cancel() }
+        // Questions about the kit itself are answered from the kit description; a keyword search only adds noise.
+        var sources: [Source] = []
+        var searchedFor: String?
+        // The medical search found articles named for the question's condition: no wider search.
+        var medicalNamed = false
+        // What the searches for this exact question found, per archive: a later pass reuses it.
+        var searched: [String: Retriever.Gathered] = [:]
+        #if DEBUG
+        let traceStart = Date()
+        func trace(_ what: String) { AskTrace.log(String(format: "%6.0f ms  ", Date().timeIntervalSince(traceStart) * 1000) + what) }
+        trace("searching")
+        #else
+        func trace(_ what: @autoclosure () -> String) {}
+        #endif
+        if query.isFollowUp { trace("follow-up search: \(query.terms), carried \(query.carried.sorted())") }
+        if !aboutKit, !medical.isEmpty {
+            let result = await Retriever.retrieveConcurrently(query: query, archives: medical, budgetChars: budget)
+            sources = result.sources
+            searched = result.gathered
+            // The medical references named the condition ("Burn" for a burn from boiling water): their answer stands,
+            // even when the rest of the question ("boiling water") isn't in their titles.
+            let named = query.isFollowUp ? 0 : Self.conditionStrength(sources, question: question, query: query)
+            trace("medical search: \(sources.count) sources, strength \(strength(sources)), condition named by \(named)")
+            if named > 0, strength(sources) == 0 { medicalNamed = true }
+        }
+        if !aboutKit, !medicalNamed, strength(sources) == 0 {
+            let result = await Retriever.retrieveConcurrently(query: query, archives: archives,
+                                                              budgetChars: budget, reusing: searched)
+            sources = result.sources
+            searched = result.gathered
+            trace("search: \(sources.count) sources, strength \(strength(sources))")
+        }
+        if Task.isCancelled { return nil }
+        // The search missed (a misspelling like "carpel tunel", or everyday words the articles don't use):
+        // try the spell-checked question, then a model-written keyword search, and keep whichever finds more.
+        if !aboutKit, !medicalNamed, strength(sources) == 0 {
+            var alternatives: [String] = []
+            if let fixed = Retriever.spellCorrected(searchText) { alternatives.append(fixed) }
+            trace("spelling checked")
+            let keywords: String?
+            if let earlyKeywords { keywords = await earlyKeywords.valueStoppingWithCaller } else if !emergency { keywords = await Self.searchWords(for: searchText, engine: engine) } else { keywords = nil }
+            if let keywords { alternatives.append(keywords) }
+            trace("search words: \(alternatives)")
+            var best = 0
+            for alternative in alternatives where !Task.isCancelled {
+                let query = scope.map { "\($0.title): \(alternative)" } ?? alternative
+                let found = await Retriever.retrieveConcurrently(question: query, archives: archives, budgetChars: budget).sources
+                let strength = Retriever.strength(found, question: alternative)
+                if strength > best {
+                    best = strength
+                    sources = found
+                    searchedFor = alternative
+                }
+            }
+            if Task.isCancelled { return nil }
+            trace("alternative searches done")
+        }
+        // Not needed after all: stop it now, so the answer doesn't wait for it.
+        earlyKeywords?.cancel()
+        // Still nothing, but PDF and reference packs are being read for the first time: give them a moment
+        // rather than answering "not in the library" about books that are about to be searchable.
+        if !aboutKit, !medicalNamed, strength(sources) == 0, PDFIndex.shared.isBuilding {
+            var waited = 0
+            while PDFIndex.shared.isBuilding, waited < 80 {
+                try? await Task.sleep(for: .milliseconds(250))
+                guard !Task.isCancelled, isCurrent() else { return nil }
+                waited += 1
+            }
+            // Same question as the first search: only the PDF pages and guide are new, so reuse the archive searches.
+            let found = await Retriever.retrieveConcurrently(query: query, archives: archives,
+                                                             budgetChars: budget, reusing: searched).sources
+            if Task.isCancelled { return nil }
+            if strength(found) > 0 { sources = found }
+        }
+        return SourceSearch(sources: sources, searchedFor: searchedFor, query: query)
+    }
+
+    /// An answer that echoes the instructions with fewer characters than this before the echo is asked again.
+    nonisolated static let echoKeep = 120
+
+    /// Added after the question when the first try printed the instructions back.
+    nonisolated static let echoNudge = "\nWrite only the answer, in your own words, starting with what to do."
+
     /// Seconds between redraws of a streaming answer.
-    private static let answerRefresh: TimeInterval = 0.1
+    static let answerRefresh: TimeInterval = 0.1
 
-    private static let emptyMessage = "Ask didn’t come up with an answer this time. Try again, or ask it in different words."
+    static let emptyMessage = "Ask didn’t come up with an answer this time. Try again, or ask it in different words."
 
-    private static let tooLongMessage = "That conversation got too long for the answer model. Start a new conversation and ask again."
+    static let tooLongMessage = "That conversation got too long for the answer model. Start a new conversation and ask again."
 
     private func fail(_ index: Int, _ message: String) {
         turns[index].status = .failed
@@ -622,7 +808,7 @@ final class AskModel {
         return text + "Sources:\n\(body)"
     }
 
-    private static func matches(_ pattern: String, _ text: String) -> Bool {
+    private nonisolated static func matches(_ pattern: String, _ text: String) -> Bool {
         text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil
     }
 
@@ -640,8 +826,46 @@ final class AskModel {
     }
 
     /// Symptoms, injuries, illness, medicine.
-    static func isHealthQuestion(_ question: String) -> Bool {
-        matches(#"\b(fever|pain|ache|hurts?|bleed\w*|burn(ed|s)?|cut|wound|rash|cough\w*|vomit\w*|diarrh\w*|nause\w*|sick|ill|illness|infect\w*|medicine|medication|dose|dosage|tylenol|ibuprofen|acetaminophen|sprain\w*|broken|fracture|bite|sting|allerg\w*|symptom\w*|swollen|swelling|dizzy|faint\w*|headache|migraine|diabet\w*|asthma|pregnan\w*|baby|infant|choking|cpr|poison\w*|stroke|seizure|heart|blood|wrist|ankle|knee|tunnel|syndrome|disease|virus|flu|cold|covid|dehydrat\w*|heat ?stroke|hypotherm\w*|frostbite)\b"#, question)
+    nonisolated static func isHealthQuestion(_ question: String) -> Bool {
+        Retriever.hasLayHealthTerm(question) || matches(#"\b(fever|pain|ache|hurts?|bleed\w*|burn(ed|s)?|wound|rash|cough\w*|vomit\w*|diarrh\w*|nause\w*|sick|ill|illness|infect\w*|medicine|medication|dose|dosage|tylenol|ibuprofen|acetaminophen|sprain\w*|broken|fracture|bite|sting|allerg\w*|symptom\w*|swollen|swelling|dizzy|faint\w*|headache|migraine|diabet\w*|asthma|pregnan\w*|baby|infant|choking|cpr|poison\w*|stroke|seizure|heart|blood|wrist|ankle|knee|tunnel|syndrome|disease|virus|flu|cold|covid|dehydrat\w*|heat ?stroke|hypotherm\w*|frostbite)\b"#, question)
+    }
+
+    /// Words of the health pattern that name a body part, a person or illness in general, not a condition: a title with
+    /// one of them ("Baby", "Heart") isn't about the question's condition.
+    nonisolated static let notConditions: Set<String> = [
+        "baby", "infant", "heart", "blood", "wrist", "ankle", "knee", "tunnel", "syndrome", "disease", "symptom",
+        "symptoms", "sick", "ill", "illness", "cold", "pain", "ache", "hurt", "hurts", "medicine", "medication",
+        "dose", "dosage", "virus",
+    ]
+
+    /// The condition words of a health question, cut to their stems ("burned": "burn", "choking": "chok"): its words
+    /// that the health pattern names, less body parts and general words.
+    nonisolated static func conditionStems(_ question: String) -> [String] {
+        Retriever.terms(question).filter { !notConditions.contains($0) && isHealthQuestion($0) }.map(conditionStem)
+    }
+
+    /// A word without a plural or tense ending: "burns", "burned", "bleeding", "stings" to "burn", "bleed", "sting".
+    nonisolated static func conditionStem(_ word: String) -> String {
+        for suffix in ["ing", "ed", "es", "s"] where word.count > suffix.count + 2 && word.hasSuffix(suffix) {
+            return String(word.dropLast(suffix.count))
+        }
+        return word
+    }
+
+    /// How many sources are about a health question's condition: the title has a word that starts with one of its
+    /// condition words or what references call it ("Burn", "Thermal burn", "Scalding" for a burn; "Epistaxis" for a
+    /// nosebleed; not "Cutaneous" for a cut), and the source covers at least half of the question's words.
+    nonisolated static func conditionStrength(_ sources: [Source], question: String, query: SearchQuery) -> Int {
+        let stems = conditionStems(question) + query.related.filter { !$0.contains(" ") }.map(conditionStem)
+        guard !stems.isEmpty else { return 0 }
+        return sources.filter { source in
+            let title = source.ref.title.lowercased()
+            let words = title.split(whereSeparator: { !$0.isLetter }).map(String.init)
+            guard words.contains(where: { w in stems.contains { w.hasPrefix($0) && w.count <= $0.count + 4 } }) else { return false }
+            let (_, coverage) = Retriever.plainRelevance(title: title, text: source.text.lowercased(), xapian: 0, terms: query.terms,
+                                                         phrases: [], lighter: query.lighter, related: query.related)
+            return coverage >= 0.5
+        }.count
     }
 
     /// "What has been downloaded?", "What do you know?": about the kit, not a topic to look up.
@@ -657,10 +881,86 @@ final class AskModel {
     }
 
     /// Short questions that lean on the one before ("would we notice it first?").
-    static func isFollowUp(_ question: String) -> Bool {
+    nonisolated static func isFollowUp(_ question: String) -> Bool {
         question.split(separator: " ").count <= 12
-            && (matches(#"\b(it|that|they|them|those|these|instead|else|continue)\b"#, question)
+            && (matches(#"\b(it|that|they|them|those|these|this|their|its|he|she|him|her|someone|somebody|instead|else|continue|afterwards?)\b"#, question)
                 || matches(#"^(and|but|so|or|what about|how about)\b"#, question))
+    }
+
+    /// A follow-up that leans on the turn before without a pronoun: short, about "the" something ("why are the
+    /// leaves turning yellow?").
+    nonisolated static func isDefiniteFollowUp(_ question: String) -> Bool {
+        question.split(separator: " ").count <= 7 && matches(#"\bthe\b"#, question)
+            && Retriever.terms(question).filter { !followUpFiller.contains($0) }.count <= 3
+    }
+
+    /// Words that say nothing about a follow-up's topic ("is that *different*", "what if it *still* drips") and
+    /// leftovers of contractions ("won't", "they're").
+    nonisolated static let followUpFiller: Set<String> = [
+        "different", "difference", "differently", "still", "again", "afterward", "afterwards", "after", "instead",
+        "else", "also", "too", "same", "then", "really", "okay", "ok", "thing", "things", "one", "ones", "someone",
+        "somebody", "something", "anything", "kind", "sort", "happens", "happen", "work", "works", "put", "let",
+        "myself", "yourself", "ourselves", "themselves", "him", "her", "his", "hers", "he", "she", "won", "don",
+        "doesn", "isn", "aren", "didn", "wouldn", "shouldn", "couldn", "re", "ll", "ve", "bring", "think", "go",
+        "long", "often", "soon", "up", "down", "out", "off",
+    ]
+
+    /// Most topic words a follow-up carries.
+    nonisolated static let carriedLimit = 4
+
+    /// The search for a question. A follow-up ("is that different at high altitude?" after "how long should I boil
+    /// water?") keeps its own words and adds up to four of the topic's from the turn before, which count half as much:
+    /// that turn's nouns, then the nouns it carried, then its other words (words its sources' titles name first in
+    /// each group; words after "without" or "no" never). The turn's sources are preferred.
+    nonisolated static func searchQuery(for question: String, after previous: Turn?) -> SearchQuery {
+        var query = SearchQuery(question)
+        guard let previous, isFollowUp(question) || isDefiniteFollowUp(question) else { return query }
+        let earlier = previous.query ?? SearchQuery(previous.question)
+        let own = query.terms.filter { !followUpFiller.contains($0) }
+        let titles = previous.sources.map { $0.ref.title.lowercased() }.joined(separator: " ")
+        let nouns = Retriever.nouns(in: previous.question).union(earlier.nouns)
+        let negated = Retriever.negated(in: previous.question)
+        let earlierOwn = earlier.terms.filter { !earlier.carried.contains($0) }
+        let earlierCarried = earlier.terms.filter { earlier.carried.contains($0) }
+        var seen = Set(own)
+        let candidates = (earlierOwn.filter(nouns.contains) + earlierCarried.filter(nouns.contains)
+                          + earlierOwn.filter { !nouns.contains($0) } + earlierCarried.filter { !nouns.contains($0) })
+            .filter { !followUpFiller.contains($0) && !negated.contains($0) && seen.insert($0).inserted }
+        // Within nouns and other words, those the sources' titles name come first.
+        func named(_ term: String) -> Bool { titles.contains(String(term.prefix(5))) }
+        let ranked = candidates.enumerated().sorted { a, b in
+            let (na, nb) = (nouns.contains(a.element), nouns.contains(b.element))
+            if na != nb { return na }
+            let (ta, tb) = (named(a.element), named(b.element))
+            return ta != tb ? ta : a.offset < b.offset
+        }.map(\.element)
+        let carried = Array(ranked.prefix(carriedLimit))
+        guard !carried.isEmpty else { return query }
+        query.terms = (own.isEmpty ? query.terms : own) + carried
+        let ownPhrases = own.isEmpty ? query.phrases : query.phrases.filter { $0.split(separator: " ").allSatisfy { own.contains(String($0)) } }
+        query.phrases = ownPhrases + earlier.phrases.filter { $0.split(separator: " ").allSatisfy { carried.contains(String($0)) } }
+        query.carried = Set(carried)
+        query.nouns = query.carried.intersection(nouns)
+        query.text = question + " " + carried.joined(separator: " ")
+        if !own.isEmpty {
+            var combinations = [own + [carried[0]]]
+            if carried.count > 1 { combinations.append(own + [carried[1]]) }
+            if own.count > 1, let specific = own.max(by: { $0.count < $1.count }) { combinations.append([specific, carried[0]]) }
+            query.combinations = combinations
+        }
+        query.preferred = Set(previous.sources.map(\.ref.id))
+        return query
+    }
+
+    /// How many sources are about a follow-up and its topic together: their title or text has one of the question's
+    /// own words and one of the carried ones.
+    nonisolated static func followUpStrength(_ sources: [Source], query: SearchQuery) -> Int {
+        let own = query.terms.filter { !query.carried.contains($0) }.map { String($0.prefix(5)) }
+        let topic = query.carried.map { String($0.prefix(5)) }
+        return sources.filter { source in
+            let text = (source.ref.title + " " + source.text).lowercased()
+            return (own.isEmpty || own.contains { text.contains($0) }) && topic.contains { text.contains($0) }
+        }.count
     }
 
     private static let searchWordsInstructions = """
@@ -693,13 +993,13 @@ final class AskModel {
         }
         let limit = min(10_000, max(1_000, (engine.promptBudget - context.count) / 2)), most = 6
         var kept = ArraySlice(done)
-        if let start = historyStart, let i = kept.firstIndex(where: { $0.id == start }) { kept = kept[i...] }
+        if let start = historyStarts[engine.technicalName], let i = kept.firstIndex(where: { $0.id == start }) { kept = kept[i...] }
         if kept.count > most || Self.historyText(kept, perAnswer: 1_500).count > limit {
             while kept.count > 1, kept.count > most * 2 / 3 || Self.historyText(kept, perAnswer: 1_500).count > limit * 2 / 3 {
                 kept = kept.dropFirst()
             }
         }
-        historyStart = kept.first?.id
+        historyStarts[engine.technicalName] = kept.first?.id
         return String(Self.historyText(kept, perAnswer: 1_500).suffix(limit))
     }
 
@@ -782,7 +1082,60 @@ final class AskModel {
     }
 }
 
+extension Task where Failure == Never {
+    /// The task's result, cancelling the task when the caller is cancelled while it waits. `value` alone doesn't pass
+    /// cancellation on: Stop pressed while a question waited for its early keyword search left the model writing them.
+    var valueStoppingWithCaller: Success {
+        get async { await withTaskCancellationHandler { await value } onCancel: { cancel() } }
+    }
+}
+
 #if DEBUG
+/// A scripted answer engine for checking Ask's guards end to end, on the Mac and over Wi-Fi (OFFLINEKIT_TEST_ENGINE=echo,
+/// test home only). Its first answer prints Ask's instructions back. Asked again plainly, it answers with the first
+/// sentence of source 1 cited as [2] (the check moves it to [1]) and a sentence no source supports cited as [1] (the
+/// check drops it).
+struct EchoTestEngine: AnswerEngine {
+    var displayName: String { "Echo test engine" }
+    var runsOnDevice: Bool { true }
+    var sourceBudget: Int { 14_000 }
+
+    func stream(instructions: String, prompt: String) -> AsyncThrowingStream<String, Error> {
+        let reply: String
+        if prompt.hasPrefix("Question:") || prompt.contains("\n\nQuestion:"), !prompt.hasSuffix(AskModel.echoNudge) {
+            reply = String(instructions.prefix(400))
+        } else if prompt.hasSuffix(AskModel.echoNudge) {
+            let first = Self.firstSentence(ofSource: 1, in: prompt) ?? "Cool the burn under cool running water for twenty minutes."
+            reply = first.trimmingCharacters(in: CharacterSet(charactersIn: ". ")) + " [2].\nSing a quiet song to the moon every evening tonight [1]."
+        } else {
+            reply = "first aid"   // the keyword search
+        }
+        return AsyncThrowingStream { continuation in
+            Task {
+                var text = ""
+                for word in reply.split(separator: " ", omittingEmptySubsequences: false) {
+                    text += (text.isEmpty ? "" : " ") + word
+                    continuation.yield(text)
+                    try? await Task.sleep(for: .milliseconds(15))
+                }
+                continuation.finish()
+            }
+        }
+    }
+
+    /// The first sentence of source n's passage in a prompt ("[n] Title (Book)\npassage").
+    static func firstSentence(ofSource n: Int, in prompt: String) -> String? {
+        guard let marker = prompt.range(of: "\n[\(n)] "), let lineEnd = prompt[marker.upperBound...].firstIndex(of: "\n") else { return nil }
+        let body = prompt[prompt.index(after: lineEnd)...]
+        let paragraph = body.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
+        var first: String?
+        paragraph.enumerateSubstrings(in: paragraph.startIndex..., options: .bySentences) { sub, _, _, stop in
+            first = sub; stop = true
+        }
+        return first
+    }
+}
+
 /// Where a question's time goes, on standard error (OFFLINEKIT_TRACE=1).
 enum AskTrace {
     static let enabled = ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil

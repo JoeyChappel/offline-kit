@@ -87,7 +87,12 @@ enum IndexBench {
 
 /// Checks the byte scanner against the regular expressions it replaced, article by article, and times both.
 /// usage: okit --html-check <file.zim> [--limit N entries] [--articles N]
+///   OFFLINEKIT_HTML_LIST=1 lists every article that differs (to compare two builds); OFFLINEKIT_HTML_ONLY=<path>
+///   checks that one article.
 enum HTMLCheck {
+    static let listsDifferences = ProcessInfo.processInfo.environment["OFFLINEKIT_HTML_LIST"] != nil
+    static let onlyPath = ProcessInfo.processInfo.environment["OFFLINEKIT_HTML_ONLY"]
+
     static func run(zim: String, limit: Int?, articles wanted: Int = .max) {
         guard let archive = try? ZimArchive(path: zim) else { print("can't open \(zim)"); return }
         let total = min(Int(archive.entryCount), limit ?? Int.max)
@@ -97,6 +102,7 @@ enum HTMLCheck {
         while cursor < total, articles < wanted {
             autoreleasepool {
                 for article in archive.articles(from: UInt(cursor), count: UInt(min(200, total - cursor)), maxBytes: UInt(AnswerIndexPolicy.maxHTMLBytes(.full))) {
+                    if let only = onlyPath, article.path != only { continue }
                     articles += 1
                     bytes += article.html.count
                     for (k, leads) in [false, true].enumerated() {
@@ -115,6 +121,7 @@ enum HTMLCheck {
                             same[k] += 1
                         } else {
                             different[k] += 1
+                            if listsDifferences { print("different (\(leads ? "lead" : "full")) \(article.path)") }
                             if shown < 4 {
                                 shown += 1
                                 print("DIFFERENT (\(leads ? "lead" : "full")) \(article.path): \(old.count) vs \(new.count) paragraphs")

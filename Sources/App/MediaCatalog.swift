@@ -39,6 +39,9 @@ struct MediaInfo: Codable, Hashable, Sendable {
     var source: String? = nil
     /// An EPUB's own title, kept so a rescan doesn't have to open every book just to name it ("" when it has none).
     var bookTitle: String? = nil
+    /// Generated art in `thumb` (GeneratedArt raw value), or "none" when the background pass looked and made nothing.
+    /// Nil until it has looked. Stays with the entry, so each file is done once.
+    var art: String? = nil
 }
 
 /// Reads and caches MediaInfo. Thumbnails are a still from about a tenth of the way in, so they aren't black.
@@ -134,6 +137,28 @@ final class MediaInfoStore: @unchecked Sendable {
         save()
     }
 
+    /// Puts generated art (see AutoArtwork) into the cached details. A video's automatic frame it replaces is deleted.
+    func recordArtwork(_ item: MediaItem, thumb: String?, art: GeneratedArt) {
+        loadIfNeeded()
+        let key = Self.cacheKey(item)
+        let replaced: String? = lock.withLock {
+            guard var value = cache[key] else { return nil }
+            let old = value.thumb
+            if let thumb { value.thumb = ArtworkRules.thumb(kind: item.kind, current: old, currentArt: value.art, still: nil, generated: thumb) }
+            value.art = art.rawValue
+            cache[key] = value
+            return old != value.thumb ? old : nil
+        }
+        let thumbs = Self.folder.appending(path: "thumbs", directoryHint: .isDirectory).path + "/"
+        if item.kind == .video, let replaced, replaced.hasPrefix(thumbs), !replaced.contains("/gen-") {
+            let inUse = lock.withLock { cache.values.contains { $0.thumb == replaced } }
+            if !inUse { try? FileManager.default.removeItem(atPath: replaced) }
+        }
+    }
+
+    /// Writes the cache now (after a batch of generated art).
+    func saveNow() { save() }
+
     /// Forgets details (and their pictures) for files that are gone. Entries for drives that are just unplugged stay.
     /// `complete` is true when every Media folder was there to scan, which makes entries from before sources were kept safe to drop.
     func prune(keeping keys: Set<String>, complete: Bool) {
@@ -153,9 +178,22 @@ final class MediaInfoStore: @unchecked Sendable {
         lock.withLock { for (key, _) in doomed { cache[key] = nil } }
         let keep = lock.withLock { Set(cache.values.compactMap(\.thumb)) }
         for (_, thumb) in doomed {
-            if let thumb, thumb.hasPrefix(thumbs), !keep.contains(thumb) { try? fm.removeItem(atPath: thumb) }
+            if let thumb, thumb.hasPrefix(thumbs), !keep.contains(thumb) {
+                try? fm.removeItem(atPath: thumb)
+                // Generated movie art keeps its ranked frames beside it ("gen-<key>.json", see MovieArtwork).
+                if let base = Self.generatedBase(thumb) { try? fm.removeItem(atPath: base + ".json") }
+            }
         }
         save()
+    }
+
+    /// "…/gen-ab12" for "…/gen-ab12.jpg" or a picked frame "…/gen-ab12-p3.jpg"; nil for other thumbnails.
+    static func generatedBase(_ path: String) -> String? {
+        let name = (path as NSString).lastPathComponent
+        guard name.hasPrefix("gen-") else { return nil }
+        var base = (path as NSString).deletingPathExtension
+        if let range = base.range(of: #"-p\d+$"#, options: .regularExpression) { base.removeSubrange(range) }
+        return base
     }
 
     private func loadIfNeeded() {

@@ -811,7 +811,28 @@ struct FindMediaSheet: View {
         .sheet(isPresented: $confirmingMove) { moveConfirmation }
     }
 
-    private var header: some View {
+    @ViewBuilder private var header: some View {
+        if finder.phase == .choosing {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: "sparkle.magnifyingglass").font(.title).foregroundStyle(.tint)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Find my media").font(.title.bold())
+                        Text("Choose where to look. Review what’s found before adding it.").font(.callout).foregroundStyle(.secondary)
+                    }
+                }
+                HStack(spacing: 12) {
+                    Label("Choose locations", systemImage: "1.circle.fill").foregroundStyle(.tint)
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                    Label("Review media", systemImage: "2.circle").foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary)
+                    Label("Add to kit", systemImage: "3.circle").foregroundStyle(.secondary)
+                }.font(.caption.weight(.semibold))
+            }
+        } else { standardHeader }
+    }
+
+    private var standardHeader: some View {
         HStack(alignment: .top, spacing: 14) {
             Image(systemName: "sparkle.magnifyingglass").font(.largeTitle).foregroundStyle(Color.accentColor)
             VStack(alignment: .leading, spacing: 4) {
@@ -824,37 +845,59 @@ struct FindMediaSheet: View {
 
     // MARK: Choosing where to look
 
+    private var selectedLocationCount: Int { finder.locations.filter { finder.chosen.contains($0.id) }.count }
+
     private var chooser: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("Where should I look?").font(.headline)
-                if finder.locations.contains(where: { $0.asksPermission && finder.chosen.contains($0.id) }) {
-                    Label {
-                        Text("The first time Offline Kit looks in Desktop, Documents, Downloads or a drive, macOS asks whether to allow it. Choose Allow so it can look. Offline Kit only reads what’s there, and nothing is moved unless you choose Move and confirm. You can change this later in System Settings › Privacy & Security › Files and Folders.")
-                            .fixedSize(horizontal: false, vertical: true)
-                    } icon: { Image(systemName: "lock.shield").foregroundStyle(Color.accentColor) }
-                    .font(.callout)
-                    .padding(12)
-                    .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 18) {
+                    locationChoices.frame(minWidth: 340, maxWidth: .infinity)
+                    searchInformation.frame(minWidth: 240, maxWidth: 300)
                 }
-                ForEach(finder.locations) { location in
-                    Toggle(isOn: Binding(get: { finder.chosen.contains(location.id) },
-                                         set: { if $0 { finder.chosen.insert(location.id) } else { finder.chosen.remove(location.id) } })) {
-                        Label {
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text(location.name)
-                                Text(location.url.path.replacingOccurrences(of: KitLocation.home.path, with: "~")
-                                     + (location.asksPermission ? " · macOS asks first" : "")).font(.caption).foregroundStyle(.secondary)
-                            }
-                        } icon: { Image(systemName: location.symbol).foregroundStyle(Color.accentColor) }
-                    }
-                    .toggleStyle(.checkbox)
-                }
-                Button("Choose a Folder…", systemImage: "folder.badge.plus") { chooseFolder() }
-                Text("Skipped automatically: apps, your Library folder, system folders, the Photos library, the Trash, the kit’s own folders, and iCloud files that aren’t downloaded to this Mac. Songs streamed from Apple Music aren’t files, so they can’t be found.")
-                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 18) { locationChoices; searchInformation }
+            }.padding(24)
+        }
+    }
+
+    private var locationChoices: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Folders and drives").font(.headline)
+            if finder.locations.isEmpty {
+                Text("Choose a folder to look in.").font(.callout).foregroundStyle(.secondary)
             }
-            .padding(24)
+            ForEach(finder.locations) { location in
+                Toggle(isOn: Binding(get: { finder.chosen.contains(location.id) },
+                                     set: { if $0 { finder.chosen.insert(location.id) } else { finder.chosen.remove(location.id) } })) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(location.name).font(.callout.weight(.semibold))
+                            Text(location.url.path.replacingOccurrences(of: KitLocation.home.path, with: "~")
+                                 + (location.asksPermission ? " · macOS asks first" : "")).font(.caption).foregroundStyle(.secondary)
+                        }
+                    } icon: { Image(systemName: location.symbol).foregroundStyle(Color.accentColor) }
+                }.toggleStyle(.checkbox)
+            }
+            Button("Choose a Folder…", systemImage: "folder.badge.plus") { chooseFolder() }.buttonStyle(.bordered)
+        }.card(padding: 18)
+    }
+
+    private var searchInformation: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                Label("Looking only", systemImage: "eye").font(.headline)
+                Text("Searching reads files. Nothing is added or moved at this step.").font(.callout).foregroundStyle(.secondary)
+                if finder.locations.contains(where: { $0.asksPermission && finder.chosen.contains($0.id) }) {
+                    Label("macOS may ask to allow access to selected folders or drives.", systemImage: "lock.shield")
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                DisclosureGroup("Permission details") {
+                    Text("The first time Offline Kit looks in Desktop, Documents, Downloads or a drive, macOS asks whether to allow it. Choose Allow so it can look. Offline Kit only reads what’s there, and nothing is moved unless you choose Move and confirm. You can change this later in System Settings › Privacy & Security › Files and Folders.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).padding(.top, 6)
+                }
+            }.card(padding: 18)
+            VStack(alignment: .leading, spacing: 10) {
+                Label("What won’t be found", systemImage: "info.circle").font(.headline)
+                Text("Skipped automatically: apps, your Library folder, system folders, the Photos library, the Trash, the kit’s own folders, and iCloud files that aren’t downloaded to this Mac. Songs streamed from Apple Music aren’t files, so they can’t be found.").font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }.card(padding: 18)
         }
     }
 
@@ -1042,6 +1085,7 @@ struct FindMediaSheet: View {
         switch finder.phase {
         case .choosing:
             HStack {
+                Text("\(selectedLocationCount) \(selectedLocationCount == 1 ? "location" : "locations") selected").font(.callout).foregroundStyle(.secondary).monospacedDigit()
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }
                 Button("Look for Media") { finder.scan(library: library, media: media, games: games) }

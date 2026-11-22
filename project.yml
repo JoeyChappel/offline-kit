@@ -12,8 +12,8 @@ settings:
     SWIFT_VERSION: "5.0"
     CLANG_CXX_LANGUAGE_STANDARD: gnu++20
     SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridge/Bridging.h
-    MARKETING_VERSION: "0.3.2"
-    CURRENT_PROJECT_VERSION: "14"
+    MARKETING_VERSION: "0.3.3"
+    CURRENT_PROJECT_VERSION: "15"
     GENERATE_INFOPLIST_FILE: YES
     INFOPLIST_KEY_CFBundleDisplayName: Offline Kit
     OTHER_LDFLAGS: ["-lc++"]
@@ -173,7 +173,7 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         INFOPLIST_KEY_UIFileSharingEnabled: YES
         INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace: YES
-        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Connects to Ollama on your Mac over home Wi-Fi when available.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: Finds your Mac on home Wi-Fi to bring items over, and connects to Ollama on your Mac when available.
         INFOPLIST_KEY_NSCameraUsageDescription: Scans barcodes on your supplies so you don't have to type them. Nothing from the camera is saved or sent.
     info:
       path: Sources/iOS/Info.plist

@@ -586,8 +586,7 @@ struct GetResourcesView: View {
         SaveLocation.refreshFreeSpace()
         locations = SaveLocation.available()
         if destination == nil || !locations.contains(where: { $0 == destination }) { destination = SaveLocation.preferred(locations) }
-        let cache = (KitLocation.portableRoot ?? URL.cachesDirectory.appending(path: "OfflineKit"))
-            .appending(path: ".kiwix-catalog.xml")
+        let cache = KitRefresh.catalogCache
         do {
             catalog = try await Catalog.load(cache: cache)
             if !navigation.resourcesPreselected && library.books.isEmpty {

@@ -454,7 +454,12 @@ static NSError *CoreError(NSString *message) {
 
 #pragma mark Input
 
+/// libretro joypads have 16 buttons. RetroButton is an open NS_ENUM, so Swift's RetroButton(rawValue:) accepts any number
+/// (the browser player sends a byte), and shifting by 32 or more is undefined (on arm64 it wraps and presses another button).
+static inline BOOL IsJoypadButton(RetroButton button) { return button >= 0 && button < 16; }
+
 - (void)setButton:(RetroButton)button pressed:(BOOL)pressed {
+    if (!IsJoypadButton(button)) return;
     unsigned bit = 1u << (unsigned)button;
     if (pressed) atomic_fetch_or(&_buttons, bit);
     else atomic_fetch_and(&_buttons, ~bit);
@@ -462,7 +467,7 @@ static NSError *CoreError(NSString *message) {
 
 - (void)setButton:(RetroButton)button pressed:(BOOL)pressed port:(unsigned)port {
     if (port == 0) { [self setButton:button pressed:pressed]; return; }
-    if (port != 1) return;
+    if (port != 1 || !IsJoypadButton(button)) return;
     unsigned bit = 1u << (unsigned)button;
     if (pressed) atomic_fetch_or(&_buttons2, bit);
     else atomic_fetch_and(&_buttons2, ~bit);
@@ -508,6 +513,7 @@ static NSError *CoreError(NSString *message) {
 }
 
 - (void)setMouseButton:(RetroMouseButton)button pressed:(BOOL)pressed {
+    if (button < RetroMouseButtonLeft || button > RetroMouseButtonMiddle) return;   // open enum, as for joypad buttons
     unsigned bit = 1u << (unsigned)button;
     if (pressed) atomic_fetch_or(&_mouseButtons, bit);
     else atomic_fetch_and(&_mouseButtons, ~bit);

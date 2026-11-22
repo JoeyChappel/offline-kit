@@ -1,0 +1,66 @@
+# First-question benchmark (okit --ask-bench, okit --topic-check): 28 single questions, each its own conversation.
+# Health and first aid, repair, food safety, outdoors, household and power outages: what a family asks first.
+# Same format as ask-conversations.txt: after "=>", what an on-topic source is about (groups separated by ";",
+# word starts separated by "|"; every group needs a match). okit --topic-check lists, per question, the articles
+# in the library whose titles are on topic, so a miss can be told apart from a gap in the library.
+#
+# Health and first aid
+What should I do for a burn from boiling water? => burn|scald
+---
+How do I stop a nosebleed? => nosebleed|epistaxis|nose bleed
+---
+How do I treat a deep cut on my hand? => wound|cut|lacerat|bleed
+---
+What should I do if someone is choking? => chok|heimlich|airway obstruct
+---
+What are the signs of a heart attack? => heart attack|myocardial infarct|acute coronary
+---
+How do I treat heat exhaustion? => heat exhaust|heat stroke|heat illness|hypertherm
+---
+My son can't breathe and is wheezing. What do I do? => asthma|wheez|bronch|breath|airway
+---
+How do I treat a dog bite? => bite; dog|animal|rabies
+---
+How can I tell if an ankle is broken or sprained? => ankle|sprain|fractur
+---
+What should I do if someone faints? => faint|syncope|unconscious|passed out
+---
+# Repair
+How do I fix a running toilet? => toilet; run|flapper|fill|flush|valve|leak
+---
+Why is my laptop overheating? => overheat|fan|thermal|heat; laptop|computer|notebook|macbook
+---
+How do I fix a flat bicycle tire? => tire|tyre|tube|punctur; bike|bicycle|flat
+---
+How do I unclog a kitchen sink? => clog|drain|block; sink|drain
+---
+How do I replace a cracked phone screen? => screen|display; phone|iphone|replac
+---
+# Food safety
+How long can raw chicken stay in the fridge? => chicken|poultry; fridge|refrigerat
+---
+How do I know if eggs have gone bad? => egg; bad|spoil|fresh|float|rotten|old
+---
+Can I eat bread if I cut off the mold? => mold|mould; bread
+---
+Is it safe to eat leftovers that sat out overnight? => overnight|room temperature|left out|sat out|danger zone|spoil|bacteri
+---
+# Outdoors
+How do I start a fire with wet wood? => fire; wet|damp|rain
+---
+How do I tie a bowline knot? => bowline
+---
+What should I do if I see a bear while hiking? => bear
+---
+How do I find north without a compass? => north|direction|navigat
+---
+# Household and power outages
+How do I safely use a generator during a power outage? => generator
+---
+How do I keep my house warm without power? => warm|heat; power|outage|electric
+---
+What should I do if I smell gas in my house? => gas; smell|leak|odor|odour
+---
+How do I shut off the main water valve? => water; main|shut|valve
+---
+How do I reset a tripped circuit breaker? => breaker; trip|reset
