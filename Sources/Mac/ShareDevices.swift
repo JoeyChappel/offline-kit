@@ -237,6 +237,7 @@ final class ShareDevices {
             if refused.activity?.text != "Blocked" { record(&refused, symbol: "hand.raised.fill", text: "Blocked") }
             devices[id] = refused
             offerCookie(res, id: id, had: cookie, port: port)
+            res.closeAfterResponse()   // a blocked device's connection doesn't stay open for its next try
             await Self.sendRefusal(req, res, status: "blocked", message: "This device has been blocked on the Mac.")
             return false
         }

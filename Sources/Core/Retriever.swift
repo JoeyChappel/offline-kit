@@ -174,6 +174,9 @@ enum Retriever {
                                                    xapian: Int(100 * hit.bm25 / best), terms: terms, phrases: phrases)
             titleBonus(hit.title, terms: terms, score: &score, coverage: &coverage)
             if hit.lead { score += 0.3 }
+            // A tie between the same article in a full index and a leads-only one (WikiMed and Wikipedia): the full
+            // one has the rest of the article too.
+            if !hit.text.isEmpty { score += 0.01 }
             return IndexedCandidate(archive: archive, hit: hit, score: score, coverage: coverage)
         }
     }
@@ -557,72 +560,270 @@ enum Retriever {
 }
 
 /// Minimal HTML-to-text for article bodies. Good enough for retrieval, not for display.
+///
+/// One pass over the UTF-8 bytes (the answer index runs it over every article of every reference): blocks that
+/// say nothing (scripts, styles, navigation, figures, tables, footnote marks) are dropped, nested ones whole;
+/// paragraph-level tags become line breaks and section headings are marked; other tags go; entities are
+/// decoded; footnote marks like "[3]" go; runs of spaces become one; lines shorter than `minLength` are dropped.
+/// Same text as the regular expressions it replaced (okit --html-check compares them over an archive) except
+/// for nested tables, which it drops whole where they left the outer table's tail (navbox lists, infobox
+/// names) in the text; 30 to 60 times faster on Wikipedia, iFixit and Stack Exchange articles.
 enum HTMLText {
-    private static let dropBlocks = try! NSRegularExpression(
-        pattern: "<(script|style|head|nav|footer|figure|table|sup)\\b[^>]*>.*?</\\1>",
-        options: [.caseInsensitive, .dotMatchesLineSeparators])
-    private static let breaks = try! NSRegularExpression(
-        pattern: "</?(p|br|li|h[1-6]|div|section|tr|dd|dt|blockquote)\\b[^>]*>", options: .caseInsensitive)
     private static let tags = try! NSRegularExpression(pattern: "<[^>]+>")
     private static let numericEntity = try! NSRegularExpression(pattern: "&#(x?)([0-9a-fA-F]+);")
-    private static let spaces = try! NSRegularExpression(pattern: "[ \\t\\u00A0]+")
-    private static let refMarks = try! NSRegularExpression(pattern: "\\[(\\d+|citation needed|edit)\\]")
 
     static func stripTags(_ s: String) -> String {
-        replace(tags, in: s, with: "")
+        tags.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "")
     }
 
     static func paragraphs(_ html: String, minLength: Int = 80) -> [String] {
-        var s = html
-        // Tables can nest; strip the innermost a few times.
-        for _ in 0..<4 {
-            let next = replace(dropBlocks, in: s, with: " ")
-            if next.utf8.count == s.utf8.count { break }   // nothing left to strip
-            s = next
-        }
-        s = replace(breaks, in: s, with: "\n")
-        s = replace(tags, in: s, with: "")
-        s = decodeEntities(s)
-        s = replace(refMarks, in: s, with: "")
-        s = replace(spaces, in: s, with: " ")
-        return s.components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.count >= minLength }
+        var html = html
+        return html.withUTF8 { lines($0, minLength: minLength, headings: false).map(\.text) }
     }
-
-    private static let headingOpen = try! NSRegularExpression(pattern: "<h[2-6]\\b[^>]*>", options: .caseInsensitive)
 
     /// Paragraphs in reading order, each with the heading of the section it's in (nil before the first heading:
     /// the lead). Same cleanup as `paragraphs`.
     static func sections(_ html: String, minLength: Int = 80) -> [(heading: String?, text: String)] {
-        var s = html
-        for _ in 0..<4 {
-            let next = replace(dropBlocks, in: s, with: " ")
-            if next.utf8.count == s.utf8.count { break }
-            s = next
+        var html = html
+        return html.withUTF8 { sections(utf8: $0, minLength: minLength) }
+    }
+
+    static func sections(utf8: UnsafeBufferPointer<UInt8>, minLength: Int = 80) -> [(heading: String?, text: String)] {
+        lines(utf8, minLength: minLength, headings: true)
+    }
+
+    // MARK: Scanner
+
+    private enum Tag { case drop, heading, lineBreak, other }
+    private static let lt: UInt8 = 0x3C, gt: UInt8 = 0x3E, amp: UInt8 = 0x26, slash: UInt8 = 0x2F, newline: UInt8 = 0x0A
+    private static let headingMark: UInt8 = 0x01
+
+    @inline(__always) private static func lower(_ c: UInt8) -> UInt8 { c >= 0x41 && c <= 0x5A ? c | 0x20 : c }
+    @inline(__always) private static func isAlnum(_ c: UInt8) -> Bool {
+        (c >= 0x30 && c <= 0x39) || (c | 0x20 >= 0x61 && c | 0x20 <= 0x7A)
+    }
+
+    /// The tag name packed into an integer, lowercased (names up to 8 letters; "blockquote" gets its own value).
+    @inline(__always) private static func pack(_ s: StaticString) -> UInt64 {
+        var v: UInt64 = 0
+        s.withUTF8Buffer { for (i, c) in $0.enumerated() { v |= UInt64(c) << (8 * UInt64(i)) } }
+        return v
+    }
+    private static let blockquote: UInt64 = ~0
+    private static let dropNames: Set<UInt64> = [pack("script"), pack("style"), pack("head"), pack("nav"), pack("footer"),
+                                                 pack("figure"), pack("table"), pack("sup")]
+    private static let headingNames: Set<UInt64> = [pack("h2"), pack("h3"), pack("h4"), pack("h5"), pack("h6")]
+    private static let breakNames: Set<UInt64> = [pack("p"), pack("br"), pack("li"), pack("h1"), pack("h2"), pack("h3"),
+                                                  pack("h4"), pack("h5"), pack("h6"), pack("div"), pack("section"),
+                                                  pack("tr"), pack("dd"), pack("dt"), blockquote]
+
+    /// Reads the tag name at `i` (just after "<" or "</"): its packed value and where it ends, or nil when it
+    /// isn't followed by a word boundary (so "<tables>" or "<h2x>" are no known tag).
+    @inline(__always)
+    private static func name(_ b: UnsafeBufferPointer<UInt8>, at i: Int, end: Int) -> (key: UInt64, end: Int)? {
+        var j = i, key: UInt64 = 0
+        while j < end, isAlnum(b[j]) {
+            if j - i < 8 { key |= UInt64(lower(b[j])) << (8 * UInt64(j - i)) }
+            j += 1
         }
-        s = replace(headingOpen, in: s, with: "\n\u{1}")
-        s = replace(breaks, in: s, with: "\n")
-        s = replace(tags, in: s, with: "")
-        s = decodeEntities(s)
-        s = replace(refMarks, in: s, with: "")
-        s = replace(spaces, in: s, with: " ")
-        var heading: String?
+        guard j > i else { return nil }
+        if j < end, b[j] == 0x5F || b[j] >= 0x80 { return nil }   // "_" or a non-ASCII letter: no word boundary
+        if j - i > 8 {
+            guard j - i == 10, key == pack("blockquo"), lower(b[i + 8]) == 0x74, lower(b[i + 9]) == 0x65 else { return (0, j) }
+            return (blockquote, j)
+        }
+        return (key, j)
+    }
+
+    /// Next `byte` at or after `i`, before `end`.
+    @inline(__always)
+    private static func find(_ byte: UInt8, _ b: UnsafeBufferPointer<UInt8>, from i: Int, end: Int) -> Int? {
+        guard i < end, let base = b.baseAddress, let p = memchr(base + i, Int32(byte), end - i) else { return nil }
+        return base.distance(to: p.assumingMemoryBound(to: UInt8.self))
+    }
+
+    /// True when `</name>` (exactly, any case) starts at `i`.
+    @inline(__always)
+    private static func isClose(_ b: UnsafeBufferPointer<UInt8>, at i: Int, end: Int, name: Range<Int>) -> Bool {
+        let n = name.count
+        guard i + n + 3 <= end, b[i + 1] == slash, b[i + n + 2] == gt else { return false }
+        for k in 0..<n where lower(b[i + 2 + k]) != lower(b[name.lowerBound + k]) { return false }
+        return true
+    }
+
+    /// Where a dropped block that opened with `name` ends (just past its closing tag), counting nested blocks of
+    /// the same kind. Unbalanced: the first closing tag. None at all: nil, and the opening tag is just a tag.
+    private static func blockEnd(_ b: UnsafeBufferPointer<UInt8>, from start: Int, end: Int, name: Range<Int>, key: UInt64) -> Int? {
+        var depth = 1, i = start, firstClose: Int?
+        while let open = find(lt, b, from: i, end: end) {
+            if isClose(b, at: open, end: end, name: name) {
+                let after = open + name.count + 3
+                if firstClose == nil { firstClose = after }
+                depth -= 1
+                if depth == 0 { return after }
+                i = after
+            } else if let tag = Self.name(b, at: open + 1, end: end), tag.key == key, tag.end - open - 1 == name.count,
+                      let close = find(gt, b, from: tag.end, end: end) {
+                depth += 1
+                i = close + 1
+            } else {
+                i = open + 1
+            }
+        }
+        return firstClose
+    }
+
+    /// Appends text with its entities decoded.
+    private static func appendText(_ b: UnsafeBufferPointer<UInt8>, _ range: Range<Int>, to out: inout [UInt8]) {
+        var i = range.lowerBound
+        let end = range.upperBound
+        while i < end {
+            guard let a = find(amp, b, from: i, end: end) else {
+                out.append(contentsOf: UnsafeBufferPointer(rebasing: b[i..<end]))
+                return
+            }
+            out.append(contentsOf: UnsafeBufferPointer(rebasing: b[i..<a]))
+            if let used = entity(b, at: a, end: end, into: &out) { i = used } else { out.append(amp); i = a + 1 }
+        }
+    }
+
+    private static let named: [(name: [UInt8], value: [UInt8])] = ([
+        ("nbsp", " "), ("amp", "&"), ("lt", "<"), ("gt", ">"), ("quot", "\""), ("#39", "'"), ("apos", "'"),
+        ("ndash", "-"), ("mdash", "-"), ("minus", "-"), ("deg", "°"), ("times", "×"),
+    ] as [(String, String)]).map { (name: Array($0.0.utf8), value: Array($0.1.utf8)) }
+
+    /// Decodes the entity at `i` (the "&") into `out` and returns where it ends, or nil when it isn't one we know.
+    private static func entity(_ b: UnsafeBufferPointer<UInt8>, at i: Int, end: Int, into out: inout [UInt8]) -> Int? {
+        guard let semi = find(0x3B, b, from: i + 1, end: min(end, i + 12)), semi > i + 1 else { return nil }
+        let body = UnsafeBufferPointer(rebasing: b[(i + 1)..<semi])
+        for entry in named where entry.name.elementsEqual(body) {
+            out.append(contentsOf: entry.value)
+            return semi + 1
+        }
+        guard body.count >= 2, body[0] == 0x23 else { return nil }   // "#"
+        let hex = body[1] == 0x78                                     // "x"
+        let digits = body.dropFirst(hex ? 2 : 1)
+        guard !digits.isEmpty, digits.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 | 0x20 >= 0x61 && $0 | 0x20 <= 0x66) })
+        else { return nil }
+        // Like the pattern it replaces: "&#12a;" is consumed even though it isn't a number.
+        var code: UInt32 = 0, valid = true
+        for d in digits {
+            let v: UInt32 = d <= 0x39 ? UInt32(d - 0x30) : UInt32((d | 0x20) - 0x61 + 10)
+            if !hex && v > 9 { valid = false; break }
+            let (m, o1) = code.multipliedReportingOverflow(by: hex ? 16 : 10)
+            let (s, o2) = m.addingReportingOverflow(v)
+            if o1 || o2 { valid = false; break }
+            code = s
+        }
+        if valid, let scalar = Unicode.Scalar(code) { out.append(contentsOf: Array(String(Character(scalar)).utf8)) }
+        return semi + 1
+    }
+
+    /// The text with tags handled: line breaks, heading marks (when `headings`) and decoded entities.
+    private static func strip(_ b: UnsafeBufferPointer<UInt8>, headings: Bool) -> [UInt8] {
+        var out: [UInt8] = []
+        out.reserveCapacity(b.count / 2)
+        let end = b.count
+        var i = 0
+        while i < end {
+            guard let open = find(lt, b, from: i, end: end) else { appendText(b, i..<end, to: &out); break }
+            appendText(b, i..<open, to: &out)
+            // A tag runs to the first ">" and holds at least one character; anything else is text.
+            guard let close = find(gt, b, from: open + 1, end: end), close > open + 1 else {
+                out.append(lt)
+                i = open + 1
+                continue
+            }
+            let closing = b[open + 1] == slash
+            let nameStart = open + (closing ? 2 : 1)
+            var kind = Tag.other
+            if let tag = name(b, at: nameStart, end: end), tag.end <= close {
+                if !closing, dropNames.contains(tag.key) { kind = .drop }
+                else if !closing, headings, headingNames.contains(tag.key) { kind = .heading }
+                else if breakNames.contains(tag.key) { kind = .lineBreak }
+                if kind == .drop, let after = blockEnd(b, from: close + 1, end: end, name: nameStart..<tag.end, key: tag.key) {
+                    out.append(0x20)
+                    i = after
+                    continue
+                }
+                if kind == .drop { kind = .other }
+            }
+            switch kind {
+            case .heading: out.append(newline); out.append(headingMark)
+            case .lineBreak: out.append(newline)
+            case .drop, .other: break
+            }
+            i = close + 1
+        }
+        return out
+    }
+
+    /// Splits the stripped text into lines: footnote marks out, spaces collapsed, trimmed, short ones dropped.
+    private static func lines(_ b: UnsafeBufferPointer<UInt8>, minLength: Int, headings: Bool) -> [(heading: String?, text: String)] {
+        let text = strip(b, headings: headings)
         var out: [(heading: String?, text: String)] = []
-        for line in s.components(separatedBy: "\n") {
-            let text = line.trimmingCharacters(in: .whitespaces)
-            if text.hasPrefix("\u{1}") {
-                let h = text.dropFirst().trimmingCharacters(in: .whitespaces)
-                if !h.isEmpty { heading = h }
-            } else if text.count >= minLength {
-                out.append((heading, text))
+        var heading: String?
+        var line: [UInt8] = []
+        line.reserveCapacity(4096)
+        text.withUnsafeBufferPointer { t in
+            var start = 0
+            while start <= t.count {
+                let stop = find(newline, t, from: start, end: t.count) ?? t.count
+                defer { start = stop + 1 }
+                let isHeading = stop > start && t[start] == headingMark
+                // A line can't have more characters than bytes.
+                guard isHeading || stop - start >= minLength else { continue }
+                clean(t, (isHeading ? start + 1 : start)..<stop, into: &line)
+                let s = String(decoding: line, as: UTF8.self)
+                let trimmed = needsTrim(line) ? s.trimmingCharacters(in: .whitespaces) : s
+                if isHeading {
+                    if !trimmed.isEmpty { heading = trimmed }
+                } else if trimmed.count >= minLength {
+                    out.append((heading, trimmed))
+                }
             }
         }
         return out
     }
 
-    private static func replace(_ re: NSRegularExpression, in s: String, with t: String) -> String {
-        re.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: t)
+    @inline(__always) private static func needsTrim(_ line: [UInt8]) -> Bool {
+        guard let first = line.first, let last = line.last else { return false }
+        return first == 0x20 || last == 0x20 || first >= 0x80 || last >= 0x80
+    }
+
+    /// One line with footnote marks ("[12]", "[citation needed]", "[edit]") removed and each run of spaces, tabs
+    /// and no-break spaces made one space.
+    private static func clean(_ t: UnsafeBufferPointer<UInt8>, _ range: Range<Int>, into line: inout [UInt8]) {
+        line.removeAll(keepingCapacity: true)
+        var i = range.lowerBound, inSpace = false
+        let end = range.upperBound
+        while i < end {
+            let c = t[i]
+            if c == 0x5B, let after = footnoteEnd(t, at: i, end: end) { i = after; continue }   // "["
+            let space = c == 0x20 || c == 0x09 || (c == 0xC2 && i + 1 < end && t[i + 1] == 0xA0)
+            if space {
+                if !inSpace { line.append(0x20); inSpace = true }
+                i += c == 0xC2 ? 2 : 1
+                continue
+            }
+            inSpace = false
+            line.append(c)
+            i += 1
+        }
+    }
+
+    private static let footnoteWords: [[UInt8]] = [Array("citation needed]".utf8), Array("edit]".utf8)]
+
+    @inline(__always)
+    private static func footnoteEnd(_ t: UnsafeBufferPointer<UInt8>, at i: Int, end: Int) -> Int? {
+        var j = i + 1
+        while j < end, t[j] >= 0x30, t[j] <= 0x39 { j += 1 }
+        if j > i + 1, j < end, t[j] == 0x5D { return j + 1 }
+        for word in footnoteWords where i + 1 + word.count <= end
+            && UnsafeBufferPointer(rebasing: t[(i + 1)..<(i + 1 + word.count)]).elementsEqual(word) {
+            return i + 1 + word.count
+        }
+        return nil
     }
 
     static func decodeEntities(_ input: String) -> String {

@@ -16,7 +16,8 @@ struct WatchListenView: View {
     @State private var query = ""
     /// `query` after the typing has paused for a moment: the lists are worked out from this one.
     @State private var appliedQuery = ""
-    @State private var derivedCache = WatchListenCache()
+    /// Shared by every Watch & Listen section, so coming back to one that is unchanged costs a lookup.
+    private var derivedCache: WatchListenCache { .shared }
     @State private var unfinished = false
     @State private var musicBrowse: MusicBrowse = .albums
     @State private var artist: String?
@@ -199,6 +200,7 @@ struct WatchListenView: View {
             } else { home }
         }
         .background { MediaForestBackground() }
+        .mediaCoverPicker()
         .foregroundStyle(MediaTheme.ink)
         .tint(MediaTheme.accent)
         .environment(\.colorScheme, .dark)
@@ -276,13 +278,15 @@ struct WatchListenView: View {
                         MediaFeaturedBanner(item: featured, play: { start(featured, $0, nil) }, detail: { selected = featured })
                             .padding(.horizontal, 24)
                     }
-                    ForEach(catalog.shelves) { shelf in
-                        MediaShelfRow(shelf: shelf, open: { selected = $0 }, seeAll: { collection = shelf })
+                    ForEach(Array(catalog.shelves.enumerated()), id: \.element.id) { place, shelf in
+                        // Only the shelves on the opening screen fade in; ones scrolled to later just appear.
+                        MediaShelfRow(shelf: shelf, open: { selected = $0 }, seeAll: { collection = shelf }, animated: place < 4)
                     }
                 }
-                if !showingWelcome && filtered.isEmpty && (!appliedQuery.isEmpty || genre != nil) {
+                // (`filtered` sorts everything, so it is only asked when a search, genre or filter could have emptied it.)
+                if !showingWelcome && (!appliedQuery.isEmpty || genre != nil) && filtered.isEmpty {
                     ContentUnavailableView.search(text: appliedQuery.isEmpty ? genre ?? "" : appliedQuery).padding()
-                } else if !showingWelcome && filtered.isEmpty && unfinished {
+                } else if !showingWelcome && unfinished && filtered.isEmpty {
                     ContentUnavailableView("Nothing unfinished", systemImage: "checkmark.circle",
                                            description: Text("Everything here is either finished or not started yet.")).padding()
                 }
@@ -502,7 +506,7 @@ struct WatchListenView: View {
                 ForEach(Array(visibleItems.enumerated()), id: \.element.id) { index, item in
                     Button { selected = item } label: { MediaCard(item: item, info: media.info[item.progressKey], progress: media.progress[item.progressKey]) }
                         .buttonStyle(.plain).mediaCardMenu(item)
-                        .appearFade(delay: min(Double(index), 8) * 0.03)
+                        .appearFade(delay: min(Double(index), 8) * 0.03, enabled: index < 24)
                 }
             }
         }.padding(.horizontal, 24)
@@ -633,7 +637,7 @@ struct WatchListenView: View {
 /// (hovering, scrolling, a progress tick elsewhere) costs a comparison, not a filter and sort of every item.
 @MainActor
 private final class WatchListenCache {
-    struct Key: Equatable {
+    struct Key: Hashable {
         let revision: Int
         let filter: MediaFilter
         let genre: String?
@@ -643,14 +647,17 @@ private final class WatchListenCache {
         let artist: String?
         let collectionID: String?
     }
-    private var key: Key?
-    private var value: WatchListenDerived?
+    static let shared = WatchListenCache()
+    private var values: [Key: WatchListenDerived] = [:]
+    private var revision = -1
 
     func derived(_ key: Key, make: () -> WatchListenDerived) -> WatchListenDerived {
-        if let value, self.key == key { return value }
+        // Anything worked out for an older library is out of date: keep only the current revision's.
+        if key.revision != revision { values.removeAll(); revision = key.revision }
+        if let value = values[key] { return value }
         let made = make()
-        self.key = key
-        value = made
+        if values.count >= 24 { values.removeAll() }
+        values[key] = made
         return made
     }
 }

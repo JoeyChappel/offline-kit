@@ -102,6 +102,8 @@ struct PrepareView: View {
                             } label: {
                                 Label("Private supply inventory", systemImage: "lock.fill").font(.callout).foregroundStyle(.secondary)
                             }
+                        } else if tab == .people || tab == .home || tab == .calculators {
+                            PrivacyNote { open(.privacy) }
                         } else {
                             KitHeading(eyebrow: "PREPARE", title: "Get ready before you need it.",
                                        subtitle: "Tell Offline Kit about your household and supplies so Ask can give answers that fit you.")
@@ -114,7 +116,7 @@ struct PrepareView: View {
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 28)
-                .frame(maxWidth: tab == .supplies ? 1100 : 860, alignment: .leading)
+                .frame(maxWidth: [.supplies, .people, .home, .calculators].contains(tab) ? 1100 : 860, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
             .onChange(of: focusPerson) {
@@ -489,92 +491,211 @@ private struct PeopleSection: View {
     @Environment(Household.self) private var household
     /// Opens this person's card in Family plan.
     let openCard: (UUID) -> Void
+    @State private var viewedPerson: UUID?
+    @State private var editingPerson: UUID?
+    @State private var wide = false
 
     var body: some View {
         @Bindable var household = household
-        VStack(alignment: .leading, spacing: 16) {
-            SectionCard(symbol: "person.crop.circle.badge.questionmark", title: "Who uses Offline Kit on this device?",
-                        subtitle: "Ask answers with that person in mind. You can switch in Ask at any time.") {
-                if household.data.people.isEmpty {
-                    Text("Add the people in your household below.").font(.callout).foregroundStyle(.secondary)
-                } else {
-                    Picker("Using this device", selection: $household.data.activePersonID) {
-                        Text("Not set").tag(UUID?.none)
-                        ForEach(household.data.people) { Text($0.name.isEmpty ? "Unnamed" : $0.name).tag(Optional($0.id)) }
-                    }
+        VStack(alignment: .leading, spacing: 18) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 16) { heading; Spacer(); addButton }
+                VStack(alignment: .leading, spacing: 12) { heading; addButton }
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 16) { askingAs; askingNote }
+                VStack(alignment: .leading, spacing: 8) { askingAs; askingNote }
+            }
+            if household.data.people.isEmpty {
+                ContentUnavailableView("Add your household", systemImage: "person.2",
+                                       description: Text("Keep each person’s skills and notes here. Their health details live in Family plan."))
+                    .frame(maxWidth: .infinity).card(padding: 18)
+            } else if wide {
+                HStack(alignment: .top, spacing: 18) {
+                    roster.frame(width: 240)
+                    profile(viewedPerson ?? household.data.people.first?.id)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+            } else if let viewedPerson {
+                Button("All people", systemImage: "chevron.left") { self.viewedPerson = nil }.buttonStyle(.borderless)
+                profile(viewedPerson)
+            } else {
+                roster
             }
-            ForEach($household.data.people) { $person in
-                PersonCard(person: $person, card: household.data.card(for: person),
-                           openCard: { openCard(person.id) }) {
-                    household.removePerson(person.id)
-                }
-            }
-            Button {
-                let person = Person(name: "")
-                household.data.people.append(person)
-                if household.data.activePersonID == nil { household.data.activePersonID = person.id }
-            } label: {
-                Label("Add a Person", systemImage: "person.badge.plus")
-            }
-            .buttonStyle(.borderedProminent)
         }
+        .onGeometryChange(for: Bool.self) { $0.size.width >= 760 } action: { wide = $0 }
+        .onChange(of: household.data.people.map(\.id)) {
+            if let viewedPerson, !household.data.people.contains(where: { $0.id == viewedPerson }) { self.viewedPerson = nil }
+        }
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("People").font(.title.bold())
+            Text("A household list, with the details Ask can use.").font(.callout).foregroundStyle(.secondary)
+        }
+    }
+    private var addButton: some View {
+        Button {
+            let person = Person(name: "")
+            household.data.people.append(person)
+            if household.data.activePersonID == nil { household.data.activePersonID = person.id }
+            viewedPerson = person.id
+            editingPerson = person.id
+        } label: { Label("Add a person", systemImage: "person.badge.plus") }
+            .buttonStyle(.borderedProminent)
+    }
+    private var askingAs: some View {
+        @Bindable var household = household
+        return Picker("Asking as", selection: $household.data.activePersonID) {
+            Text("Not set").tag(UUID?.none)
+            ForEach(household.data.people) { Text($0.name.isBlank ? "Unnamed" : $0.name).tag(Optional($0.id)) }
+        }.fixedSize(horizontal: false, vertical: true)
+    }
+    private var askingNote: some View {
+        Text("Sets who Ask answers for. Viewing a profile below doesn’t change this.")
+            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+    private var roster: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Household · \(household.data.people.count)").font(.headline)
+            ForEach(household.data.people) { person in
+                let selected = (viewedPerson ?? (wide ? household.data.people.first?.id : nil)) == person.id
+                Button { viewedPerson = person.id } label: {
+                    HStack(spacing: 12) {
+                        Text(initials(person.name)).font(.callout.weight(.semibold))
+                            .frame(width: 38, height: 38)
+                            .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 9))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(person.name.isBlank ? "Unnamed" : person.name).font(.callout.weight(.semibold))
+                            Text(person.age.label).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                        if !wide { Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary) }
+                    }.padding(10).contentShape(Rectangle())
+                        .background(selected ? Color.accentColor.opacity(0.13) : Color.clear, in: RoundedRectangle(cornerRadius: 10))
+                        .overlay { RoundedRectangle(cornerRadius: 10).stroke(selected ? Color.accentColor.opacity(0.5) : .clear) }
+                }.buttonStyle(.plain).accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }.card(padding: 14)
+    }
+    @ViewBuilder private func profile(_ id: UUID?) -> some View {
+        if let id, let person = household.data.people.first(where: { $0.id == id }) {
+            PersonCard(person: personBinding(person), card: household.data.card(for: person),
+                       initiallyEditing: editingPerson == id, finishedEditing: { editingPerson = nil }, openCard: { openCard(id) }) {
+                household.removePerson(id)
+            }.id(id)
+        }
+    }
+    private func personBinding(_ person: Person) -> Binding<Person> {
+        Binding(get: { household.data.people.first { $0.id == person.id } ?? person }, set: { updated in
+            if let index = household.data.people.firstIndex(where: { $0.id == person.id }) { household.data.people[index] = updated }
+        })
+    }
+    private func initials(_ name: String) -> String {
+        let letters = name.split(whereSeparator: \.isWhitespace).prefix(2).compactMap(\.first)
+        return letters.isEmpty ? "?" : String(letters).uppercased()
     }
 }
 
 private struct PersonCard: View {
     @Binding var person: Person
     let card: MedicalCard
+    let initiallyEditing: Bool
+    let finishedEditing: () -> Void
     let openCard: () -> Void
     let onDelete: () -> Void
+    @State private var editing = false
     @State private var newSkill = ""
     @State private var confirmDelete = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                TextField("Name", text: $person.name).font(.title3.bold()).textFieldStyle(.plain)
-                Spacer()
-                Picker("Age", selection: $person.age) {
-                    ForEach(Person.Age.allCases) { Text($0.label).tag($0) }
-                }
-                .labelsHidden().fixedSize()
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 12) { identity.frame(minWidth: 180); Spacer(minLength: 0); personActions }
+                VStack(alignment: .leading, spacing: 12) { identity; personActions }
             }
             medicalLink
+            Divider()
             VStack(alignment: .leading, spacing: 6) {
                 Text("Skills").font(.subheadline.weight(.semibold))
                 Text("Ask gives more hands-on detail for things this person knows how to do.")
                     .font(.caption).foregroundStyle(.secondary)
-                FlowLayout(spacing: 6) {
-                    ForEach(Preparedness.skills + person.skills.filter { !Preparedness.skills.contains($0) }, id: \.self) { skill in
-                        let on = person.skills.contains(skill)
-                        Button {
-                            if on { person.skills.removeAll { $0 == skill } } else { person.skills.append(skill) }
-                        } label: {
-                            Label(skill, systemImage: on ? "checkmark" : "plus")
-                                .font(.caption.weight(.medium))
-                                .padding(.horizontal, 10).padding(.vertical, 6)
-                                .foregroundStyle(on ? Color.white : Design.ink)
-                                .background(on ? Color.accentColor : Color.secondary.opacity(0.12), in: Capsule())
+                if editing {
+                    FlowLayout(spacing: 6) {
+                        ForEach(Preparedness.skills + person.skills.filter { !Preparedness.skills.contains($0) }, id: \.self) { skill in
+                            let on = person.skills.contains(skill)
+                            Button {
+                                if on { person.skills.removeAll { $0 == skill } } else { person.skills.append(skill) }
+                            } label: {
+                                Label(skill, systemImage: on ? "checkmark" : "plus")
+                                    .font(.caption.weight(.medium))
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .foregroundStyle(on ? Color.white : Design.ink)
+                                    .background(on ? Color.accentColor : Color.secondary.opacity(0.12), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
-                }
-                HStack {
-                    TextField("Add another skill", text: $newSkill).textFieldStyle(.roundedBorder).onSubmit(addSkill)
-                    Button("Add", action: addSkill).disabled(newSkill.trimmingCharacters(in: .whitespaces).isEmpty)
+                    HStack {
+                        TextField("Add another skill", text: $newSkill).textFieldStyle(.roundedBorder).onSubmit(addSkill)
+                        Button("Add", action: addSkill).disabled(newSkill.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                } else {
+                    if person.skills.isEmpty {
+                        Text("No skills selected.").font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        FlowLayout(spacing: 6) {
+                            ForEach(person.skills, id: \.self) { skill in Pill(text: skill, symbol: "checkmark", tint: .accentColor) }
+                        }
+                    }
+                    Button("Choose skills…") { editing = true }.buttonStyle(.bordered)
                 }
             }
-            field("Anything else Ask should know", "For example: uses a wheelchair, speaks Spanish, works night shifts", text: $person.notes)
-            Button("Remove \(person.name.isEmpty ? "This Person" : person.name)", role: .destructive) { confirmDelete = true }
-                .buttonStyle(.borderless).font(.callout)
-                .confirmationDialog("Remove \(person.name.isEmpty ? "this person" : person.name)?", isPresented: $confirmDelete) {
-                    Button("Remove", role: .destructive, action: onDelete)
-                } message: {
-                    Text("Their details, their Family plan medical card and anything Ask noted about them are deleted.")
+            Divider()
+            if editing {
+                field("Anything else Ask should know", "For example: uses a wheelchair, speaks Spanish, works night shifts", text: $person.notes)
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Anything else Ask should know").font(.subheadline.weight(.semibold))
+                    Text(person.notes.isBlank ? "No notes added." : person.notes).font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(person.notes.isBlank ? "Add notes…" : "Edit notes…") { editing = true }.buttonStyle(.bordered)
                 }
+            }
         }
         .card(padding: 18)
+        .onAppear { editing = initiallyEditing }
+        .confirmationDialog("Remove \(person.name.isEmpty ? "this person" : person.name)?", isPresented: $confirmDelete) {
+            Button("Remove", role: .destructive, action: onDelete)
+        } message: {
+            Text("Their details, their Family plan medical card and anything Ask noted about them are deleted.")
+        }
+    }
+
+    @ViewBuilder private var identity: some View {
+        if editing {
+            VStack(alignment: .leading, spacing: 8) {
+                TextField("Name", text: $person.name).font(.title3.bold()).textFieldStyle(.roundedBorder)
+                Picker("Age", selection: $person.age) { ForEach(Person.Age.allCases) { Text($0.label).tag($0) } }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(person.name.isBlank ? "Unnamed" : person.name).font(.title2.bold())
+                Text(person.age.label).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+            }
+        }
+    }
+    private var personActions: some View {
+        HStack(spacing: 10) {
+            Button(editing ? "Done" : "Edit person", systemImage: editing ? "checkmark" : "pencil") {
+                editing.toggle()
+                if !editing { finishedEditing() }
+            }.buttonStyle(.bordered)
+            Menu {
+                Button("Remove person…", role: .destructive) { confirmDelete = true }
+            } label: { Image(systemName: "ellipsis") }.accessibilityLabel("More person actions")
+        }
     }
 
     /// Health lives on the person's Family plan card, so it's typed in one place and printed from there.
@@ -616,23 +737,62 @@ private struct HomeSection: View {
     let openPlan: () -> Void
 
     var body: some View {
-        @Bindable var household = household
-        SectionCard(symbol: "house", title: "Your home",
-                    subtitle: "Ask uses this to give the right steps for your setup, like shutting off your water or heating safely.") {
-            row("Where you live", "City and state, like Springfield, Illinois", $household.data.home.area)
-            row("Type of home", "House, apartment, mobile home…", $household.data.home.type)
-            row("Water", "City water, private well…", $household.data.home.water)
-            row("Heat", "Natural gas, electric, propane, wood stove…", $household.data.home.heat)
-            row("Backup power", "None, portable generator, solar and battery…", $household.data.home.power)
-            row("Pets", "Two dogs, one cat…", $household.data.home.pets)
-            row("Notes", "Anything else about your home", $household.data.home.notes)
+        VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Meeting places and out-of-area contact").font(.subheadline.weight(.semibold))
-                Text(meetingSummary).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                Button { openPlan() } label: { Label("Edit in Family Plan", systemImage: "figure.2.and.child.holdinghands") }
-                    .buttonStyle(.bordered)
+                Text("Your home").font(.title.bold())
+                Text("Details that help Ask tailor practical answers to your setup.").font(.callout).foregroundStyle(.secondary)
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .top, spacing: 20) {
+                    homeFields.frame(minWidth: 350, maxWidth: .infinity)
+                    familyPlanSummary.frame(minWidth: 280, maxWidth: 360)
+                }
+                VStack(alignment: .leading, spacing: 18) { homeFields; familyPlanSummary }
             }
         }
+    }
+
+    private var homeFields: some View {
+        @Bindable var household = household
+        return VStack(alignment: .leading, spacing: 16) {
+            SectionCard(symbol: "house", title: "Location & home") {
+                row("Where you live", "City and state, like Springfield, Illinois", $household.data.home.area)
+                row("Type of home", "House, apartment, mobile home…", $household.data.home.type)
+            }
+            SectionCard(symbol: "drop", title: "Utilities & backup") {
+                row("Water", "City water, private well…", $household.data.home.water)
+                row("Heat", "Natural gas, electric, propane, wood stove…", $household.data.home.heat)
+                row("Backup power", "None, portable generator, solar and battery…", $household.data.home.power)
+            }
+            SectionCard(symbol: "pawprint", title: "Pets & notes") {
+                row("Pets", "Two dogs, one cat…", $household.data.home.pets)
+                row("Notes", "Anything else about your home", $household.data.home.notes)
+            }
+        }
+    }
+
+    private var familyPlanSummary: some View {
+        SectionCard(symbol: "figure.2.and.child.holdinghands", title: "From your Family plan") {
+            planSummary("Near home", value: household.data.home.meetingPlace, symbol: "mappin")
+            Divider()
+            planSummary("Out of area", value: household.data.extra.plan.meetingOutOfArea, symbol: "mappin.and.ellipse")
+            Divider()
+            planSummary("Contact", value: household.data.home.outOfAreaContact, symbol: "person")
+            Button { openPlan() } label: { Label("Open Family plan", systemImage: "arrow.right") }.buttonStyle(.bordered)
+            Text("Edit meeting places and contacts there so they stay consistent on printed plans.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func planSummary(_ title: String, value: String, symbol: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol).foregroundStyle(.tint).frame(width: 22)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.subheadline.weight(.semibold))
+                Text(value.isBlank ? "Not set yet" : value).font(.callout).foregroundStyle(.secondary)
+                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+            }
+        }.padding(.vertical, 3)
     }
 
     private func row(_ label: String, _ prompt: String, _ text: Binding<String>) -> some View {
@@ -642,13 +802,7 @@ private struct HomeSection: View {
         }
     }
 
-    private var meetingSummary: String {
-        let home = household.data.home
-        let bits = [home.meetingPlace.isBlank ? nil : "Near home: \(home.meetingPlace)",
-                    household.data.extra.plan.meetingOutOfArea.isBlank ? nil : "Out of area: \(household.data.extra.plan.meetingOutOfArea)",
-                    home.outOfAreaContact.isBlank ? nil : "Contact: \(home.outOfAreaContact)"].compactMap { $0 }
-        return bits.isEmpty ? "Not set yet. They’re part of your Family plan, so they print on the plan and wallet cards." : bits.joined(separator: " · ")
-    }
+
 }
 
 // MARK: - Emergency info

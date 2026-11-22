@@ -178,7 +178,8 @@ struct GamesView: View {
         let all = games.games
         let continuing = all.compactMap { game in game.resumeState.map { (game, $0.date) } }
             .sorted { $0.1 > $1.1 }
-        let favorites = all.filter { games.favorites.contains($0.id) }.sorted(by: byTitle)
+        // `games.games` is already in title order (the scan sorts it), so filtering keeps it in order.
+        let favorites = all.filter { games.favorites.contains($0.id) }
         let recent = all.filter { games.lastPlayed[$0.id] != nil }
             .sorted { (games.lastPlayed[$0.id] ?? .distantPast) > (games.lastPlayed[$1.id] ?? .distantPast) }
         let bySystem = Dictionary(grouping: all, by: \.system)
@@ -205,7 +206,7 @@ struct GamesView: View {
                     .appearFade(delay: next())
             }
             ForEach(systems) { system in
-                let list = (bySystem[system] ?? []).sorted(by: byTitle)
+                let list = bySystem[system] ?? []
                 shelf(system.name, symbol: system.artSymbol, count: list.count, route: .system(system), tint: system.tint) { tiles(list) }
                     .appearFade(delay: next())
             }
@@ -216,8 +217,6 @@ struct GamesView: View {
             HStack { Spacer(); controlsButton; Spacer() }
         }
     }
-
-    private func byTitle(_ a: Game, _ b: Game) -> Bool { a.title.localizedStandardCompare(b.title) == .orderedAscending }
 
     private func tiles(_ list: [Game]) -> some View {
         ForEach(list.prefix(14)) { game in
@@ -371,7 +370,8 @@ struct GamesView: View {
 
     /// Genre or publisher groups with their game counts, biggest first. Empty until games are organized.
     @ViewBuilder private func groupSection(_ title: String, field: CatalogDetails.Key, route: @escaping (String) -> GameShelf) -> some View {
-        let names = Dictionary(grouping: games.games.compactMap { KitCatalog.shared.value(KitCatalog.gameKey($0), field) }, by: { $0 })
+        // Nothing to group until Organize with AI has approved some details.
+        let names = KitCatalog.shared.details.isEmpty ? [] : Dictionary(grouping: games.games.compactMap { KitCatalog.shared.value(KitCatalog.gameKey($0), field) }, by: { $0 })
             .map { ($0.key, $0.value.count) }.sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }
         if !names.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
@@ -696,8 +696,7 @@ private struct GameTile: View {
         .padding(10)
         .background(Design.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(hovering ? Color.accentColor.opacity(0.6) : Design.border, lineWidth: 0.5))
-        .hoverLift()
-        .onHover { hovering = $0 }
+        .hoverLift(hovering: $hovering)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(game.title), \(game.system.name)\(game.canResume ? ", saved place" : "")\(favorite ? ", favorite" : "")")
     }
@@ -724,8 +723,7 @@ private struct ContinueCard: View {
         .frame(width: 252)
         .background(Design.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(hovering ? Color.accentColor.opacity(0.6) : Design.border, lineWidth: 0.5))
-        .hoverLift()
-        .onHover { hovering = $0 }
+        .hoverLift(hovering: $hovering)
     }
 }
 
@@ -743,43 +741,25 @@ private struct GameDetailView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 22) {
-                GameArtwork(game: game).frame(maxWidth: 520)
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(game.system.name.uppercased()).font(.caption.weight(.semibold)).tracking(1.2).foregroundStyle(Color.accentColor)
-                    Text(game.title).font(.system(.largeTitle, design: .rounded, weight: .bold)).foregroundStyle(Design.ink)
-                }
-                FlowLayout(spacing: 8) {
-                    Pill(text: "Works offline", symbol: "checkmark.shield", tint: .accentColor)
-                    if game.canResume { Pill(text: "Saved place available", symbol: "bookmark") }
-                }
                 ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 12) { playActions }
-                    VStack(alignment: .leading, spacing: 12) { playActions }
-                }
-                if game.canResume {
-                    Text("Resume carries on from where you left off. Play starts from the beginning, and a quick look won’t replace where you left off.")
-                        .font(.callout).foregroundStyle(.secondary)
-                }
-                Label(game.system.controlsHint, systemImage: "keyboard")
-                    .font(.callout).foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if game.system == .dos {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Picker("Controls", selection: Binding(get: { dosControls }, set: { changeControls($0) })) {
-                            Text("Keyboard & mouse").tag(GameLibrary.DOSControls.keyboard)
-                            Text("Joystick or game pad").tag(GameLibrary.DOSControls.joystick)
-                        }
-                        .pickerStyle(.menu).fixedSize()
-                        Text("Choose Joystick if the game says a joystick is required. Then the arrow keys move, Z fires and X is the second button.")
-                            .font(.caption).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                    HStack(alignment: .top, spacing: 26) {
+                        GameArtwork(game: game).frame(width: 300)
+                        introduction.frame(minWidth: 350, maxWidth: .infinity, alignment: .leading)
+                    }
+                    VStack(alignment: .leading, spacing: 20) {
+                        GameArtwork(game: game).frame(maxWidth: 360)
+                        introduction
                     }
                 }
-                LabeledContent("System", value: game.system.name)
-                if let date = library.lastPlayed[game.id] { LabeledContent("Last played", value: date.formatted(date: .abbreviated, time: .shortened)) }
-                Label("Saves stay beside this game and travel with its drive.", systemImage: "externaldrive")
-                    .font(.callout).foregroundStyle(.secondary)
-            }.padding(24).frame(maxWidth: 760, alignment: .leading).frame(maxWidth: .infinity)
+                controlsGuide
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 18) {
+                        savedPlaceCard.frame(minWidth: 250, maxWidth: .infinity)
+                        detailsCard.frame(minWidth: 250, maxWidth: .infinity)
+                    }
+                    VStack(alignment: .leading, spacing: 18) { savedPlaceCard; detailsCard }
+                }
+            }.padding(24).frame(maxWidth: 1100, alignment: .leading).frame(maxWidth: .infinity)
         }
         .background(Design.canvas)
         .navigationTitle(game.title)
@@ -806,6 +786,148 @@ private struct GameDetailView: View {
         } message: {
             Text("Its saves stay in the Saves folder, so adding the game again brings them back.")
         }
+    }
+
+    private var savedDate: Date? {
+        guard game.canResume, let url = game.resumeStateURL else { return nil }
+        return (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+    }
+
+    private var introduction: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(game.system.name.uppercased()).font(.caption.weight(.semibold)).tracking(1.2).foregroundStyle(Color.accentColor)
+                Text(game.title).font(.system(.largeTitle, design: .rounded, weight: .bold)).foregroundStyle(Design.ink)
+            }
+            FlowLayout(spacing: 8) {
+                Pill(text: "Works offline", symbol: "checkmark.shield", tint: .accentColor)
+                if game.canResume { Pill(text: "Saved place available", symbol: "bookmark") }
+                if let date = savedDate {
+                    Text("Saved \(date.formatted(.relative(presentation: .named)))").font(.caption).foregroundStyle(.secondary)
+                        .help(date.formatted(date: .abbreviated, time: .shortened))
+                }
+            }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) { playActions }
+                VStack(alignment: .leading, spacing: 12) { playActions }
+            }
+            if game.system.hasSaveStates {
+                Text(game.canResume ? "Resume picks up your latest saved place. Longer sessions save automatically." : "Longer sessions save automatically. You can also save your place from the player.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Save and load from the game’s own menu.").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var controlsGuide: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("How to play").font(.title2.bold()).accessibilityAddTraits(.isHeader)
+            #if os(macOS)
+            FlowLayout(spacing: 18) {
+                switch game.system {
+                case .scummvm:
+                    key("Mouse", action: "Point and click")
+                    key("fn-F5", action: "Game menu")
+                    key("Esc", action: "Skip a scene")
+                case .dos:
+                    if dosControls == .joystick {
+                        key("↑ ↓ ← →", action: "Move")
+                        key("Z", action: "Fire")
+                        key("X", action: "Button 2")
+                    } else {
+                        key("Keyboard", action: "Direct input")
+                    }
+                    key("Mouse", action: "Move and click")
+                case .atari2600:
+                    key("↑ ↓ ← →", action: "Move")
+                    key("Z / X", action: "Fire")
+                    key("Return", action: "Game Reset")
+                    key("Space", action: "Game Select")
+                case .pcEngine:
+                    key("↑ ↓ ← →", action: "Move")
+                    key("X", action: "I")
+                    key("Z", action: "II")
+                    key("Return", action: "Run")
+                    key("Space", action: "Select")
+                default:
+                    key("↑ ↓ ← →", action: "Move")
+                    key("X", action: "A")
+                    key("Z", action: "B")
+                    if game.system.hasShoulderButtons { key("Q / W", action: "L / R") }
+                    key("Return", action: "Start")
+                    key("Space", action: "Select")
+                }
+            }
+            if game.system == .scummvm {
+                Text("Use the Game Menu button to save or load. On a Mac laptop, fn-F5 opens the same menu.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else if game.system == .dos {
+                Text(dosControls == .joystick ? "Other keys still go straight to the game. A game controller works as the joystick too." : "Click the picture if keys stop reaching the game.")
+                    .font(.callout).foregroundStyle(.secondary)
+            } else {
+                Text("Game controllers work too.").font(.callout).foregroundStyle(.secondary)
+            }
+            #else
+            let hint = game.system == .dos
+                ? (dosControls == .joystick ? "Tap the picture to click. The on-screen direction pad or a connected game controller moves the joystick." : "Tap the picture to click. Choose Joystick below for games that need a joystick.")
+                : game.system.controlsHint
+            Label(hint, systemImage: "hand.tap").font(.callout).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if !game.system.usesKeyboardAndMouse {
+                Text(touchButtonHint).font(.callout).foregroundStyle(.secondary)
+            }
+            #endif
+            if game.system == .dos { dosControlPicker }
+        }.frame(maxWidth: .infinity, alignment: .leading).card(padding: 20)
+    }
+
+    private var touchButtonHint: String {
+        switch game.system {
+        case .pcEngine: "On-screen A and B play buttons I and II. Start is Run; Select is Select."
+        case .atari2600: "On-screen B fires. Start is Game Reset; Select is Game Select."
+        case .gameBoyAdvance: "The on-screen pad includes A, B, L, R, Start and Select."
+        default: "Move with the on-screen direction pad; use A, B, Start and Select."
+        }
+    }
+
+    private func key(_ keys: String, action: String) -> some View {
+        HStack(spacing: 10) {
+            Text(keys).font(.system(.callout, design: .monospaced, weight: .semibold))
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .background(Design.canvas, in: RoundedRectangle(cornerRadius: 8))
+                .overlay { RoundedRectangle(cornerRadius: 8).stroke(Design.border) }
+            Text(action).font(.callout)
+        }.accessibilityElement(children: .combine)
+    }
+
+    private var dosControlPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("Controls", selection: Binding(get: { dosControls }, set: { changeControls($0) })) {
+                Text("Keyboard & mouse").tag(GameLibrary.DOSControls.keyboard)
+                Text("Joystick or game pad").tag(GameLibrary.DOSControls.joystick)
+            }.pickerStyle(.menu)
+            Text("Choose Joystick if the game says a joystick is required.")
+                .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    private var savedPlaceCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Saved place", systemImage: "externaldrive").font(.headline)
+            Text("Saves stay beside this game and travel with its drive.").font(.callout).foregroundStyle(.secondary)
+            if !game.system.hasSaveStates {
+                Text("This system uses the game’s own save menu; Resume isn’t available.").font(.caption).foregroundStyle(.secondary)
+            }
+        }.frame(maxWidth: .infinity, alignment: .leading).card(padding: 18)
+    }
+
+    private var detailsCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("Game details", systemImage: "desktopcomputer").font(.headline)
+            LabeledContent("System", value: game.system.name)
+            if let date = library.lastPlayed[game.id] { LabeledContent("Last played", value: date.formatted(date: .abbreviated, time: .shortened)) }
+        }.frame(maxWidth: .infinity, alignment: .leading).card(padding: 18)
     }
 
     /// Saved beside the game. A game that's playing right now restarts with the new controls.

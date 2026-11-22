@@ -3,6 +3,9 @@ import Foundation
 // Test harness for the shared core: same retrieval and engines as the app.
 // usage: okit [--engine apple|ollama|builtIn|auto] [--model <id>] [--sources-only] "question"
 //        okit --bench <questions.txt> [--ttfw] [--out results.json]   retrieval and first-word timings
+//        OFFLINEKIT_GREEDY=1 okit --llama-bench <questions.txt> [--tokens 128] [--out r.json]   model speed and memory
+//        okit --html-check <file.zim> [--limit N] [--articles N]   HTML-to-text against the old regular expressions
+//        okit --index-bench <file.zim> [--limit N] [--depth full|leads] [--questions q.txt] [--reuse]   index build and query timings
 //        okit --models                      list answer models (Models folders + ones used in place)
 //        okit --add-model <file.gguf> [place]  check and add a GGUF (copies into the library unless "place")
 
@@ -18,6 +21,38 @@ func run() async {
         case "--engine": choice = EngineChoice(rawValue: args.removeFirst()) ?? .auto
         case "--sources-only": sourcesOnly = true
         case "--model": builtInModel = args.removeFirst()
+        case "--index-bench":
+            let zim = args.removeFirst()
+            let limit = args.firstIndex(of: "--limit").flatMap { Int(args[$0 + 1]) }
+            let depth = args.firstIndex(of: "--depth").flatMap { AnswerIndexPolicy.Depth(rawValue: args[$0 + 1]) }
+            let questions = args.firstIndex(of: "--questions").map { args[$0 + 1] }
+            // --qos background|utility measures at the builder's own priority.
+            let qos: QualityOfService = switch args.firstIndex(of: "--qos").map({ args[$0 + 1] }) {
+            case "background": .background
+            case "utility": .utility
+            default: .userInitiated
+            }
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                let thread = Thread {
+                    IndexBench.run(zim: zim, limit: limit, depth: depth, questionsFile: questions, reuse: args.contains("--reuse"))
+                    done.resume()
+                }
+                thread.qualityOfService = qos
+                thread.stackSize = 8 << 20
+                thread.start()
+            }
+            return
+        case "--html-check":
+            let zim = args.removeFirst()
+            HTMLCheck.run(zim: zim, limit: args.firstIndex(of: "--limit").flatMap { Int(args[$0 + 1]) },
+                          articles: args.firstIndex(of: "--articles").flatMap { Int(args[$0 + 1]) } ?? .max)
+            return
+        case "--llama-bench":
+            let file = args.removeFirst()
+            let tokens = args.firstIndex(of: "--tokens").flatMap { Int(args[$0 + 1]) } ?? 128
+            let out = args.firstIndex(of: "--out").map { args[$0 + 1] }
+            await LlamaBench.run(questionsFile: file, maxTokens: tokens, out: out)
+            return
         case "--prefix-check":
             await Bench.prefixCheck(questionsFile: args.removeFirst())
             return
@@ -99,11 +134,10 @@ func run() async {
             let dl = ChunkedDownload(metalinkURL: model.url, title: model.title, meta: model.metalink,
                                      folder: LocalModels.folder(forLibrary: library))
             let start = Date()
-            var lastPrint = Date.distantPast
+            let throttle = PrintThrottle()
             do {
                 let url = try await dl.run { p in
-                    guard Date().timeIntervalSince(lastPrint) > 15 || p.phase != .downloading else { return }
-                    lastPrint = Date()
+                    guard throttle.due(seconds: 15, always: p.phase != .downloading) else { return }
                     print(String(format: "  %@ %.1f%% %.1f MB/s", "\(p.phase)", Double(p.done) / Double(max(p.total, 1)) * 100, p.bytesPerSecond / 1e6))
                 }
                 print(String(format: "DONE %@ in %.0fs (SHA-256 verified)", url.path, Date().timeIntervalSince(start)))
@@ -176,6 +210,19 @@ func run() async {
     for s in turn.sources { print("[\(s.id)] \(s.ref.title) · \(s.bookTitle)") }
     if let e = turn.error { print("ERROR: \(e)") }
     print("\n\(turn.answer)")
+}
+
+/// At most one progress line every few seconds, from whichever thread reports progress.
+final class PrintThrottle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last = Date.distantPast
+    func due(seconds: TimeInterval, always: Bool = false) -> Bool {
+        lock.withLock {
+            guard always || Date().timeIntervalSince(last) > seconds else { return false }
+            last = Date()
+            return true
+        }
+    }
 }
 
 await run()

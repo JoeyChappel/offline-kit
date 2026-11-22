@@ -28,21 +28,58 @@ struct CalculatorsSection: View {
     /// Opens Power out, for its generator safety section.
     let openPowerOut: () -> Void
 
+    @State private var wide = false
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            ChipRow(items: Calculator.allCases, selection: $selection, label: \.label, symbol: \.symbol)
-            switch selection {
-            case .water: WaterCalculator()
-            case .generator: GeneratorCalculator(openPowerOut: openPowerOut)
-            case .solar: SolarCalculator()
-            case .units: UnitsCalculator()
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Calculators").font(.title.bold())
+                Text("Choose a tool, then work with its inputs and results.").font(.callout).foregroundStyle(.secondary)
+            }
+            HStack(alignment: .top, spacing: 18) {
+                if wide { toolList.frame(width: 230) }
+                VStack(alignment: .leading, spacing: 16) {
+                    if !wide {
+                        Picker("Tool", selection: $selection) {
+                            ForEach(Calculator.allCases) { Label($0.label, systemImage: $0.symbol).tag($0) }
+                        }.pickerStyle(.menu)
+                    }
+                    calculator
+                }.frame(maxWidth: .infinity, alignment: .leading)
             }
         }
+        .onGeometryChange(for: Bool.self) { $0.size.width >= 900 } action: { wide = $0 }
         #if DEBUG
         // Test hook: -calculator generator opens that calculator.
         .task { if let raw = UserDefaults.standard.string(forKey: "calculator"), let c = Calculator(rawValue: raw) { selection = c } }
         #endif
     }
+
+    private var toolList: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Tools").font(.headline).padding(.bottom, 4)
+            ForEach(Calculator.allCases) { tool in
+                let on = tool == selection
+                Button { selection = tool } label: {
+                    Label(tool.label, systemImage: tool.symbol).font(.callout.weight(.medium))
+                        .frame(maxWidth: .infinity, alignment: .leading).padding(10)
+                        .foregroundStyle(on ? Color.white : Design.ink)
+                        .background(on ? Color.accentColor : Design.canvas, in: RoundedRectangle(cornerRadius: 9))
+                        .overlay { RoundedRectangle(cornerRadius: 9).stroke(on ? Color.clear : Design.border) }
+                }.buttonStyle(.plain).accessibilityAddTraits(on ? .isSelected : [])
+            }
+        }.card(padding: 14)
+    }
+
+    @ViewBuilder private var calculator: some View {
+        switch selection {
+        case .water: WaterCalculator()
+        case .generator: GeneratorCalculator(openPowerOut: openPowerOut)
+        case .solar: SolarCalculator()
+        case .units: UnitsCalculator()
+        }
+    }
+
 }
 
 // MARK: - Shared pieces
@@ -664,7 +701,10 @@ private struct UnitsCalculator: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            ChipRow(items: UnitKind.allCases, selection: $kind, label: \.label, symbol: \.symbol)
+            Text("Unit conversions").font(.title2.bold())
+            Picker("Convert", selection: $kind) {
+                ForEach(UnitKind.allCases) { Label($0.label, systemImage: $0.symbol).tag($0) }
+            }.pickerStyle(.menu)
             if kind == .fuel {
                 FuelCalculator()
             } else {
@@ -682,16 +722,14 @@ private struct UnitsCalculator: View {
         let units = kind.units
         let source = units[min(from, units.count - 1)]
         let value = Measurement(value: amount ?? 0, unit: source.1)
-        return SectionCard(symbol: kind.symbol, title: kind.label) {
-            HStack {
-                NumberInput(label: "Amount", value: $amount, width: 130, allowNegative: kind == .temperature)
-                Picker("From", selection: $from) {
-                    ForEach(units.indices, id: \.self) { Text(units[$0].0).tag($0) }
+        return VStack(alignment: .leading, spacing: 16) {
+            SectionCard(symbol: kind.symbol, title: "Amount to convert") {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 16) { amountInput.frame(minWidth: 220); fromPicker.frame(minWidth: 160) }
+                    VStack(alignment: .leading, spacing: 12) { amountInput; fromPicker }
                 }
-                .labelsHidden().fixedSize()
             }
-            Divider()
-            VStack(alignment: .leading, spacing: 6) {
+            SectionCard(symbol: "equal", title: "Equivalent amounts") {
                 ForEach(units.indices, id: \.self) { i in
                     if i != from {
                         HStack {
@@ -703,9 +741,17 @@ private struct UnitsCalculator: View {
                     }
                 }
             }
-            Divider()
-            FormulaNote(formula: formula, assumptions: assumptions)
+            FormulaNote(formula: formula, assumptions: assumptions).card(padding: 18)
         }
+    }
+
+    private var amountInput: some View {
+        NumberInput(label: "Amount", value: $amount, width: 130, allowNegative: kind == .temperature)
+    }
+    private var fromPicker: some View {
+        Picker("From", selection: $from) {
+            ForEach(kind.units.indices, id: \.self) { Text(kind.units[$0].0).tag($0) }
+        }.pickerStyle(.menu)
     }
 
     private var formula: [String] {

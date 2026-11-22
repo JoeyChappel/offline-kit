@@ -26,6 +26,78 @@ enum LlamaError: LocalizedError {
     }
 }
 
+/// llama.cpp settings for the built-in model and any model the person adds. One place, so they're easy to tune
+/// and measure (okit --llama-bench; DEBUG builds read OFFLINEKIT_LLAMA overrides, e.g. "fa=0,kv=f16,ub=256").
+struct LlamaTuning: Sendable, Equatable, CustomStringConvertible {
+    var gpuLayers: Int32
+    var flashAttention: llama_flash_attn_type
+    /// Key and value cache type: f16, or q8_0 (half the memory).
+    var cacheType: ggml_type
+    var batch: UInt32
+    var ubatch: UInt32
+    /// CPU threads for generation and for prompts (only what isn't on the GPU runs on them).
+    var threads: Int32
+    var threadsBatch: Int32
+    /// Full-size sliding-window cache (llama.cpp's default); off keeps only the window.
+    var swaFull: Bool
+    var opOffload: Bool
+    var loadMode: llama_load_mode
+
+    /// Measured with Gemma 4 E4B on an M4 Pro (okit --llama-bench, 15 questions, 1,000 to 1,500-token prompts):
+    /// flash attention (auto turns it on with Metal) is 4% faster to the first word and 200 MB smaller than off;
+    /// a 512-token micro-batch beats 256 slightly and 1,024 or 2,048 by 25%; 4 CPU threads beat 1 and 8; op offload
+    /// helps; and a sliding-window cache sized to the window instead of the whole context saves 280 MB (and makes
+    /// the saved instructions smaller) at the same speed, with identical answers. A q8_0 cache saves another 80 MB
+    /// but generates 7% slower and changed 2 of 15 answers, so it stays f16. mmap keeps the weights out of the
+    /// app's footprint (6.8 GB without it). Not measured on iPhone or iPad: they keep the same settings, all of
+    /// which use less memory than llama.cpp's defaults or the same.
+    static var platformDefault: LlamaTuning {
+        let cores = Int32(max(1, ProcessInfo.processInfo.activeProcessorCount))
+        #if targetEnvironment(simulator)
+        // The simulator's Metal is too limited for this: everything on the CPU.
+        return LlamaTuning(gpuLayers: 0, flashAttention: LLAMA_FLASH_ATTN_TYPE_AUTO, cacheType: GGML_TYPE_F16,
+                           batch: 2048, ubatch: 512, threads: min(4, cores), threadsBatch: min(4, cores),
+                           swaFull: false, opOffload: true, loadMode: LLAMA_LOAD_MODE_MMAP)
+        #else
+        return LlamaTuning(gpuLayers: 999, flashAttention: LLAMA_FLASH_ATTN_TYPE_AUTO, cacheType: GGML_TYPE_F16,
+                           batch: 2048, ubatch: 512, threads: min(4, cores), threadsBatch: min(4, cores),
+                           swaFull: false, opOffload: true, loadMode: LLAMA_LOAD_MODE_MMAP)
+        #endif
+    }
+
+    static let current: LlamaTuning = {
+        var t = platformDefault
+        #if DEBUG
+        // Test hook: OFFLINEKIT_LLAMA="fa=1,kv=q8_0,b=2048,ub=1024,t=4,tb=4,swa=0,op=1,load=mmap,ngl=999"
+        for pair in (ProcessInfo.processInfo.environment["OFFLINEKIT_LLAMA"] ?? "").split(separator: ",") {
+            let kv = pair.split(separator: "=", maxSplits: 1).map(String.init)
+            guard kv.count == 2 else { continue }
+            let (key, value) = (kv[0], kv[1])
+            switch key {
+            case "fa": t.flashAttention = value == "auto" ? LLAMA_FLASH_ATTN_TYPE_AUTO : (value == "1" ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED)
+            case "kv": t.cacheType = value == "q8_0" ? GGML_TYPE_Q8_0 : (value == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16)
+            case "b": t.batch = UInt32(value) ?? t.batch
+            case "ub": t.ubatch = UInt32(value) ?? t.ubatch
+            case "t": t.threads = Int32(value) ?? t.threads
+            case "tb": t.threadsBatch = Int32(value) ?? t.threadsBatch
+            case "swa": t.swaFull = value == "1"
+            case "op": t.opOffload = value == "1"
+            case "ngl": t.gpuLayers = Int32(value) ?? t.gpuLayers
+            case "load": t.loadMode = llama_load_mode_from_str(value)
+            default: break
+            }
+        }
+        #endif
+        return t
+    }()
+
+    var description: String {
+        let fa = flashAttention == LLAMA_FLASH_ATTN_TYPE_AUTO ? "auto" : (flashAttention == LLAMA_FLASH_ATTN_TYPE_ENABLED ? "on" : "off")
+        let kv = cacheType == GGML_TYPE_Q8_0 ? "q8_0" : (cacheType == GGML_TYPE_Q4_0 ? "q4_0" : "f16")
+        return "ngl=\(gpuLayers) fa=\(fa) kv=\(kv) b=\(batch) ub=\(ubatch) t=\(threads)/\(threadsBatch) swaFull=\(swaFull) opOffload=\(opOffload) load=\(String(cString: llama_load_mode_name(loadMode)))"
+    }
+}
+
 /// Keeps one model loaded (loading takes seconds) and runs one generation at a time.
 final class LlamaRuntime: @unchecked Sendable {
     static let shared = LlamaRuntime()
@@ -120,19 +192,24 @@ final class LlamaRuntime: @unchecked Sendable {
     private func load(path: String, contextTokens: Int32, custom: Bool) throws {
         if loadedPath == path, self.contextTokens == UInt32(contextTokens), context != nil { return }
         unload()
+        let tuning = LlamaTuning.current
         var params = llama_model_default_params()
-        #if targetEnvironment(simulator)
-        params.n_gpu_layers = 0          // the simulator's Metal is too limited for this
-        #else
-        params.n_gpu_layers = 999        // everything on the GPU (Metal)
-        #endif
+        params.n_gpu_layers = tuning.gpuLayers
+        params.load_mode = tuning.loadMode
         guard let model = llama_model_load_from_file(path, params) else {
             throw custom ? LlamaError.loadFailedCustom(URL(fileURLWithPath: path).lastPathComponent) : LlamaError.loadFailed(path)
         }
         var cparams = llama_context_default_params()
         cparams.n_ctx = UInt32(contextTokens)
-        cparams.n_batch = 2048
-        cparams.n_ubatch = 512
+        cparams.n_batch = tuning.batch
+        cparams.n_ubatch = tuning.ubatch
+        cparams.n_threads = tuning.threads
+        cparams.n_threads_batch = tuning.threadsBatch
+        cparams.flash_attn_type = tuning.flashAttention
+        cparams.type_k = tuning.cacheType
+        cparams.type_v = tuning.cacheType
+        cparams.swa_full = tuning.swaFull
+        cparams.op_offload = tuning.opOffload
         guard let context = llama_init_from_model(model, cparams) else {
             llama_model_free(model)
             throw LlamaError.contextFailed
@@ -207,7 +284,7 @@ final class LlamaRuntime: @unchecked Sendable {
         var batch = Array(tokens)
         var offset = 0
         while offset < batch.count {
-            let count = min(2048, batch.count - offset)
+            let count = min(Int(llama_n_batch(context)), batch.count - offset)
             let status = batch.withUnsafeMutableBufferPointer { buf in
                 llama_decode(context, llama_batch_get_one(buf.baseAddress! + offset, Int32(count)))
             }
@@ -252,6 +329,13 @@ final class LlamaRuntime: @unchecked Sendable {
     #if DEBUG
     /// Tokens in the last prompt, and how many of them came from the saved instructions (for the benchmark).
     nonisolated(unsafe) static var lastPrefill: (total: Int, reused: Int) = (0, 0)
+    /// Where the last generation's time went, in milliseconds (for the benchmark): evaluating the prompt (restoring
+    /// the instructions included), until the first visible text, and the answer's tokens after the first.
+    struct Timings: Sendable { var prefillMs = 0.0, firstTextMs = 0.0, tokens = 0, generateMs = 0.0, sampleMs = 0.0, gpuWaitMs = 0.0, restoreMs = 0.0 }
+    nonisolated(unsafe) static var lastTimings = Timings()
+    /// Test hook: wait for the GPU after the prompt and before each token, so `lastTimings` splits the time
+    /// accurately (decoding otherwise runs on while the CPU moves on).
+    nonisolated(unsafe) static var measuresTimings = false
     /// Test hook: false evaluates every prompt whole, the way it was before instructions were saved.
     nonisolated(unsafe) static var reusesInstructions = true
 
@@ -293,6 +377,12 @@ final class LlamaRuntime: @unchecked Sendable {
         // Start from the instructions' saved state when this prompt begins with them; otherwise evaluate them first
         // and save that state for the next question. Either way the same tokens are evaluated in the same two steps
         // (instructions, then the rest), so the answer doesn't depend on whether the state was saved.
+        #if DEBUG
+        let began = DispatchTime.now().uptimeNanoseconds
+        func ms(since t: UInt64) -> Double { Double(DispatchTime.now().uptimeNanoseconds - t) / 1e6 }
+        var timings = Timings()
+        defer { Self.lastTimings = timings }
+        #endif
         let memory = llama_get_memory(context)
         llama_memory_clear(memory, true)
         var start = 0
@@ -306,6 +396,9 @@ final class LlamaRuntime: @unchecked Sendable {
         } else if let saved = prefixes.first(where: { tokens.count > $0.tokens.count && tokens.starts(with: $0.tokens) }) {
             let restored = saved.state.withUnsafeBufferPointer { llama_state_seq_set_data(context, $0.baseAddress, $0.count, 0) }
             if restored > 0 { start = saved.tokens.count } else { llama_memory_clear(memory, true) }
+            #if DEBUG
+            timings.restoreMs = ms(since: began)
+            #endif
         } else if let prefix = instructionTokens(system: system, custom: custom, vocab: vocab),
                   tokens.count > prefix.count, tokens.starts(with: prefix) {
             guard try decode(tokens[..<prefix.count], context: context, isCancelled: isCancelled) else { return }
@@ -316,6 +409,11 @@ final class LlamaRuntime: @unchecked Sendable {
         Self.lastPrefill = (tokens.count, start)
         #endif
         guard try decode(tokens[start...], context: context, isCancelled: isCancelled) else { return }
+        #if DEBUG
+        if Self.measuresTimings { llama_synchronize(context) }
+        timings.prefillMs = ms(since: began)
+        let generating = DispatchTime.now().uptimeNanoseconds
+        #endif
 
         let sampler = llama_sampler_chain_init(llama_sampler_chain_default_params())
         defer { llama_sampler_free(sampler) }
@@ -334,22 +432,56 @@ final class LlamaRuntime: @unchecked Sendable {
             llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED))
         }
 
+        // Per token: sample, append its bytes, start the next token on the GPU, and only then (while the GPU works)
+        // hand the text over, at most every 50 ms once the reader has something to see. Until then every token is
+        // passed on, so the first words appear the moment there are any (the first tokens are often whitespace
+        // or a hidden "thinking" marker).
         var bytes: [UInt8] = []
+        bytes.reserveCapacity(maxTokens * 4)
         var piece = [CChar](repeating: 0, count: 256)
-        var lastEmit = Date.distantPast
+        var lastEmit: UInt64 = 0
+        var showing = false
+        let interval: UInt64 = 50_000_000
         for _ in 0..<maxTokens {
             if isCancelled() { break }
+            #if DEBUG
+            let waiting = DispatchTime.now().uptimeNanoseconds
+            if Self.measuresTimings { llama_synchronize(context) }
+            timings.gpuWaitMs += ms(since: waiting)
+            let sampling = DispatchTime.now().uptimeNanoseconds
+            #endif
             var token = llama_sampler_sample(sampler, context, -1)
+            #if DEBUG
+            timings.sampleMs += ms(since: sampling)
+            #endif
             if llama_vocab_is_eog(vocab, token) { break }
-            let n = llama_token_to_piece(vocab, token, &piece, Int32(piece.count), 0, false)
-            if n > 0 { bytes.append(contentsOf: piece.prefix(Int(n)).map { UInt8(bitPattern: $0) }) }
-            if Date().timeIntervalSince(lastEmit) > 0.05 {
-                lastEmit = Date()
-                onText(Self.visibleAnswer(String(decoding: bytes, as: UTF8.self)))
+            var n = llama_token_to_piece(vocab, token, &piece, Int32(piece.count), 0, false)
+            if n < 0 {
+                piece = [CChar](repeating: 0, count: Int(-n))
+                n = llama_token_to_piece(vocab, token, &piece, Int32(piece.count), 0, false)
             }
+            if n > 0 { piece.withUnsafeBytes { bytes.append(contentsOf: $0.prefix(Int(n))) } }
             let status = llama_decode(context, llama_batch_get_one(&token, 1))
             guard status == 0 else { throw LlamaError.decodeFailed(status) }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if !showing || now - lastEmit >= interval {
+                let text = Self.visibleAnswer(String(decoding: bytes, as: UTF8.self))
+                if showing || text.contains(where: { !$0.isWhitespace }) {
+                    #if DEBUG
+                    if !showing { timings.firstTextMs = ms(since: began) }
+                    #endif
+                    showing = true
+                    lastEmit = now
+                    onText(text)
+                }
+            }
+            #if DEBUG
+            timings.tokens += 1
+            #endif
         }
+        #if DEBUG
+        timings.generateMs = ms(since: generating)
+        #endif
         onText(Self.visibleAnswer(String(decoding: bytes, as: UTF8.self)).trimmingCharacters(in: .whitespacesAndNewlines))
     }
 }

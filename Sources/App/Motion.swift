@@ -86,6 +86,8 @@ private struct HoverLift: ViewModifier {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var hovering = false
     var scale: CGFloat
+    /// The card's own copy of "pointer is over me" (for its border), fed by this one hover area.
+    var external: Binding<Bool>? = nil
 
     func body(content: Content) -> some View {
         content
@@ -93,7 +95,10 @@ private struct HoverLift: ViewModifier {
             .shadow(color: .black.opacity(hovering ? 0.28 : 0), radius: hovering ? 14 : 0, y: hovering ? 8 : 0)
             .animation(Motion.quick, value: hovering)
             #if os(macOS)
-            .onHover { hovering = $0 }
+            .onHover { hovering = $0; if external?.wrappedValue != $0 { external?.wrappedValue = $0 } }
+            #else
+            // iPad pointer: only the card's own border follows it (nothing lifts off Mac).
+            .onHover { if external?.wrappedValue != $0 { external?.wrappedValue = $0 } }
             #endif
     }
 }
@@ -101,8 +106,15 @@ private struct HoverLift: ViewModifier {
 /// Content fades and rises into place the first time it appears.
 private struct AppearFade: ViewModifier {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var shown = false
+    @State private var shown: Bool
     var delay: Double
+
+    /// `enabled: false` shows the content at once, for cards that come into view while scrolling (every fade is an
+    /// animation the whole screen is redrawn for on each frame, so a long scroll through shelves added up).
+    init(delay: Double, enabled: Bool) {
+        self.delay = delay
+        _shown = State(initialValue: !enabled)
+    }
 
     func body(content: Content) -> some View {
         content
@@ -118,6 +130,8 @@ private struct AppearFade: ViewModifier {
 extension View {
     /// A small lift and shadow under the pointer.
     func hoverLift(_ scale: CGFloat = 1.03) -> some View { modifier(HoverLift(scale: scale)) }
+    /// The same, for a card that also needs to know it is hovered: one hover area instead of two.
+    func hoverLift(_ scale: CGFloat = 1.03, hovering: Binding<Bool>) -> some View { modifier(HoverLift(scale: scale, external: hovering)) }
     /// Fade and rise into place on first appearance.
-    func appearFade(delay: Double = 0) -> some View { modifier(AppearFade(delay: delay)) }
+    func appearFade(delay: Double = 0, enabled: Bool = true) -> some View { modifier(AppearFade(delay: delay, enabled: enabled)) }
 }

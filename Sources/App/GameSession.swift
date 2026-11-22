@@ -152,9 +152,22 @@ struct Game: Identifiable, Hashable {
     /// When the saved place and its picture last changed, as of the last scan. Part of equality, so a new save
     /// redraws cards and detail screens (they read the save files from disk).
     private(set) var savedStamp: Double = 0
+    /// The card and list title, worked out once (it is a regex, and shelves ask for it for every game on every redraw).
+    let title: String
+    /// Where this game's saves start ("…/Games/Saves/Tetris.gb"), worked out once for the same reason.
+    private let saveBasePath: String
     init(url: URL, system: GameSystem) {
-        self.url = url.standardizedFileURL.resolvingSymlinksInPath()
+        let url = url.standardizedFileURL.resolvingSymlinksInPath()
+        self.url = url
         self.system = system
+        let base = system == .scummvm && url.pathExtension.lowercased() != "scummvm"
+            ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
+        title = base
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: #"\s*[\(\[].*?[\)\]]"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+        saveBasePath = GameLibrary.gamesRoot(containing: url).appending(path: "Saves", directoryHint: .isDirectory)
+            .appending(path: url.lastPathComponent).path
     }
     var id: String { url.path }
     var ref: GameRef { GameRef(path: url.path) }
@@ -163,13 +176,6 @@ struct Game: Identifiable, Hashable {
     private var baseName: String {
         system == .scummvm && url.pathExtension.lowercased() != "scummvm"
             ? url.lastPathComponent : url.deletingPathExtension().lastPathComponent
-    }
-
-    var title: String {
-        baseName
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: #"\s*[\(\[].*?[\)\]]"#, with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespaces)
     }
 
     /// Saves live in a "Saves" folder beside the games, so they travel with the drive. They're named after the whole
@@ -191,10 +197,15 @@ struct Game: Identifiable, Hashable {
     /// The newer save and when it was written, from one look at the disk (shelves need both for every game).
     var resumeState: (url: URL, date: Date)? {
         guard system.hasSaveStates else { return nil }
-        return [stateURL, autosaveURL].compactMap { url -> (url: URL, date: Date)? in
-            guard let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { return nil }
-            return (url, date)
-        }.max { $0.date < $1.date }
+        // Two stat calls on plain paths: shelves ask for every game on each redraw. On a tie the saved place wins.
+        var best: (path: String, date: Date)?
+        for path in [saveBasePath + ".state", saveBasePath + ".autosave"] {
+            var info = stat()
+            guard stat(path, &info) == 0 else { continue }
+            let date = Date(timeIntervalSince1970: Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1_000_000_000)
+            if best == nil || date > best!.date { best = (path, date) }
+        }
+        return best.map { (URL(fileURLWithPath: $0.path), $0.date) }
     }
 
     /// Saves from before they were named after the whole file name ("Tetris.srm") move to the new names. When two

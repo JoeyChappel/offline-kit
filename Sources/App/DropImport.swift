@@ -481,8 +481,10 @@ private struct DropImportSheet: View {
                 .frame(maxWidth: .infinity, minHeight: 120)
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 8) {
-                        ForEach($importer.items) { $item in row($item) }
+                    VStack(alignment: .leading, spacing: 16) {
+                        reviewGroup(.ready)
+                        reviewGroup(.duplicate)
+                        reviewGroup(.unsupported)
                     }
                 }
                 .frame(minHeight: 120, maxHeight: 360)
@@ -490,17 +492,27 @@ private struct DropImportSheet: View {
             footer
         }
         .padding(24)
-        .frame(minWidth: 560)
+        .frame(minWidth: 640, idealWidth: 700)
         .interactiveDismissDisabled(importer.copying)
+        .onChange(of: importer.destination) {
+            // Replacement consent belongs to the destination shown in this review.
+            guard !importer.copying, !importer.done else { return }
+            for index in importer.items.indices { importer.items[index].replace = false }
+        }
     }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(importer.done ? "Added to your kit" : importer.looking ? "Looking at what you dropped" : "Add \(importer.toCopy.count) \(importer.toCopy.count == 1 ? "item" : "items") to your kit?")
+            Text(importer.done ? "Import complete" : importer.looking ? "Looking at what you dropped" : "Add files to your kit")
                 .font(.title2.bold())
             if !importer.done && !importer.looking {
                 Text("Each file goes where it belongs. Change anything that looks wrong.")
                     .foregroundStyle(.secondary)
+                FlowLayout(spacing: 8) {
+                    Pill(text: "\(importer.toCopy.count) ready to add", symbol: "plus", tint: .accentColor)
+                    Pill(text: "\(count(.duplicate)) already saved", symbol: "checkmark.circle")
+                    Pill(text: "\(count(.unsupported)) unsupported", symbol: "questionmark.circle")
+                }
                 Picker("Save to", selection: $importer.destination) {
                     ForEach(importer.locations) { location in
                         Label("\(location.name) · \(ByteCountFormatter.string(fromByteCount: location.cachedFreeSpace, countStyle: .file)) free",
@@ -508,16 +520,54 @@ private struct DropImportSheet: View {
                     }
                 }
                 .disabled(importer.copying)
-                Toggle(isOn: $importer.moveOriginals) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text("Move instead of copy")
-                        Text("The originals go to the Trash once each copy is complete.")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
+                ViewThatFits(in: .horizontal) {
+                    HStack(alignment: .top, spacing: 18) { transferChoice.frame(width: 190); transferExplanation }
+                    VStack(alignment: .leading, spacing: 10) { transferChoice.frame(maxWidth: 260); transferExplanation }
                 }
-                .disabled(importer.copying)
+
             }
         }
+    }
+
+    private enum ReviewGroup { case ready, duplicate, unsupported }
+
+    private func belongs(_ item: ImportItem, to group: ReviewGroup) -> Bool {
+        switch group {
+        case .ready: item.kind != .unsupported && !item.skipped
+        case .duplicate: item.kind != .unsupported && item.skipped
+        case .unsupported: item.kind == .unsupported
+        }
+    }
+    private func count(_ group: ReviewGroup) -> Int { importer.items.filter { belongs($0, to: group) }.count }
+
+    @ViewBuilder private func reviewGroup(_ group: ReviewGroup) -> some View {
+        let total = count(group)
+        if total > 0 {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("\(group == .ready ? (importer.done ? "Selected for import" : "Ready to add") : group == .duplicate ? "Already saved · Skipped" : "Unsupported · Skipped") · \(total)")
+                    .font(.headline).padding(.horizontal, 10).padding(.top, 8)
+                ForEach($importer.items) { $item in
+                    if belongs(item, to: group) { row($item) }
+                }
+            }.padding(8)
+                .background(group == .ready ? Color.accentColor.opacity(0.05) : Color.secondary.opacity(0.04), in: RoundedRectangle(cornerRadius: 14))
+        }
+    }
+
+    private var transferChoice: some View {
+        Picker("Transfer", selection: $importer.moveOriginals) {
+            Text("Copy").tag(false)
+            Text("Move").tag(true)
+        }.pickerStyle(.segmented).disabled(importer.copying)
+    }
+
+    private var transferExplanation: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(importer.moveOriginals ? "Move removes originals from their current location." : "Copy keeps your original files where they are.")
+                .font(.callout.weight(.medium))
+            Text("When moving between drives, each original goes to the Trash only after its copy is checked.")
+                .font(.caption).foregroundStyle(.secondary)
+        }.fixedSize(horizontal: false, vertical: true)
     }
 
     private func row(_ item: Binding<ImportItem>) -> some View {
@@ -535,20 +585,26 @@ private struct DropImportSheet: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if let copy = value.duplicateOf, value.kind.isMedia, !importer.done {
-                    Label("Already in your kit (Media › \(copy.replacingOccurrences(of: "/", with: " › "))), so it’s skipped.", systemImage: "checkmark.circle")
+                    Label("Already in your kit (Media › \(copy.replacingOccurrences(of: "/", with: " › "))). " + (value.skipped ? "Skipped to avoid a duplicate." : "You chose to add another copy."), systemImage: "checkmark.circle")
                         .font(.caption).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
                     Toggle(isOn: item.addAnyway) { Text("Add another copy anyway").font(.caption) }
                         .toggleStyle(.checkbox).disabled(importer.copying)
-                } else if exists && value.kind != .unsupported && !importer.done {
+                }
+                if exists && value.kind != .unsupported && !value.skipped && !importer.done {
                     Toggle(isOn: item.replace) {
-                        Text("Something with this name is already there. Replace it (otherwise both are kept)").font(.caption)
+                        Text("Replace the file with this name at the destination (otherwise both are kept)").font(.caption)
                     }
                     .toggleStyle(.checkbox).disabled(importer.copying)
+                    Text("Replacement removes the destination’s existing file. It is separate from adding a duplicate copy.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
             Spacer()
             if value.kind != .unsupported && !importer.done {
-                Picker("Type", selection: item.kind) {
+                Picker("Type", selection: Binding(get: { item.wrappedValue.kind }, set: {
+                    item.wrappedValue.kind = $0
+                    item.wrappedValue.replace = false
+                })) {
                     ForEach(ImportKind.allCases.filter { $0 != .unsupported }) { Text($0.label).tag($0) }
                 }
                 .labelsHidden().fixedSize()
@@ -589,14 +645,14 @@ private struct DropImportSheet: View {
                 }
             }
             HStack {
-                Text(importer.done || importer.looking ? "" : importer.checking ? "Checking what’s already in your kit…" : "\(ByteCountFormatter.string(fromByteCount: importer.totalBytes, countStyle: .file)) to copy")
+                Text(importer.done || importer.looking ? "" : importer.checking ? "Checking what’s already in your kit…" : "\(importer.toCopy.count) \(importer.toCopy.count == 1 ? "item" : "items") · \(ByteCountFormatter.string(fromByteCount: importer.totalBytes, countStyle: .file)) to \(importer.moveOriginals ? "move" : "copy")")
                     .font(.callout).foregroundStyle(.secondary)
                 Spacer()
                 if importer.done {
                     Button("Done") { dismiss() }.keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
                 } else {
                     Button("Cancel", role: .cancel) { dismiss() }.disabled(importer.copying)
-                    Button(importer.moveOriginals ? "Move to Kit" : "Add to Kit") {
+                    Button("\(importer.moveOriginals ? "Move" : "Add") \(importer.toCopy.count) \(importer.toCopy.count == 1 ? "item" : "items")") {
                         // A one-off choice here never changes where the kit lives; only Get Resources and setup do.
                         Task { await importer.run(library: library, media: media, games: games) }
                     }

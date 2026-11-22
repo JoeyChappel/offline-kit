@@ -131,7 +131,23 @@ function bookPlace(b){
 }
 
 // ---- Pieces ----
-function art(item, url, extra){
+// Artwork from the Mac comes in phone-sized copies (?w=, see ShareArtwork): `sizes` is the tile's width on screen, so the
+// browser picks the copy that fills it at this screen's pixel density instead of the full-size cover.
+const ART_WIDTHS = [160, 320, 480, 640, 960, 1280];
+const SZ = {card:'(min-width:768px) 280px, 248px', square:'(min-width:768px) 190px, 160px', cover:'(min-width:768px) 156px, 136px',
+  game:'150px', round:'(min-width:768px) 190px, 160px', wide:'112px', tall:'60px', thumb:'72px', upnext:'120px',
+  pcover:'min(70vw, 300px)', coverhead:'min(52vw, 220px)', coversq:'min(64vw, 280px)', hero:'calc(100vw - 40px)', back:'100vw'};
+function setArt(img, url, sizes){
+  const u = safeURL(url);
+  if (sizes && /^\/(media\/[^?#]+\/(thumb|cover)|api\/games\/art\/)/.test(u)) {
+    const join = u.includes('?') ? '&' : '?';
+    img.sizes = sizes;
+    img.srcset = ART_WIDTHS.map(w => `${u}${join}w=${w} ${w}w`).join(', ');
+  }
+  img.src = u;
+  return img;
+}
+function art(item, url, extra, sizes){
   const box = el('div', {className:'art' + (extra ? ' ' + extra : '')});
   box.style.background = poster(item.title);
   const ph = el('span', {className:'ph'}, item.title || '');
@@ -140,7 +156,7 @@ function art(item, url, extra){
     const img = el('img', {alt:'', loading:'lazy', decoding:'async'});
     img.onload = () => ph.remove();
     img.onerror = () => img.remove();
-    img.src = safeURL(url);
+    setArt(img, url, sizes || SZ[extra] || SZ.card);
     box.append(img);
   }
   return box;
@@ -149,7 +165,7 @@ const bar = f => el('div', {className:'bar'}, el('i', {style:`width:${(clamp01(f
 
 function mediaCard(it){
   const audio = it.kind === 'audio';
-  const a = art(it, it.thumb || it.cover);
+  const a = art(it, it.thumb || it.cover, null, audio ? SZ.square : SZ.card);
   const f = fraction(it);
   if (f != null) a.append(bar(f));
   else if (it.progress?.finished) a.append(el('span', {className:'tag r'}, audio ? '✓ Played' : '✓ Watched'));
@@ -159,7 +175,7 @@ function mediaCard(it){
     a, el('b', {}, it.title), el('small', {}, audio ? (it.artist || it.meta || '') : (it.meta || '')));
 }
 function bookCard(b){
-  const a = art(b, b.thumb);
+  const a = art(b, b.thumb, null, SZ.cover);
   if (b.fraction != null && bookStarted(b)) a.append(bar(b.fraction));
   if (b.progress?.finished) a.append(el('span', {className:'tag r'}, '✓'));
   if (b.format === 'pdf') a.append(el('span', {className:'tag'}, 'PDF'));
@@ -170,7 +186,7 @@ function bookCard(b){
 const systemName = g => g.systemName || g.system || '';
 function refreshGames(){ delete inflight.games; loadGames().then(rerender).catch(() => {}); }
 function gameCard(g, resume){
-  const a = art(g, g.art);
+  const a = art(g, g.art, null, SZ.game);
   if (g.canResume) a.append(el('span', {className:'tag'}, 'Resume'));
   return el('button', {className:'card game', onclick:() => openGame(g, resume ?? !!g.canResume), 'aria-label':`${g.title}, ${systemName(g) || 'game'}`},
     a, el('b', {}, g.title), el('small', {}, systemName(g)));
@@ -197,7 +213,8 @@ function continueCard(entry){
     url = it.art; label = 'PLAYING'; place = systemName(it);
     onclick = () => openGame(it, !!it.canResume);
   }
-  const a = art(it, url, type === 'media' && it.kind === 'video' ? 'wide' : type === 'book' ? 'tall' : '');
+  const shape = type === 'media' && it.kind === 'video' ? 'wide' : type === 'book' ? 'tall' : '';
+  const a = art(it, url, shape, SZ[shape || 'thumb']);
   return el('button', {className:'ccard', onclick, 'aria-label':`Continue ${it.title}`}, a,
     el('span', {className:'tx'}, el('small', {}, label), el('b', {}, it.title), el('span', {className:'pl'}, place),
       f != null ? el('span', {className:'mbar'}, el('i', {style:`width:${(clamp01(f) * 100).toFixed(1)}%`})) : null));
@@ -507,7 +524,7 @@ function hero(it){
   const f = fraction(it), resuming = f != null;
   const img = it.thumb || it.cover;
   return el('button', {className:'hero', onclick:() => push(mediaDetailPage(it)), 'aria-label':`${resuming ? 'Resume' : 'Play'} ${it.title}`},
-    img ? el('img', {src:safeURL(img), alt:'', decoding:'async'}) : null,
+    img ? setArt(el('img', {alt:'', decoding:'async'}), img, SZ.hero) : null,
     el('div', {className:'in'}, el('div', {className:'eb'}, resuming ? 'PICK UP WHERE YOU LEFT OFF' : 'READY WHEN YOU ARE'),
       el('h3', {}, it.title), el('p', {}, it.meta || ''), resuming ? el('div', {className:'bar'}, el('i', {style:`width:${(f * 100).toFixed(1)}%`})) : null,
       el('span', {className:'go'}, icon('playfill', 'fill'), resuming ? 'Resume' : 'Play')));
@@ -606,8 +623,8 @@ function mediaDetailPage(item){
     const it = S.byId.get(item.id) || item;
     const f = fraction(it), music = it.category === 'music';
     const header = isVideo
-      ? el('div', {className:'dhead'}, el('div', {className:'back'}, it.thumb || it.cover ? el('img', {src:safeURL(it.thumb || it.cover), alt:'', decoding:'async'}) : null))
-      : el('div', {className:'dhead coverhead sq'}, art(it, it.thumb || it.cover));
+      ? el('div', {className:'dhead'}, el('div', {className:'back'}, it.thumb || it.cover ? setArt(el('img', {alt:'', decoding:'async'}), it.thumb || it.cover, SZ.back) : null))
+      : el('div', {className:'dhead coverhead sq'}, art(it, it.thumb || it.cover, null, SZ.coversq));
     if (isVideo && !(it.thumb || it.cover)) header.firstChild.style.background = poster(it.title);
     const info = el('div', {className:'dinfo'},
       el('div', {className:'k'}, music ? 'ALBUM' : it.category === 'audiobooks' ? 'AUDIOBOOK' : 'VIDEO'),
@@ -635,7 +652,7 @@ function mediaDetailPage(item){
     detailFor(it).then(d => {
       const next = S.byId.get(d.upNext);
       if (next) upNext.replaceChildren(el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, 'Up Next')),
-        el('button', {className:'upnext', onclick:() => push(mediaDetailPage(next))}, art(next, next.thumb || next.cover),
+        el('button', {className:'upnext', onclick:() => push(mediaDetailPage(next))}, art(next, next.thumb || next.cover, null, SZ.upnext),
           el('span', {}, el('small', {}, 'PLAYS NEXT'), el('b', {style:'display:block'}, next.title), el('small', {style:'display:block;letter-spacing:0;font-weight:400'}, next.meta || '')))));
       const more = (d.related || []).map(id => S.byId.get(id)).filter(Boolean);
       fill(related, shelf('More Like This', more.map(mediaCard)));
@@ -698,7 +715,7 @@ function bookDetailPage(book){
     const actions = el('div', {className:'btns'}, el('div', {className:'btn sk', style:'flex:1'}));
     const chapters = el('div');
     const nodes = [
-      el('div', {className:'dhead coverhead'}, art(b, b.thumb)),
+      el('div', {className:'dhead coverhead'}, art(b, b.thumb, null, SZ.coverhead)),
       el('div', {className:'dinfo'}, el('div', {className:'k'}, pdf ? 'PDF' : 'BOOK'), el('h1', {}, b.title),
         b.author ? el('p', {}, b.author) : null, el('p', {}, [b.genre, b.parts ? (pdf ? count(b.parts, 'page') : count(b.parts, 'chapter')) : null, b.year].filter(Boolean).join(' · ')),
         place ? el('div', {className:'prog'}, place) : null),

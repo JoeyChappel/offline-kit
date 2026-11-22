@@ -123,8 +123,7 @@ struct MediaCard: View {
         .foregroundStyle(MediaTheme.ink)
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .contentShape(Rectangle())
-        .hoverLift()
-        .onHover { hovering = $0 }
+        .hoverLift(hovering: $hovering)
         .animation(reduceMotion ? nil : Motion.quick, value: hovering)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityText)
@@ -146,6 +145,8 @@ struct MediaShelfRow: View {
     let shelf: MediaShelf
     let open: (MediaItem) -> Void
     var seeAll: (() -> Void)? = nil
+    /// False for shelves that are scrolled into view later: their cards show at once instead of fading in.
+    var animated = true
     @Environment(MediaLibrary.self) private var media
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -162,11 +163,14 @@ struct MediaShelfRow: View {
                             MediaCard(item: item, info: media.info[item.progressKey], progress: media.progress[item.progressKey])
                                 .frame(width: item.kind == .video ? 272 : MediaCatalog.category(item, media.info[item.progressKey]) == .music ? 180 : 152)
                         }.buttonStyle(.plain).mediaCardMenu(item)
-                            .appearFade(delay: min(Double(index), 6) * 0.04)
+                            .appearFade(delay: min(Double(index), 6) * 0.04, enabled: animated && index < 8)
                     }
                 }.scrollTargetLayout().padding(.horizontal, 24).padding(.vertical, 4)
             }.scrollTargetBehavior(.viewAligned)
         }
+        #if DEBUG
+        .onAppear { LaunchTiming.firstShelf() }
+        #endif
     }
 }
 

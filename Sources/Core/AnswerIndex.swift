@@ -39,11 +39,12 @@ enum AnswerIndexPolicy {
     }
 
     /// Rough index size per article, to skip a reference that can't fit before spending hours on it. A leads-only
-    /// index keeps the words but not the text (about 1.15 bytes per character of lead, measured on the test archives),
-    /// and reads a hit's lead back from the archive; at about 120 words a lead, that's roughly 1 KB an article,
-    /// so full English Wikipedia (6.8 million articles) needs about 7 GB.
+    /// index keeps the words but not the text, and reads a hit's lead back from the archive: 520 bytes an article
+    /// with its title index, for leads of about 700 characters (120 words at most), measured on a 300,000-article
+    /// test archive. Real leads use more distinct words, hence the margin: about 4.8 GB for full English Wikipedia
+    /// (6.8 million articles). The build still stops if the index outgrows the budget.
     static func estimatedBytes(articles: Int, depth: Depth) -> Int64 {
-        Int64(articles) * (depth == .full ? 20_000 : 1_000)
+        Int64(articles) * (depth == .full ? 20_000 : 700)
     }
 
     /// Most words kept from a lead in a leads-only index.
@@ -54,6 +55,22 @@ enum AnswerIndexPolicy {
     static func maxPassages(_ depth: Depth) -> Int { depth == .full ? 40 : 1 }
     /// Articles read and written per transaction. Small enough that pausing for a question is quick.
     static func chunk(_ depth: Depth) -> Int { depth == .full ? 60 : 400 }
+
+    /// Threads turning articles into passages: one on battery, a few on power (one more SQLite writer keeps up
+    /// with about three; measured on an M4 Pro). iPhone and iPad stay at two to keep cool while charging.
+    static func workers(plugged: Bool) -> Int {
+        #if DEBUG
+        // Test hook: OFFLINEKIT_INDEX_WORKERS=1 measures the battery path on power.
+        if let forced = ProcessInfo.processInfo.environment["OFFLINEKIT_INDEX_WORKERS"].flatMap(Int.init) { return max(1, forced) }
+        #endif
+        guard plugged else { return 1 }
+        let cores = ProcessInfo.processInfo.activeProcessorCount
+        #if os(macOS)
+        return min(3, max(1, cores / 3))
+        #else
+        return min(2, max(1, cores / 3))
+        #endif
+    }
 
     /// Sections that list sources or links rather than say anything.
     static let skippedSections: Set<String> = ["references", "external links", "see also", "further reading", "notes",
@@ -70,7 +87,7 @@ struct IndexHit: Sendable {
     /// Position in the article, for putting two passages of one article back in reading order.
     let order: Int
     /// BM25, larger is better (SQLite returns it negated).
-    let bm25: Double
+    var bm25: Double
     /// Question words the passage is sure to contain, from the query that found it. A leads-only index keeps no
     /// text (`text` is empty until the lead is read back), so this is what it's scored on.
     var matched: [String] = []
@@ -78,16 +95,21 @@ struct IndexHit: Sendable {
 
 /// One reference's passages in an SQLite FTS5 table.
 final class PassageStore: @unchecked Sendable {
-    static let version = "3"
+    static let version = "4"
     let url: URL
+    let depth: AnswerIndexPolicy.Depth
     private let lock = NSLock()
     private var db: SQLiteDB?
+    /// Words found to be common or not (see `isCommon`, `isCommonTitle`). Guarded by `lock`.
+    private var common: [String: Bool] = [:]
+    private var commonTitle: [String: Bool] = [:]
 
     /// A full index keeps each passage's text, so a hit needs nothing from the archive. A leads-only index is
     /// contentless: it keeps the words for searching (and the path, title and position) but not the text, which
     /// halves its size; a hit's lead is read back from the archive.
     init(url: URL, depth: AnswerIndexPolicy.Depth) throws {
         self.url = url
+        self.depth = depth
         let db = try SQLiteDB(url: url)
         let content = depth == .leads ? ", content='', contentless_unindexed=1" : ""
         try db.script("""
@@ -96,6 +118,13 @@ final class PassageStore: @unchecked Sendable {
             CREATE VIRTUAL TABLE IF NOT EXISTS passages USING fts5(title, heading, body, path UNINDEXED, lead UNINDEXED,
                 ord UNINDEXED, name UNINDEXED, tokenize='porter unicode61 remove_diacritics 2'\(content));
             """)
+        // A leads-only index (a huge reference) also keeps its titles on their own: see `titled`.
+        if depth == .leads {
+            try db.script("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS titles USING fts5(title, first UNINDEXED, last UNINDEXED,
+                    tokenize='porter unicode61 remove_diacritics 2', content='', contentless_unindexed=1);
+                """)
+        }
         self.db = db
     }
 
@@ -125,11 +154,18 @@ final class PassageStore: @unchecked Sendable {
             try db.transaction {
                 var added = 0
                 for article in articles {
+                    var first: Int64?
                     for p in article.passages {
                         try db.run("INSERT INTO passages(title, heading, body, path, lead, ord, name) VALUES (?, ?, ?, ?, ?, ?, ?)",
                                    [.text(article.title), .text(p.heading), .text(p.text), .text(article.path),
                                     .int(p.lead ? 1 : 0), .int(Int64(p.order)), .text(article.title)])
+                        if first == nil { first = db.lastInsertRowID }
                         added += 1
+                    }
+                    // The article's title on its own, pointing at its passages (inserted together, so their rowids run on).
+                    if depth == .leads, let first {
+                        try db.run("INSERT INTO titles(title, first, last) VALUES (?, ?, ?)",
+                                   [.text(article.title), .int(first), .int(db.lastInsertRowID)])
                     }
                 }
                 var count = 0
@@ -143,7 +179,13 @@ final class PassageStore: @unchecked Sendable {
 
     /// Merges the index's segments once it's complete, and gives the space they used back: smaller and faster to search.
     func optimize() {
-        lock.withLock { try? db?.script("INSERT INTO passages(passages) VALUES('optimize'); PRAGMA incremental_vacuum;") }
+        lock.withLock {
+            try? db?.script("""
+                INSERT INTO passages(passages) VALUES('optimize');
+                \(depth == .leads ? "INSERT INTO titles(titles) VALUES('optimize');" : "")
+                PRAGMA incremental_vacuum;
+                """)
+        }
     }
 
     var bytes: Int64 { Self.fileBytes(url) }
@@ -155,19 +197,29 @@ final class PassageStore: @unchecked Sendable {
         }
     }
 
-    /// BM25 search, narrow to broad like Ask's libzim searches: every word, then each word pair as a phrase, then the
-    /// three most specific words, and any word only when all that found almost nothing. Queries that need every
-    /// word stay fast on a big index; "any word" has to score every passage with a common word in it.
-    /// Title matches weigh most, then section headings.
+    /// BM25 search, narrow to broad like Ask's libzim searches: every word, then word pairs as phrases, then the
+    /// three most specific words, and any word only when all that found almost nothing; and always the articles
+    /// named for the question's words. Title matches weigh most, then section headings.
+    ///
+    /// The cost of a ranked query is the passages it has to score, so on a huge index (a leads-only Wikipedia)
+    /// queries that would match tens of thousands of passages are left out: a phrase of two common words
+    /// ("power outage" in an encyclopedia) is counted first, cheaply and only up to `broadLimit`, and skipped when
+    /// it reaches it (the title search finds the article named for it), and a leads-only index looks titles up in
+    /// a separate index of titles instead of filtering every passage by its title column.
     func search(terms: [String], phrases: [String], limit: Int) -> [IndexHit] {
         guard !terms.isEmpty else { return [] }
         func quoted(_ words: [String]) -> String { words.map { "\"\($0)\"" }.joined(separator: " ") }
-        // Each query with the words every hit of it must contain.
-        var queries: [(match: String, words: [String])] = [(quoted(terms), terms)]
-        queries += phrases.map { ("\"\($0)\"", $0.split(separator: " ").map(String.init)) }
+        let common = Set(terms.filter { isCommon($0) })
+        // Each query with the words every hit of it must contain, and whether it may be too broad to rank.
+        var queries: [(match: String, words: [String], check: Bool)] = [(quoted(terms), terms, false)]
+        // Long questions: the pairs with an uncommon word first, and at most four.
+        let pairs = phrases.map { ($0, $0.split(separator: " ").map(String.init)) }
+            .sorted { $0.1.filter(common.contains).count < $1.1.filter(common.contains).count }
+            .prefix(4)
+        queries += pairs.map { ("\"\($0.0)\"", $0.1, $0.1.allSatisfy(common.contains)) }
         if terms.count > 3 {
-            let specific = Array(terms.sorted { $0.count > $1.count }.prefix(3))
-            queries.append((quoted(specific), specific))
+            let specific = Array(terms.sorted { (common.contains($0) ? 1 : 0, -$0.count) < (common.contains($1) ? 1 : 0, -$1.count) }.prefix(3))
+            queries.append((quoted(specific), specific, specific.allSatisfy(common.contains)))
         }
         var hits: [IndexHit] = []
         var seen = Set<String>()
@@ -178,31 +230,121 @@ final class PassageStore: @unchecked Sendable {
             }
         }
         // Broader queries only while the narrower ones found few passages: each costs a few milliseconds.
-        for q in queries where hits.count < 40 { add(query(q.match, limit: limit), q.words) }
+        for q in queries where hits.count < 40 {
+            if q.check && isBroad(q.match) { continue }
+            add(query(q.match, limit: limit), q.words)
+        }
         // Articles named for any of the words, always: a passage holds only part of an article, so "signs of
         // dehydration in a baby" can miss "Dehydration" when its signs and its babies are in different passages.
+        // A full index (at most 60,000 articles) asks its passages, which picks each article's passages that best match;
+        // a leads-only one has one passage an article and asks its title index, whose BM25 is on a different scale:
+        // the best title counts as much as the best passage.
         let any = terms.map { "\"\($0)\"" }.joined(separator: " OR ")
-        add(query("title : (\(any))", limit: limit / 2), [])
+        var named = depth == .full ? query("title : (\(any))", limit: limit / 2) : titled(terms, limit: limit / 2)
+        if depth == .leads, let bestTitle = named.map(\.bm25).max(), bestTitle > 0 {
+            let top = hits.map(\.bm25).max() ?? bestTitle
+            for i in named.indices { named[i].bm25 = top * named[i].bm25 / bestTitle }
+        }
+        add(named, [])
         // Still almost nothing: any word that isn't so common that scoring every passage with it would be slow.
         if hits.count < 10 && terms.count > 1 {
-            let uncommon = terms.filter { !isCommon($0) }.map { "\"\($0)\"" }
+            let uncommon = terms.filter { !common.contains($0) }.map { "\"\($0)\"" }
             if !uncommon.isEmpty { add(query(uncommon.joined(separator: " OR "), limit: limit), []) }
         }
         return hits
     }
 
+    /// Most matches a query may have and still be ranked (about 3 ms of scoring).
+    static let broadLimit = 8_000
+
+    /// True when a query matches at least `broadLimit` passages. Counting stops there and scores nothing.
+    private func isBroad(_ match: String) -> Bool {
+        lock.withLock {
+            let count = (try? db?.scalar("SELECT count(*) FROM (SELECT rowid FROM passages WHERE passages MATCH ? LIMIT \(Self.broadLimit))",
+                                         [.text(match)])) ?? 0
+            #if DEBUG
+            if Self.traceQueries && count >= Self.broadLimit {
+                FileHandle.standardError.write(Data("  index query skipped, too broad: \(match)\n".utf8))
+            }
+            #endif
+            return count >= Self.broadLimit
+        }
+    }
+
+    /// Passages of the articles whose titles have the most of these words: the best few titles from the title
+    /// index (words in thousands of titles left out, unless that's all there is), then the first three passages of
+    /// each (the lead and what follows), read by rowid, so many articles get a turn. They're scored by their title's
+    /// BM25, not by a passage query: BM25 counts every passage that has each word, which on a big index
+    /// costs milliseconds per query even when it scores one row.
+    private func titled(_ terms: [String], limit: Int) -> [IndexHit] {
+        let usable = terms.filter { !isCommonTitle($0) }
+        let words = usable.isEmpty ? terms : usable
+        let any = words.map { "\"\($0)\"" }.joined(separator: " OR ")
+        #if DEBUG
+        let started = Date()
+        defer {
+            if Self.traceQueries {
+                FileHandle.standardError.write(Data(String(format: "  title query %6.2f ms  %@\n", Date().timeIntervalSince(started) * 1000, any).utf8))
+            }
+        }
+        #endif
+        return lock.withLock {
+            var articles: [(first: Int64, last: Int64, score: Double)] = []
+            try? db?.run("SELECT first, last, bm25(titles) FROM titles WHERE titles MATCH ? ORDER BY rank LIMIT 24", [.text(any)]) { row in
+                articles.append((row.int(0), row.int(1), -row.double(2)))
+            }
+            var hits: [IndexHit] = []
+            for article in articles where hits.count < limit {
+                try? db?.run("SELECT path, name, heading, body, lead, ord FROM passages WHERE rowid BETWEEN ? AND ? LIMIT 3",
+                             [.int(article.first), .int(article.last)]) { row in
+                    hits.append(IndexHit(path: row.text(0), title: row.text(1), heading: row.text(2), text: row.text(3),
+                                         lead: row.int(4) == 1, order: Int(row.int(5)), bm25: article.score))
+                }
+            }
+            return Array(hits.prefix(limit))
+        }
+    }
+
+    /// True when a word is in at least 2,000 titles ("river" in an encyclopedia). Remembered like `isCommon`.
+    private func isCommonTitle(_ term: String) -> Bool {
+        lock.withLock {
+            if let known = commonTitle[term] { return known }
+            let count = (try? db?.scalar("SELECT count(*) FROM (SELECT rowid FROM titles WHERE titles MATCH ? LIMIT 2000)",
+                                         [.text("\"\(term)\"")])) ?? 0
+            if commonTitle.count > 5_000 { commonTitle.removeAll() }
+            commonTitle[term] = count >= 2000
+            return count >= 2000
+        }
+    }
+
+    #if DEBUG
+    static let traceQueries = ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE_QUERIES"] != nil
+    #endif
+
     /// True when a word is in more than 1,500 passages ("water" in an encyclopedia). Counting stops there, so
     /// it's quick even on a huge index.
+    /// Remembered per word: a complete index doesn't change.
     private func isCommon(_ term: String) -> Bool {
         lock.withLock {
+            if let known = common[term] { return known }
             let count = (try? db?.scalar("SELECT count(*) FROM (SELECT rowid FROM passages WHERE passages MATCH ? LIMIT 1500)",
                                          [.text("\"\(term)\"")])) ?? 0
+            if common.count > 5_000 { common.removeAll() }
+            common[term] = count >= 1500
             return count >= 1500
         }
     }
 
     private func query(_ match: String, limit: Int) -> [IndexHit] {
-        lock.withLock {
+        #if DEBUG
+        let started = Date()
+        defer {
+            if Self.traceQueries {
+                FileHandle.standardError.write(Data(String(format: "  index query %6.2f ms  %@\n", Date().timeIntervalSince(started) * 1000, match).utf8))
+            }
+        }
+        #endif
+        return lock.withLock {
             var hits: [IndexHit] = []
             try? db?.run("""
                 SELECT path, name, heading, body, lead, ord, bm25(passages, 5.0, 2.0, 1.0, 0, 0, 0, 0) AS score
@@ -217,9 +359,29 @@ final class PassageStore: @unchecked Sendable {
 
     // MARK: Passages from HTML
 
-    /// Splits an article into passages of about 80 to 200 words, each within one section.
+    /// The passages of each article read from an archive (articles with none are left out).
+    static func drafts(_ articles: [ZimArticle], depth: AnswerIndexPolicy.Depth) -> [(path: String, title: String, passages: [Draft])] {
+        articles.compactMap { article in
+            let passages = passages(html: article.html, depth: depth)
+            return passages.isEmpty ? nil : (article.path, article.title, passages)
+        }
+    }
+
+    /// Splits an article into passages of about 80 to 200 words, each within one section. A leads-only index
+    /// reads only the HTML before the first section heading.
+    static func passages(html: Data, depth: AnswerIndexPolicy.Depth) -> [Draft] {
+        html.withUnsafeBytes { raw in
+            let all = raw.bindMemory(to: UInt8.self)
+            let part = depth == .leads ? UnsafeBufferPointer(rebasing: all[..<leadEnd(all)]) : all
+            return passages(blocks: HTMLText.sections(utf8: part), depth: depth)
+        }
+    }
+
     static func passages(html: String, depth: AnswerIndexPolicy.Depth) -> [Draft] {
-        let blocks = HTMLText.sections(html)
+        passages(html: Data(html.utf8), depth: depth)
+    }
+
+    private static func passages(blocks: [(heading: String?, text: String)], depth: AnswerIndexPolicy.Depth) -> [Draft] {
         let hasLead = blocks.contains { $0.heading == nil }
         var out: [Draft] = []
         var current: [String] = [], words = 0, heading: String?, lead = false
@@ -242,7 +404,7 @@ final class PassageStore: @unchecked Sendable {
                 lead = isLead
             }
             for piece in pieces(block.text) {
-                let n = piece.split(separator: " ").count
+                let n = wordCount(piece)
                 if words > 0 && words + n > 200 { flush() }
                 current.append(piece)
                 words += n
@@ -271,34 +433,46 @@ final class PassageStore: @unchecked Sendable {
     /// A leads-only hit's text, read back from the archive: the same passage the index was built from.
     static func leadText(archive: ZimArchive, path: String) -> String? {
         if let cached = ParagraphCache.shared.get(archive: archive.uuid, path: "#lead#" + path) { return cached.paragraphs.first }
-        guard let data = archive.data(atPath: path, offset: 0, length: UInt(AnswerIndexPolicy.maxHTMLBytes(.leads))) else { return nil }
-        let html = leadHTML(String(decoding: data, as: UTF8.self))
-        guard let text = passages(html: html, depth: .leads).first?.text else { return nil }
+        guard let data = archive.data(atPath: path, offset: 0, length: UInt(AnswerIndexPolicy.maxHTMLBytes(.leads))),
+              let text = passages(html: data, depth: .leads).first?.text else { return nil }
         ParagraphCache.shared.put(archive: archive.uuid, path: "#lead#" + path, finalPath: path, paragraphs: [text])
         return text
     }
 
-    /// The HTML up to the first section heading that follows some text: all a leads-only index reads, and much
-    /// quicker to clean up than the whole article.
-    static func leadHTML(_ html: String) -> String {
-        var searchFrom = html.startIndex
-        while let heading = html.range(of: "<h2", options: .caseInsensitive, range: searchFrom..<html.endIndex) {
-            if html.range(of: "<p", options: .caseInsensitive, range: html.startIndex..<heading.lowerBound) != nil {
-                return String(html[..<heading.lowerBound])
+    /// Where the lead ends: the first section heading ("<h2", any case) that follows a paragraph ("<p"), or the
+    /// end. All a leads-only index reads, and much quicker to clean up than the whole article.
+    static func leadEnd(_ html: UnsafeBufferPointer<UInt8>) -> Int {
+        func next(_ second: UInt8, _ third: UInt8?, from start: Int) -> Int? {
+            var i = start
+            while i + 1 < html.count, let base = html.baseAddress,
+                  let p = memchr(base + i, 0x3C, html.count - i) {
+                let at = base.distance(to: p.assumingMemoryBound(to: UInt8.self))
+                if at + 1 < html.count, html[at + 1] | 0x20 == second,
+                   third == nil || (at + 2 < html.count && html[at + 2] == third) { return at }
+                i = at + 1
             }
-            searchFrom = heading.upperBound
+            return nil
         }
-        return html
+        guard let paragraph = next(0x70, nil, from: 0) else { return html.count }        // "<p"
+        return next(0x68, 0x32, from: paragraph + 2) ?? html.count                       // "<h2"
+    }
+
+    /// Words in a passage: runs of characters between spaces.
+    static func wordCount(_ text: String) -> Int {
+        var count = 0, inWord = false
+        for c in text.utf8 {
+            if c == 0x20 { inWord = false } else if !inWord { inWord = true; count += 1 }
+        }
+        return count
     }
 
     /// A paragraph, or a long one cut at sentence ends into parts of about 150 words.
     private static func pieces(_ paragraph: String) -> [String] {
-        let words = paragraph.split(separator: " ")
-        guard words.count > 200 else { return [paragraph] }
+        guard wordCount(paragraph) > 200 else { return [paragraph] }
         var parts: [String] = [], current = "", count = 0
         paragraph.enumerateSubstrings(in: paragraph.startIndex..., options: .bySentences) { sentence, _, _, _ in
             guard let sentence = sentence?.trimmingCharacters(in: .whitespaces), !sentence.isEmpty else { return }
-            let n = sentence.split(separator: " ").count
+            let n = wordCount(sentence)
             if count > 0 && count + n > 150 { parts.append(current); current = ""; count = 0 }
             current += (current.isEmpty ? "" : " ") + sentence
             count += n
@@ -343,11 +517,16 @@ final class AnswerIndex: @unchecked Sendable {
     private var userPaused = KitSettings.shared.bool(forKey: "answerIndexPaused") ?? false
     private var powerPause: Pause?
     private var asking = 0
+    /// On mains power: indexing may use a few cores at utility priority instead of one at background priority.
+    private var plugged = AnswerIndexStatus.pluggedIn()
     private var generation = 0
     private var started = false
     private var lastPublish = Date.distantPast
 
     static var folder: URL { KitLocation.caches.appending(path: "OfflineKit/answer-index", directoryHint: .isDirectory) }
+
+    /// Reads and cleans up chunks on power. Its own work only; it waits for nothing.
+    private let workers = DispatchQueue(label: "Answer index workers", qos: .utility, attributes: .concurrent)
 
     private init() {}
 
@@ -481,6 +660,17 @@ final class AnswerIndex: @unchecked Sendable {
         publish(force: true)
     }
 
+    /// On mains power or not (reported by the app; macOS and tvOS also know it at launch).
+    func setPlugged(_ value: Bool) {
+        condition.withLock { plugged = value }
+    }
+
+    /// The builder thread's priority: utility on power, so it can use the fast cores; background otherwise, so it
+    /// stays on the efficiency cores and its disk writes yield to everything else.
+    private static func setPriority(plugged: Bool) {
+        pthread_set_qos_class_self_np(plugged ? QOS_CLASS_UTILITY : QOS_CLASS_BACKGROUND, 0)
+    }
+
     /// Low Power Mode or a low battery (reported by the app, which can read the battery).
     func setPowerPause(_ pause: Pause?) {
         let changed: Bool = condition.withLock {
@@ -492,8 +682,13 @@ final class AnswerIndex: @unchecked Sendable {
         if changed { publish(force: true) }
     }
 
-    /// Deletes every index and builds them again.
+    /// Deletes every index and builds them again. Returns at once: closing an index waits for any query or merge
+    /// in progress, and deleting gigabytes takes a moment, so neither happens on the caller's (main) thread.
     func rebuild() {
+        Task.detached(priority: .utility) { [self] in self.rebuildNow() }
+    }
+
+    private func rebuildNow() {
         let archives: [ZimArchive] = condition.withLock {
             generation += 1
             for store in stores.values { store.close() }
@@ -571,31 +766,36 @@ final class AnswerIndex: @unchecked Sendable {
         }
         update(uuid, generation) { $0.state = .building(done: cursor, total: total) }
 
-        let chunk = AnswerIndexPolicy.chunk(depth), maxBytes = AnswerIndexPolicy.maxHTMLBytes(depth)
+        let chunk = AnswerIndexPolicy.chunk(depth)
         #if DEBUG
-        var readTime = 0.0, writeTime = 0.0
+        var waitTime = 0.0, writeTime = 0.0
         #endif
+        // Chunks are read and turned into passages ahead: on power by a few worker threads, while this one writes the
+        // chunks before them; otherwise one at a time on this thread, at background priority. Written in order,
+        // one transaction per chunk, so a relaunch resumes exactly where the last one ended.
+        var ahead: ChunkWork?
+        defer { _ = ahead?.results() }   // workers never touch the store, but don't leave them running
         while cursor < total {
             guard mayContinue(uuid, generation: generation) else { return }
+            let lanes = AnswerIndexPolicy.workers(plugged: condition.withLock { plugged })
+            Self.setPriority(plugged: lanes > 1)
             let start = Date()
-            let batch = autoreleasepool { () -> [(path: String, title: String, passages: [PassageStore.Draft])] in
-                let articles = archive.articles(from: UInt(cursor), count: UInt(chunk), maxBytes: UInt(maxBytes))
-                #if DEBUG
-                readTime += Date().timeIntervalSince(start)
-                #endif
-                return articles.compactMap { article in
-                    var html = String(decoding: article.html, as: UTF8.self)
-                    if depth == .leads { html = PassageStore.leadHTML(html) }
-                    let passages = PassageStore.passages(html: html, depth: depth)
-                    return passages.isEmpty ? nil : (article.path, article.title, passages)
-                }
-            }
-            cursor = min(total, cursor + chunk)
+            let work = ahead.flatMap { $0.start == cursor ? $0 : nil }
+                ?? ChunkWork(archive: archive, depth: depth, from: cursor, chunks: lanes, total: total, queue: lanes > 1 ? workers : nil)
+            let batches = work.results()
+            #if DEBUG
+            waitTime += Date().timeIntervalSince(start)
+            #endif
+            ahead = lanes > 1 && work.end < total
+                ? ChunkWork(archive: archive, depth: depth, from: work.end, chunks: lanes, total: total, queue: workers) : nil
             #if DEBUG
             let written = Date()
             #endif
             do {
-                try store.append(batch, cursor: cursor, seconds: seconds + Date().timeIntervalSince(start))
+                for (i, batch) in batches.enumerated() {
+                    cursor = min(total, work.starts[i] + chunk)
+                    try store.append(batch, cursor: cursor, seconds: seconds + Date().timeIntervalSince(start))
+                }
                 #if DEBUG
                 writeTime += Date().timeIntervalSince(written)
                 #endif
@@ -627,8 +827,8 @@ final class AnswerIndex: @unchecked Sendable {
         publish(force: true)
         #if DEBUG
         if ProcessInfo.processInfo.environment["OFFLINEKIT_TRACE"] != nil {
-            FileHandle.standardError.write(Data(String(format: "answer index: %@ %@ %d articles, %.1f MB, %.1fs (this run: reading %.1fs, writing %.1fs, the rest is cleaning up HTML)\n",
-                                                       archive.title, depth.rawValue, articles, Double(bytes) / 1e6, seconds, readTime, writeTime).utf8))
+            FileHandle.standardError.write(Data(String(format: "answer index: %@ %@ %d articles, %.1f MB, %.1fs (this run: waiting for passages %.1fs, writing %.1fs)\n",
+                                                       archive.title, depth.rawValue, articles, Double(bytes) / 1e6, seconds, waitTime, writeTime).utf8))
         }
         #endif
     }
@@ -689,6 +889,41 @@ final class AnswerIndex: @unchecked Sendable {
     }
 }
 
+/// Chunks of an archive read and turned into passages: on worker threads (each chunk at once) or, without a
+/// queue, right here.
+private final class ChunkWork: @unchecked Sendable {
+    typealias Batch = [(path: String, title: String, passages: [PassageStore.Draft])]
+    /// First entry of each chunk, and the entry after the last one.
+    let starts: [Int]
+    let end: Int
+    var start: Int { starts.first ?? end }
+    private let group = DispatchGroup()
+    private let lock = NSLock()
+    private var batches: [Batch]
+
+    init(archive: ZimArchive, depth: AnswerIndexPolicy.Depth, from: Int, chunks: Int, total: Int, queue: DispatchQueue?) {
+        let chunk = AnswerIndexPolicy.chunk(depth), maxBytes = AnswerIndexPolicy.maxHTMLBytes(depth)
+        end = min(total, from + chunks * chunk)
+        starts = Array(stride(from: from, to: end, by: chunk))
+        batches = Array(repeating: [], count: starts.count)
+        for (i, first) in starts.enumerated() {
+            let work: @Sendable () -> Void = { [self] in
+                let batch = autoreleasepool {
+                    PassageStore.drafts(archive.articles(from: UInt(first), count: UInt(chunk), maxBytes: UInt(maxBytes)), depth: depth)
+                }
+                lock.withLock { batches[i] = batch }
+            }
+            if let queue { queue.async(group: group, execute: work) } else { work() }
+        }
+    }
+
+    /// The chunks' passages, in order, once they're all done.
+    func results() -> [Batch] {
+        group.wait()
+        return lock.withLock { batches }
+    }
+}
+
 /// The answer index's progress for Kit Care, and the power checks that pause it.
 @MainActor @Observable
 final class AnswerIndexStatus {
@@ -705,9 +940,30 @@ final class AnswerIndexStatus {
         watching = Task { @MainActor in
             while !Task.isCancelled {
                 AnswerIndex.shared.setPowerPause(Self.powerPause())
+                AnswerIndex.shared.setPlugged(Self.pluggedIn())
                 try? await Task.sleep(for: .seconds(20))
             }
         }
+    }
+
+    /// On mains power: a Mac on its adapter (or without a battery), a charging iPhone or iPad, an Apple TV.
+    nonisolated static func pluggedIn() -> Bool {
+        #if os(macOS)
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() as String? else { return true }
+        return type == kIOPMACPowerKey
+        #elseif os(tvOS)
+        return true
+        #elseif canImport(UIKit)
+        // UIDevice belongs to the main thread; until the power watcher reports, assume battery.
+        guard Thread.isMainThread else { return false }
+        return MainActor.assumeIsolated {
+            let state = UIDevice.current.batteryState
+            return state == .charging || state == .full
+        }
+        #else
+        return false
+        #endif
     }
 
     static func powerPause() -> AnswerIndex.Pause? {

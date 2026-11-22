@@ -13,6 +13,16 @@ enum WebApp {
 
     static var html: String { page.replacingOccurrences(of: "/*SCRIPT*/", with: script) }
 
+    /// The page or a script with its indentation, blank lines and whole-line `//` comments taken out, once at first serve
+    /// (about 6% smaller, before gzip). Line breaks stay, so JavaScript's automatic semicolons work as written; none of the
+    /// page's strings or template literals spans lines, and the page has no `<pre>` whose spacing would change.
+    static func slim(_ text: String) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line -> Substring? in
+            let trimmed = line.drop { $0 == " " || $0 == "\t" }
+            return trimmed.isEmpty || trimmed.hasPrefix("//") ? nil : trimmed
+        }.joined(separator: "\n")
+    }
+
     /// The web app manifest: the name, icons and colors a phone uses when the page is added to its Home Screen.
     static let manifest = #"""
 {
@@ -388,7 +398,7 @@ svg.fill{fill:currentColor;stroke:none}
 <div id="player" class="hidden"></div>
 <div id="reader" class="hidden"></div>
 <div id="pin" class="hidden" role="dialog" aria-labelledby="pintitle">
-  <img src="/assets/icon-180.png" alt="" width="76" height="76">
+  <img src="/assets/icon-180.png" alt="" width="76" height="76" loading="lazy" decoding="async">
   <h1 id="pintitle">Enter PIN</h1>
   <p>The person who set up Offline Kit can tell you the PIN.</p>
   <div class="dots" id="dots" aria-hidden="true"></div>

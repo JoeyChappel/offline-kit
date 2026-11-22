@@ -94,59 +94,55 @@ struct BinderSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var options = PrintDocuments.BinderOptions()
 
+    private struct ContentsSection {
+        let title: String
+        let note: String
+    }
+    private var contents: [ContentsSection] {
+        var list: [ContentsSection] = []
+        if options.familyPlan { list.append(.init(title: "Family emergency plan", note: "Meeting places, shutoffs and medical cards")) }
+        if options.emergencyInfo {
+            list.append(.init(title: "Emergency numbers and radio", note: options.yourNumbers ? "Includes your own numbers (\(household.data.contacts.count))" : "Public numbers and radio information"))
+        }
+        if options.powerOut { list.append(.init(title: "Power-out guide", note: "Food, generator and water guidance with sources")) }
+        if options.guides {
+            for guide in household.data.extra.savedGuides {
+                list.append(.init(title: guide.ref.title.isBlank ? "Untitled guide" : guide.ref.title,
+                                  note: library.book(guide.ref.bookID) == nil ? "Archive not connected; noted in the binder" : "Saved guide"))
+            }
+        }
+        if options.supplies { list.append(.init(title: "Supplies list", note: "\(household.data.extra.supplies.count) items")) }
+        return list
+    }
+    private var includesPrivateInformation: Bool {
+        options.familyPlan || (options.emergencyInfo && options.yourNumbers) || options.supplies
+    }
+
     var body: some View {
         let extra = household.data.extra
         NavigationStack {
-            Form {
-                Section {
-                    Toggle(isOn: $options.familyPlan) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Family plan")
-                            Text("Meeting places, shutoffs and each person’s medical details.").font(.caption).foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Build your paper backup.").font(.title.bold())
+                        Text("Choose the sections to print or save together as one PDF.").font(.callout).foregroundStyle(.secondary)
+                    }
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 20) {
+                            choices.frame(minWidth: 370, maxWidth: .infinity)
+                            selectedContents.frame(minWidth: 280, maxWidth: 360)
                         }
+                        VStack(alignment: .leading, spacing: 20) { choices; selectedContents }
                     }
-                    .disabled(household.data.people.isEmpty)
-                    if options.familyPlan {
-                        Label(PrintDocuments.privateWarning, systemImage: "exclamationmark.lock.fill")
-                            .font(.callout).foregroundStyle(.orange)
-                    }
-                    Toggle("Emergency numbers and radio", isOn: $options.emergencyInfo)
-                    if options.emergencyInfo {
-                        Toggle("Include your own numbers (\(household.data.contacts.count))", isOn: $options.yourNumbers)
-                            .disabled(household.data.contacts.isEmpty)
-                    }
-                    Toggle(isOn: $options.powerOut) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Power-out guide (food, generator, water)")
-                            Text("Offline Kit’s built-in guide, with the official sources for each figure.").font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    Toggle("Saved guides (\(extra.savedGuides.count))", isOn: $options.guides)
-                        .disabled(extra.savedGuides.isEmpty)
-                    Toggle("Supplies list (\(extra.supplies.count))", isOn: $options.supplies)
-                        .disabled(extra.supplies.isEmpty)
-                } header: {
-                    Text("Include")
-                } footer: {
-                    Text("Starts with a cover and contents. Each section begins on a new page. Guides print with their pictures when the archive has them; archives that aren’t connected are noted.")
-                }
-                let offline = extra.savedGuides.filter { library.book($0.ref.bookID) == nil }
-                if options.guides && !offline.isEmpty {
-                    Section {
-                        Label("\(offline.count) saved \(offline.count == 1 ? "guide’s archive isn’t" : "guides’ archives aren’t") connected. Connect the drive to print \(offline.count == 1 ? "it" : "them") in full.",
-                              systemImage: "externaldrive.badge.exclamationmark")
-                            .font(.callout)
-                    }
-                }
-                Section {
-                    PrintButtons(title: "Household emergency binder", filename: "Household emergency binder", pageNumbers: true,
-                                 printLabel: "Print Binder…") {
-                        await PrintDocuments.binder(household.data, options: options, library: library)
-                    }
-                    .disabled(!(options.familyPlan || options.emergencyInfo || options.powerOut || options.guides || options.supplies))
-                }
+                }.padding(24).frame(maxWidth: 1100, alignment: .leading).frame(maxWidth: .infinity)
             }
-            .formStyle(.grouped)
+            .background(Design.canvas)
+            .safeAreaInset(edge: .bottom) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 20) { contentsCount.frame(minWidth: 180); Spacer(); printActions }
+                    VStack(alignment: .leading, spacing: 12) { contentsCount; printActions }
+                }.padding(18).frame(maxWidth: .infinity, alignment: .leading).background(.bar)
+            }
             .navigationTitle("Print the Binder")
             #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
@@ -159,9 +155,88 @@ struct BinderSheet: View {
             }
         }
         #if os(macOS)
-        .frame(minWidth: 480, minHeight: 520)
+        .frame(width: 900, height: 760)
         #endif
     }
+
+    private var choices: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Reference sections").font(.title2.bold())
+                Toggle("Emergency numbers and radio", isOn: $options.emergencyInfo)
+                Toggle("Include your own numbers (\(household.data.contacts.count))", isOn: $options.yourNumbers)
+                    .disabled(!options.emergencyInfo || household.data.contacts.isEmpty).padding(.leading, 20)
+                Divider()
+                Toggle(isOn: $options.powerOut) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Power-out guide")
+                        Text("Built-in guidance with its official sources.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Divider()
+                Toggle("Saved guides (\(household.data.extra.savedGuides.count))", isOn: $options.guides)
+                    .disabled(household.data.extra.savedGuides.isEmpty)
+                Text("Save an article from Library to include it here. Guides print with their pictures when the archive has them.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.card(padding: 18)
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Household sections").font(.title2.bold())
+                Toggle(isOn: $options.familyPlan) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Family plan")
+                        Text("Meeting places, shutoffs and medical cards.").font(.caption).foregroundStyle(.secondary)
+                    }
+                }.disabled(household.data.people.isEmpty)
+                Divider()
+                Toggle("Supplies list (\(household.data.extra.supplies.count))", isOn: $options.supplies)
+                    .disabled(household.data.extra.supplies.isEmpty)
+            }.card(padding: 18)
+            let offline = household.data.extra.savedGuides.filter { library.book($0.ref.bookID) == nil }
+            if options.guides && !offline.isEmpty {
+                Label("\(offline.count) saved \(offline.count == 1 ? "guide’s archive isn’t" : "guides’ archives aren’t") connected. Connect the drive to print \(offline.count == 1 ? "it" : "them") in full.", systemImage: "externaldrive.badge.exclamationmark")
+                    .font(.callout).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true).card(padding: 16)
+            }
+        }
+    }
+
+    private var selectedContents: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Selected contents").font(.title2.bold())
+                Label("Cover and contents · Always included", systemImage: "doc.text").font(.callout)
+                ForEach(Array(contents.enumerated()), id: \.offset) { index, section in
+                    Divider()
+                    HStack(alignment: .top, spacing: 12) {
+                        Text("\(index + 1)").font(.callout.bold()).foregroundStyle(.tint).frame(width: 24)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(section.title).font(.callout.weight(.semibold))
+                            Text(section.note).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Divider()
+                Text("Each section begins on a new page.").font(.caption).foregroundStyle(.secondary)
+            }.card(padding: 18)
+            if includesPrivateInformation {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Includes private household information", systemImage: "lock.fill").font(.headline).foregroundStyle(.orange)
+                    Text("Printouts and PDFs aren’t encrypted. Store them privately and shred old copies.")
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }.card(padding: 18)
+            }
+        }
+    }
+    private var contentsCount: some View {
+        Text("\(contents.count) \(contents.count == 1 ? "section" : "sections"), plus cover and contents")
+            .font(.callout.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+    }
+    private var printActions: some View {
+        PrintButtons(title: "Household emergency binder", filename: "Household emergency binder", pageNumbers: true,
+                     printLabel: "Print Binder…") {
+            await PrintDocuments.binder(household.data, options: options, library: library)
+        }.disabled(contents.isEmpty)
+    }
+
 }
 
 /// "Save Guide" in the article reader's toolbar. Saves whatever article is showing now.

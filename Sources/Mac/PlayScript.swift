@@ -7,7 +7,7 @@ import CryptoKit
 /// play.js is self-contained: its styles are injected once and scoped under `.okplay-root`, every element it makes
 /// has an `okp-` class, and it builds the DOM with DOM methods (no HTML parsing of anything from the server).
 enum PlayScript {
-    static let player: (data: Data, etag: String) = cached(js)
+    static let player: (data: Data, etag: String) = cached(WebApp.slim(js))
     static let testPage: (data: Data, etag: String) = cached(test)
 
     private static func cached(_ text: String) -> (data: Data, etag: String) {

@@ -117,7 +117,10 @@ final class MediaInfoStore: @unchecked Sendable {
                 pending[progressKey] = info
                 sinceSave += 1
                 addNext()
-                if pending.count >= batch || Date().timeIntervalSince(lastFlush) > 1.5 {
+                // Each flush redraws the screens and works the shelves out again, so a fast first scan hands over details
+                // a few times a second, not after every 40 files.
+                let sinceFlush = Date().timeIntervalSince(lastFlush)
+                if (pending.count >= batch && sinceFlush > 0.5) || sinceFlush > 1.5 {
                     let ready = pending
                     pending = [:]
                     lastFlush = Date()
@@ -431,7 +434,25 @@ enum MediaCatalog {
 
     /// "Tears of Steel (2012)" → "Tears of Steel".
     static func displayTitle(_ title: String) -> String {
-        title.replacingOccurrences(of: #"\s*\((1[89]|20)\d{2}\)\s*$"#, with: "", options: .regularExpression)
+        // A regex replace per call, and cards ask for it on every redraw: remember each answer.
+        if let known = displayTitles.get(title) { return known }
+        let answer = title.replacingOccurrences(of: #"\s*\((1[89]|20)\d{2}\)\s*$"#, with: "", options: .regularExpression)
+        displayTitles.set(title, answer)
+        return answer
+    }
+    private static let displayTitles = StringMemo()
+
+    /// A small thread-safe string-to-string memo for work the screens repeat on every redraw (regexes, formatters).
+    final class StringMemo: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [String: String] = [:]
+        func get(_ key: String) -> String? { lock.withLock { values[key] } }
+        func set(_ key: String, _ value: String) {
+            lock.withLock {
+                if values.count > 20_000 { values.removeAll() }
+                values[key] = value
+            }
+        }
     }
 
     static func isInProgress(_ p: MediaProgress?, kind: MediaItem.Kind = .video) -> Bool {
@@ -461,6 +482,16 @@ enum MediaCatalog {
 
     /// "2012 · 12 min · Animation", "Audiobook · 9 chapters · 2 hr 58 min".
     static func meta(_ item: MediaItem, _ info: MediaInfo?) -> String {
+        // The duration text comes from a formatter built on each call; remember the line per item and its details.
+        let key = "\(item.id)|\(item.tracks.count)|\(category(item, info).rawValue)|\(info?.year ?? 0)|\(info?.duration ?? -1)|\(info?.genre ?? "")|\(info?.author ?? "")|\(info?.parts ?? -1)"
+        if let known = metas.get(key) { return known }
+        let line = makeMeta(item, info)
+        metas.set(key, line)
+        return line
+    }
+    private static let metas = StringMemo()
+
+    private static func makeMeta(_ item: MediaItem, _ info: MediaInfo?) -> String {
         var bits: [String] = []
         if item.kind == .book {
             bits.append("Book")
@@ -502,6 +533,23 @@ enum MediaCatalog {
         let added = { (item: MediaItem) in i(item)?.added ?? .distantPast }
 
         let isMusic = { (item: MediaItem) in category(item, i(item)) == .music }
+        // Shelves listed by title share one sort of the whole library (done the first time one needs it), and each
+        // shelf just orders its items by their place in it.
+        var titleRanks: [String: Int]?
+        func byTitle(_ list: [MediaItem]) -> [MediaItem] {
+            if titleRanks == nil {
+                let titles = items.map(\.title)
+                let order = items.indices.sorted { a, b in
+                    let c = titles[a].localizedStandardCompare(titles[b])
+                    return c == .orderedSame ? a < b : c == .orderedAscending
+                }
+                var ranks: [String: Int] = [:]
+                for (place, index) in order.enumerated() where ranks[items[index].id] == nil { ranks[items[index].id] = place }
+                titleRanks = ranks
+            }
+            let ranks = titleRanks ?? [:]
+            return list.sorted { (ranks[$0.id] ?? 0) < (ranks[$1.id] ?? 0) }
+        }
         // Music is played again and again, and books are read, so both get their own rows.
         let stories = items.filter { !isMusic($0) && $0.kind != .book }
         let books = items.filter { $0.kind == .book }
@@ -534,7 +582,7 @@ enum MediaCatalog {
         var byGenre: [String: [MediaItem]] = [:]
         for item in items { if let g = i(item)?.genre { byGenre[g, default: []].append(item) } }
         for (genre, list) in byGenre.sorted(by: { $0.value.count != $1.value.count ? $0.value.count > $1.value.count : $0.key < $1.key }) {
-            add(genre, list.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending })
+            add(genre, byTitle(list))
         }
 
         // Series in order, then "More from <studio or author>", from approved Organize with AI details.
@@ -546,8 +594,8 @@ enum MediaCatalog {
         add("Short Films", videos.filter { (i($0)?.duration ?? .infinity) < 20 * 60 })
         add("Movies", videos.filter { (i($0)?.duration ?? 0) >= 40 * 60 })
         add("Audiobooks", items.filter { $0.kind == .audio && !isMusic($0) })
-        add("Music", music.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending })
-        add("Books", books.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending })
+        add("Music", byTitle(music))
+        add("Books", byTitle(books))
 
         add("Watch Again", finished)
         add("On a drive that isn’t connected", away)

@@ -237,12 +237,25 @@ struct RootView: View {
             // Test hook: -cycleSections N clicks through Watch, Audiobooks, Music, Books and Play N times, one a second.
             if let rounds = Int(UserDefaults.standard.string(forKey: "cycleSections") ?? "") {
                 Task {
-                    try? await Task.sleep(for: .seconds(6))
+                    // -cycleWait S: seconds before the first switch (default 6); -cycleScroll YES scrolls each screen (macOS).
+                    try? await Task.sleep(for: .seconds(Double(UserDefaults.standard.string(forKey: "cycleWait") ?? "") ?? 6))
                     let order: [SidebarItem] = [.media, .audiobooks, .music, .books, .games]
+                    let scroll = UserDefaults.standard.bool(forKey: "cycleScroll")
+                    StallProbe.start()
+                    StallProbe.report("before cycling")
                     for step in 0..<(rounds * order.count) {
                         NSLog("CYCLE %@", "\(order[step % order.count])")
                         navigation.selection = order[step % order.count]
+                        #if os(macOS)
+                        if scroll {
+                            try? await Task.sleep(for: .milliseconds(400))
+                            await ProfileScroller.scrollMainContent()
+                            try? await Task.sleep(for: .milliseconds(100))
+                        } else { try? await Task.sleep(for: .seconds(1)) }
+                        #else
                         try? await Task.sleep(for: .seconds(1))
+                        #endif
+                        StallProbe.report("\(order[step % order.count])")
                     }
                     NSLog("CYCLE done")
                 }
@@ -469,3 +482,33 @@ struct BookView: View {
         .onAppear { if current == nil { current = book.mainPage } }
     }
 }
+
+#if os(macOS) && DEBUG
+/// Profiling aid for -cycleScroll: scrolls the biggest vertical scroll view in the main window down and back up.
+@MainActor
+enum ProfileScroller {
+    static func scrollMainContent() async {
+        guard let root = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil })?.contentView else { return }
+        var best: NSScrollView?
+        func walk(_ v: NSView) {
+            if let sv = v as? NSScrollView, sv.hasVerticalScroller, let doc = sv.documentView, doc.frame.height > sv.bounds.height + 50,
+               sv.bounds.width * sv.bounds.height > (best.map { $0.bounds.width * $0.bounds.height } ?? 0) { best = sv }
+            v.subviews.forEach(walk)
+        }
+        walk(root)
+        guard let sv = best, let doc = sv.documentView else { return }
+        let travel = min(doc.frame.height - sv.bounds.height, 2400)
+        let steps = 20
+        for i in 1...steps {
+            sv.contentView.scroll(to: NSPoint(x: 0, y: travel * Double(i) / Double(steps)))
+            sv.reflectScrolledClipView(sv.contentView)
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        for i in 1...steps {
+            sv.contentView.scroll(to: NSPoint(x: 0, y: travel * Double(steps - i) / Double(steps)))
+            sv.reflectScrolledClipView(sv.contentView)
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+    }
+}
+#endif

@@ -17,6 +17,12 @@ struct SettingsView: View {
     @State private var removingModel: InstalledModel?
     /// Bumped when models are added or removed, so the list re-reads the Models folders.
     @State private var modelsChanged = 0
+    @State private var checkingEngine = false
+    @State private var availableEngine: String?
+    @State private var engineDetail = ""
+    @State private var engineDestination: String?
+    @State private var engineIsLocal = true
+    @State private var checkRevision = 0
 
     private enum Picking { case folder, model }
     private struct PendingModel: Identifiable {
@@ -30,13 +36,22 @@ struct SettingsView: View {
         @Bindable var model = model
         @Bindable var library = library
         Form {
-            Section("Answers") {
+            Section {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Answers").font(.largeTitle.bold())
+                    Text("Choose how Ask answers, and see where your questions go.").foregroundStyle(.secondary)
+                }.padding(.vertical, 6)
+            }
+            availabilitySection
+            Section("Answer preference") {
                 Picker("Answer with", selection: $model.choice) {
                     ForEach(EngineChoice.allCases) { Text($0.label).tag($0) }
                 }
-                LabeledContent("Apple Intelligence", value: AppleEngine.availability)
-                Text("Automatic picks the best one available: the larger model in Ollama if it’s running, then the Offline Kit answer model, then Apple Intelligence. Answers are made on \(model.contextDestination).")
+                Text("Automatic uses the best available engine: Ollama, then the Offline Kit answer model, then Apple Intelligence. A preference doesn’t mean that engine is available.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            answerModelSection
+            Section {
                 DisclosureGroup("Advanced: Ollama (optional)") {
                     TextField("Ollama address", text: $model.ollamaHost)
                         .autocorrectionDisabled()
@@ -57,16 +72,13 @@ struct SettingsView: View {
                     } else {
                         Text("Ollama isn’t running. That’s fine: it’s only needed if you want to use it.").foregroundStyle(.secondary)
                     }
-                    if model.usesHomeNetwork {
-                        Label("Questions, and the household details Ask uses with them, are sent to \(model.contextDestination) to be answered.",
-                              systemImage: "wifi")
+                    if let engineDestination, !engineIsLocal {
+                        Label(engineDestination, systemImage: "wifi")
                             .font(.caption).foregroundStyle(.secondary)
                     }
-                    Button("Check Again") { Task { await model.refreshOllama() } }
+                    Button("Check Again") { checkRevision += 1 }.disabled(checkingEngine)
                 }
             }
-
-            answerModelSection
 
             ReadAloudSettingsSection()
 
@@ -129,7 +141,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         #if os(macOS)
-        .frame(width: 560, height: 720)
+        .frame(width: 620, height: 780)
         #endif
         // One picker for both uses: a view gets only one file importer.
         .fileImporter(isPresented: $showPicker, allowedContentTypes: picking == .folder ? [.folder] : Self.modelTypes) { result in
@@ -164,7 +176,92 @@ struct SettingsView: View {
         .alert("Answer model", isPresented: .constant(modelMessage != nil)) {
             Button("OK") { modelMessage = nil }
         } message: { Text(modelMessage ?? "") }
-        .task { await model.refreshOllama() }
+        .task(id: availabilityKey) { await checkAvailability() }
+    }
+
+    private var availabilityKey: String {
+        [model.choice.rawValue, model.ollamaHost, model.ollamaModel, model.builtInModel,
+         library.folders.map(\.path).joined(separator: "|"), String(modelsChanged),
+         String(KitChanges.shared.models), String(checkRevision)].joined(separator: "|")
+    }
+
+    private var availabilitySection: some View {
+        Section("Available now") {
+            VStack(alignment: .leading, spacing: 12) {
+                if checkingEngine {
+                    HStack(spacing: 10) { ProgressView().controlSize(.small); Text("Checking answer engines…").foregroundStyle(.secondary) }
+                } else {
+                    Label(availableEngine ?? "No engine available for this preference", systemImage: availableEngine == nil ? "cpu" : "checkmark.circle")
+                        .font(.headline)
+                    if let engineDestination {
+                        Label(engineIsLocal ? "On this device" : "Home network", systemImage: engineIsLocal ? "desktopcomputer" : "wifi")
+                            .font(.caption.weight(.semibold)).foregroundStyle(.tint)
+                        Text(engineDestination).font(.callout).foregroundStyle(.secondary)
+                    }
+                    if !engineDetail.isEmpty { Text(engineDetail).font(.caption).foregroundStyle(.secondary) }
+                }
+                HStack {
+                    Text("Availability is checked again before answering.").font(.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 8)
+                    Button("Check Again") { checkRevision += 1 }.disabled(checkingEngine)
+                }
+            }.padding(.vertical, 4)
+        }
+    }
+
+    @MainActor private func checkAvailability() async {
+        checkingEngine = true
+        availableEngine = nil
+        engineDestination = nil
+        engineDetail = ""
+        let validOllamaAddress = AskModel.isHomeNetworkAddress(model.ollamaHost)
+        let useLocalFallback = !validOllamaAddress && model.choice == .auto
+        if validOllamaAddress {
+            await model.refreshOllama()
+        } else if model.choice == .ollama {
+            engineDetail = "Enter a local or home-network Ollama address in Advanced: Ollama."
+            checkingEngine = false
+            return
+        }
+        guard !Task.isCancelled else { return }
+        model.libraryFolders = library.folders
+        let engine: (any AnswerEngine)?
+        if useLocalFallback {
+            // Automatic can still answer locally. Never probe an arbitrary host or change the saved preference.
+            if let installed = LocalModels.selected(libraryFolders: library.folders, id: model.builtInModel) {
+                engine = LlamaEngine(model: installed)
+            } else {
+                engine = AppleEngine.isAvailable ? AppleEngine() : nil
+            }
+        } else {
+            engine = await model.resolveEngine()
+        }
+        guard !Task.isCancelled else { return }
+        if let local = engine as? LlamaEngine, case .tooBig(let needed, let available) = local.model.plan {
+            engineDetail = "The selected model needs about \(ModelFit.gigabytes(needed)) of memory; \(ModelFit.gigabytes(available)) is available. Choose a smaller model."
+        } else if let engine {
+            availableEngine = engine.displayName
+            engineDetail = engine.technicalName
+            if useLocalFallback { engineDetail += ". Ollama wasn’t checked: its address must be local or on your home network." }
+            engineIsLocal = engine.runsOnDevice
+            #if os(macOS)
+            let localDestination = "this Mac"
+            #else
+            let localDestination = "this device"
+            #endif
+            engineDestination = engine.runsOnDevice
+                ? "Questions are processed on \(localDestination)."
+                : "Questions and the household details Ask uses with them are sent to \(model.ollamaHost) on your home network."
+        } else {
+            let status = model.engineLabel(libraryFolders: library.folders)
+            engineDetail = status.name + ". " + status.detail
+            if model.choice == .apple { engineDetail = AppleEngine.availability }
+            if useLocalFallback {
+                engineDetail = "No Offline Kit model is installed. Apple Intelligence: " + AppleEngine.availability
+                    + " Enter a local or home-network Ollama address to check Ollama."
+            }
+        }
+        checkingEngine = false
     }
 
     // MARK: Answer model
@@ -181,7 +278,7 @@ struct SettingsView: View {
         let _ = KitChanges.shared.models   // a download finished, or a model was added elsewhere
         let installed = LocalModels.installedCached(libraryFolders: library.folders)
         let selected = LocalModels.selected(in: installed, id: model.builtInModel)
-        Section("Answer model") {
+        Section("Offline Kit answer model") {
             if let selected {
                 Picker("Offline Kit answer model", selection: Binding(get: { selected.id }, set: { model.builtInModel = $0 })) {
                     ForEach(installed) { Text($0.shortName).tag($0.id) }
@@ -198,12 +295,12 @@ struct SettingsView: View {
                 }
                 .font(.caption).foregroundStyle(.secondary)
             } else {
-                LabeledContent("Offline Kit answer model") {
-                    HStack(spacing: 10) {
-                        Text("Not downloaded").foregroundStyle(.secondary)
-                        Button("Get It…") { openGetResources() }
-                    }
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Not downloaded").font(.callout.weight(.medium)).foregroundStyle(.secondary)
+                    Text("Keep an answer model with your library for use offline.").font(.callout).foregroundStyle(.secondary)
+                    Button("Get Model…") { openGetResources() }.buttonStyle(.borderedProminent)
                 }
+
             }
             if let addingModel {
                 HStack(spacing: 8) {
@@ -211,7 +308,7 @@ struct SettingsView: View {
                     Text("Adding \(addingModel)…").foregroundStyle(.secondary)
                 }
             }
-            DisclosureGroup("Advanced: use your own model file") {
+            DisclosureGroup("Use your own model file") {
                 if let selected, case .ready(let tokens) = selected.plan, selected.isCustom {
                     Text("Reads about \(tokens.formatted()) tokens at a time on \(ModelFit.deviceName).")
                         .font(.caption).foregroundStyle(.secondary)

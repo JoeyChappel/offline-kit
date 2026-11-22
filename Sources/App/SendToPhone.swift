@@ -13,6 +13,12 @@ struct SendSource: Hashable {
 
     var key: String { paths.first?.standardizedFileURL.path ?? title }
 
+    /// `media(item).key` without looking at the disk for covers: cards ask this on every redraw.
+    static func mediaKey(_ item: MediaItem) -> String {
+        if item.kind == .audio, MediaCover.isFolderItem(item) { return item.tracks[0].deletingLastPathComponent().standardizedFileURL.path }
+        return item.tracks.first?.standardizedFileURL.path ?? item.title
+    }
+
     /// A movie, an album or audiobook (its whole folder), a song, or an EPUB or PDF in the Media folder. Custom covers go along.
     static func media(_ item: MediaItem, info: MediaInfo? = nil) -> SendSource {
         let kind: SendKind = switch item.kind { case .video: .video; case .audio: .audio; case .book: .book }
@@ -46,14 +52,19 @@ struct SendSource: Hashable {
 
 /// "Send to iPhone" for right-click menus and detail pages. Mac only; nothing on iPhone and iPad.
 struct SendToPhoneButton: View {
-    let source: SendSource
+    /// The source is only built when the button is used (it looks at the disk for covers), not when a menu is set up.
+    let key: String
+    let source: () -> SendSource
+
+    init(source: SendSource) { key = source.key; self.source = { source } }
+    init(key: String, source: @escaping () -> SendSource) { self.key = key; self.source = source }
 
     var body: some View {
         #if os(macOS)
-        let queued = SendList.shared.contains(source)
+        let queued = SendList.shared.contains(key: key)
         Button(queued ? "Remove from Send to iPhone" : "Send to iPhone",
                systemImage: queued ? "iphone.slash" : "iphone.and.arrow.forward") {
-            SendList.shared.toggle(source)
+            SendList.shared.toggle(source())
         }
         .help(queued ? "Take this off the list for your iPhone." : "Add this to the list your iPhone downloads over Wi-Fi. See Share on Wi-Fi.")
         #endif
@@ -95,7 +106,7 @@ struct SendNoticeBanner: View {
 struct SendQueuedBadge: View {
     let item: MediaItem
     var body: some View {
-        if item.unavailable == nil, SendList.shared.contains(.media(item)) {
+        if item.unavailable == nil, SendList.shared.contains(key: SendSource.mediaKey(item)) {
             Image(systemName: "iphone").font(.caption.bold()).padding(6)
                 .background(.black.opacity(0.8), in: Circle()).foregroundStyle(.white).padding(8)
                 .help("On the Send to iPhone list")
@@ -106,8 +117,8 @@ struct SendQueuedBadge: View {
 #endif
 
 extension SendToPhoneButton {
-    init(media item: MediaItem, info: MediaInfo? = nil) { self.init(source: .media(item, info: info)) }
-    init(game: Game) { self.init(source: .game(game)) }
+    init(media item: MediaItem, info: MediaInfo? = nil) { self.init(key: SendSource.mediaKey(item), source: { .media(item, info: info) }) }
+    init(game: Game) { self.init(key: game.url.standardizedFileURL.path, source: { .game(game) }) }
     init(archive book: Book) { self.init(source: .archive(book)) }
     init(document doc: SavedDocument) { self.init(source: .document(doc)) }
 }

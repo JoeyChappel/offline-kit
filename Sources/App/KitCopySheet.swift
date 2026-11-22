@@ -34,6 +34,10 @@ struct KitCopySheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .background(Design.canvas)
+            .safeAreaInset(edge: .top, spacing: 0) { stageHeader }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if copier.phase == .idle || copier.phase == .planning { chooseFooter }
+            }
             .navigationTitle("Copy my kit")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -42,7 +46,7 @@ struct KitCopySheet: View {
                 }
             }
         }
-        .frame(width: 640, height: 640)
+        .frame(width: 700, height: 760)
         .fileImporter(isPresented: $choosingFolder, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { destination = url; copier.reset() }
         }
@@ -93,9 +97,11 @@ struct KitCopySheet: View {
 
     private var setup: some View {
         VStack(alignment: .leading, spacing: 18) {
-            KitHeading(eyebrow: "SHARE YOUR KIT", title: "Copy my kit.",
-                       subtitle: "Copies your library to another drive or folder so it works on another Mac. Every file is checked against the original after it’s copied. Nothing here is changed or deleted.")
-            privacyNote
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Make a checked copy.").font(.title.bold())
+                Text("Copy your library to another drive or folder. Original files stay as they are.")
+                    .font(.callout).foregroundStyle(.secondary)
+            }
             VStack(alignment: .leading, spacing: 8) {
                 Text("What to copy").font(.headline)
                 ForEach(library.folders, id: \.self) { folder in
@@ -107,29 +113,29 @@ struct KitCopySheet: View {
                         }
                     }
                 }
-                Toggle("Include the Offline Kit app, so the copy opens on a Mac that doesn’t have it", isOn: $includeApp)
+                Toggle("Include the Offline Kit app", isOn: $includeApp)
+                Text("So the copy can open on another compatible Mac.").font(.caption).foregroundStyle(.secondary)
                 Text("Unfinished downloads aren’t copied. More than one library folder is combined into one.")
                     .font(.caption).foregroundStyle(.secondary)
             }
             .card(padding: 16)
             VStack(alignment: .leading, spacing: 8) {
-                Text("Where to").font(.headline)
-                ForEach(driveRows) { row in
-                    let drive = row.url
-                    Button { destination = drive; copier.reset() } label: {
-                        HStack {
-                            Image(systemName: destination == drive ? "largecircle.fill.circle" : "circle").foregroundStyle(.tint)
-                            Label("\(row.name) · \(kitBytes(row.free)) free", systemImage: "externaldrive")
-                            Spacer()
-                        }.contentShape(Rectangle())
-                    }.buttonStyle(.plain)
+                Text("Destination").font(.headline)
+                HStack(spacing: 14) {
+                    Label(destination?.path ?? "Choose a drive or folder", systemImage: "externaldrive")
+                        .font(.callout).foregroundStyle(destination == nil ? Color.secondary : Color.primary)
+                        .lineLimit(1).truncationMode(.middle).frame(maxWidth: .infinity, alignment: .leading)
+                        .help(destination?.path ?? "Choose a drive or folder")
+                    Menu("Choose…") {
+                        // Names and free space come from loadDrives, read off the main thread, not on every redraw.
+                        ForEach(driveRows) { row in
+                            Button("\(row.name) · \(kitBytes(row.free)) free") { destination = row.url; copier.reset() }
+                        }
+                        if !driveRows.isEmpty { Divider() }
+                        Button("Choose a Folder…") { choosingFolder = true }
+                    }.menuStyle(.borderedButton)
                 }
-                HStack {
-                    Button("Choose a Folder…") { choosingFolder = true }
-                    if let destination, !drives.contains(destination) {
-                        Text(destination.path).font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
-                    }
-                }
+                if destination == nil { Text("An OfflineKit folder will be created at your destination.").font(.caption).foregroundStyle(.secondary) }
                 if let destination {
                     Text("The copy goes in \(KitCopy.kitFolder(in: destination).path). Plugged into another Mac, Offline Kit finds it there.")
                         .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -139,26 +145,68 @@ struct KitCopySheet: View {
                 }
             }
             .card(padding: 16)
-            HStack {
-                Spacer()
-                if copier.phase == .planning { ProgressView().controlSize(.small); Text("Looking at what to copy…").foregroundStyle(.secondary) }
-                Button("Next") { Task { await prepare() } }
-                    .buttonStyle(.borderedProminent).controlSize(.large)
-                    .disabled(destination == nil || sources.isEmpty || destinationProblem != nil || copier.phase == .planning)
-            }
+            privacyNote
         }
+        .disabled(copier.phase == .planning)
+    }
+
+    private var stageIndex: Int {
+        switch copier.phase {
+        case .idle, .planning: 0
+        case .ready: 1
+        default: 2
+        }
+    }
+
+    private var stageHeader: some View {
+        let reporting = copier.phase == .finished || copier.phase == .stopped
+        let titles = ["Choose", "Review", reporting ? "Report" : "Copy & check"]
+        return HStack(spacing: 10) {
+            ForEach(Array(titles.enumerated()), id: \.offset) { index, title in
+                HStack(spacing: 7) {
+                    Image(systemName: index < stageIndex ? "checkmark.circle.fill" : "\(index + 1).circle.fill")
+                    Text(title).font(.callout.weight(index == stageIndex ? .semibold : .regular))
+                }
+                .foregroundStyle(index == stageIndex ? Color.accentColor : Color.secondary)
+                .padding(.horizontal, 12).padding(.vertical, 9)
+                .background(index == stageIndex ? Color.accentColor.opacity(0.12) : Color.clear, in: Capsule())
+                .accessibilityLabel("Step \(index + 1): \(title)\(index == stageIndex ? ", current" : index < stageIndex ? ", complete" : "")")
+                if index < 2 { Image(systemName: "chevron.right").font(.caption).foregroundStyle(.tertiary) }
+            }
+        }.frame(maxWidth: .infinity).padding(.horizontal, 16).padding(.vertical, 12).background(.bar)
+    }
+
+    private var chooseFooter: some View {
+        HStack(alignment: .center, spacing: 18) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(copier.phase == .planning ? "Reviewing files and space…" : "Review files, space and replacements next.").font(.callout.weight(.semibold))
+                Text("Copied files are read back and compared with the originals.").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            if copier.phase == .planning { ProgressView().controlSize(.small) }
+            Button("Review copy", systemImage: "arrow.right") { Task { await prepare() } }
+                .buttonStyle(.borderedProminent).controlSize(.large)
+                .disabled(destination == nil || sources.isEmpty || destinationProblem != nil || copier.phase == .planning)
+        }.padding(18).background(.bar)
     }
 
     private var privacyNote: some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: "lock.fill").foregroundStyle(.tint).font(.title3)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Your private info stays here").font(.headline)
-                Text("People, health notes, contacts and saved answers in Prepare are encrypted with a key kept in this Mac’s keychain. The copy won’t include them, and the key can’t be exported. Whoever gets the copy starts with an empty Prepare.")
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Private household information stays here").font(.headline)
+                Text("People, health notes, contacts and saved answers are excluded from the copy.")
                     .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                DisclosureGroup("What is excluded?") {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(PrivateStore.usesPassphrase
+                             ? "Your private household information stays on this drive, locked with your passphrase. It isn’t copied."
+                             : "Private household records are encrypted with a key kept in this Mac’s keychain. Neither those records nor the key are exported.")
+                        Text("Unfinished downloads, broken links and damaged reference archives are skipped. The review lists what won’t be copied and why.")
+                    }.font(.caption).foregroundStyle(.secondary).padding(.top, 5)
+                }
             }
-        }
-        .card(padding: 16)
+        }.card(padding: 16)
     }
 
     // MARK: Review
@@ -246,7 +294,7 @@ struct KitCopySheet: View {
                 Button("Stop", role: .destructive) { copier.stop() }
                 Spacer()
             }
-            Text("You can close this window; the copy keeps going. Stopped copies pick up where they left off: files already copied are skipped next time.")
+            Text("You can hide this window; the copy keeps going. After stopping, a new review lists what still needs copying.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -285,7 +333,7 @@ struct KitCopySheet: View {
             VStack(alignment: .leading, spacing: 8) {
                 if let plan = copier.plan {
                     fact("Files", "\(outcome.copied) copied · \(plan.identical.count) already there")
-                    fact("Size copied", kitBytes(copier.bytesTotal / 2))
+                    fact("Planned copy size", kitBytes(copier.bytesTotal / 2))
                 }
                 fact("Verified OK", "\(outcome.verified) of \(outcome.copied)")
                 fact("Failures", "\(outcome.failures.count)")

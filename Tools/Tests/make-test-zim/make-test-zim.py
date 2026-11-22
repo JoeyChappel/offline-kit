@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Synthetic ZIM archives for Ask retrieval and answer-index tests. No downloads, no real content.
 
-usage: make-test-zim.py <out folder> [--small-only]
+usage: make-test-zim.py <out folder> [--small-only] [--big N]
   practical.zim     ~300 health, repair and food articles with sections and a full-text index
   encyclopedia.zim  ~20,000 short encyclopedia-style articles (lead + one section), also indexed;
                     the practical topics appear here too, shorter, so both archives answer the same questions
+  --big N           only big.zim: N Wikipedia-sized stubs (a lead of 40 to 220 words, two or three sections) over
+                    a Zipf-distributed vocabulary of 60,000 made-up words plus everyday English, no full-text index.
+                    For answer-index scale tests (300,000 articles: about 4 minutes and 0.5 GB).
 
 Builds the zimwrite helper (Objective-C++ against Vendor/CoreKiwix.xcframework) when it isn't there yet.
 """
@@ -526,6 +529,87 @@ def encyclopedia_articles(rng, count, practical):
     return out
 
 
+# --- Big archive: many stubs over a realistic vocabulary ----------------------------------------------------
+
+COMMON = ("water power river storm village town house food plant people region city road school farm market winter "
+          "summer year church bridge island coast mountain forest valley family war king music film game team station "
+          "railway company population century history language district province border lake field bread fire light "
+          "stone iron wood glass engine ship boat army museum park garden hospital doctor child health disease").split()
+
+
+def big_vocabulary(rng, n=60_000):
+    words, seen = [], set()
+    while len(words) < n:
+        w = "".join(rng.choice(SYL) for _ in range(rng.choice((2, 2, 3, 3, 4))))
+        if w not in seen:
+            seen.add(w); words.append(w)
+    # Zipf: the k-th word is used about 1/k as often as the first.
+    cum, total = [], 0.0
+    for k in range(1, n + 1):
+        total += 1.0 / k
+        cum.append(total)
+    return words, cum
+
+
+def big_sentence(rng, vocab, cum, region):
+    made = rng.choices(vocab, cum_weights=cum, k=rng.randint(4, 9))
+    common = rng.sample(COMMON, k=rng.randint(1, 3))
+    words = made + common
+    rng.shuffle(words)
+    return f"The {words[0]} of the {region} region " + " ".join(words[1:]) + f" since {rng.randint(1200, 2025)}."
+
+
+def big_articles(rng, count, practical):
+    vocab, cum = big_vocabulary(rng)
+    out, seen = [], set()
+    for path, title, cat, sec, context in practical:
+        if context is None:
+            out.append((path, title, cat, sec, None, True))
+            seen.add(title)
+    while len(out) < count:
+        kind, lead_t, facts = rng.choice(KINDS)
+        name = " ".join(w.capitalize() for w in rng.choices(vocab, cum_weights=cum, k=rng.choice((1, 2, 2, 3))))
+        title = f"{name} ({kind})"
+        if title in seen:
+            continue
+        seen.add(title)
+        region = rng.choice(REGIONS)
+        lead = [f"{name} {lead_t.format(region=region, n=rng.randint(2, 98), other=stub_title(rng))}"]
+        lead += [big_sentence(rng, vocab, cum, region) for _ in range(rng.randint(2, 16))]
+        lead.insert(rng.randrange(1, len(lead) + 1), rng.choice(facts))
+        sec = {"lead": lead, "_base": title}
+        for h in rng.sample(["History", "Geography", "Economy", "Culture", "Description", "Notes"], k=rng.randint(2, 3)):
+            sec[h] = [big_sentence(rng, vocab, cum, region) for _ in range(rng.randint(2, 5))]
+        out.append((slug(title), title, "encyclopedia", sec, None, True))
+    return out
+
+
+def big_html(title, sections, rng):
+    """A stub with every section (article_html's short form keeps one), light markup and a short reference list."""
+    parts = [f"<html><head><title>{title}</title></head><body>", NOISE.format(cat="encyclopedia"), f"<h1>{title}</h1>"]
+    lead = sections["lead"]
+    cut = max(1, len(lead) // 2) if len(lead) > 6 else len(lead)
+    parts.append(f"<p>{linkify(' '.join(lead[:cut]), rng)}<sup>[1]</sup></p>")
+    if cut < len(lead):
+        parts.append(f"<p>{linkify(' '.join(lead[cut:]), rng)}</p>")
+    for h, sentences in sections.items():
+        if h in ("lead", "_base"):
+            continue
+        parts.append(f"<h2>{h}</h2><p>{linkify(' '.join(sentences), rng)}</p>")
+    parts.append(references(rng, 3))
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+def write_big(path, items, rng):
+    with open(path, "w", encoding="utf-8") as f:
+        for i, (p, title, cat, sec, context, short) in enumerate(items):
+            if i:
+                f.write("\x1e")
+            html = big_html(title, sec, rng) if cat == "encyclopedia" else article_html(title, cat, sec, rng, context, short)
+            f.write(f"{p}\x1f{title}\x1f{html}")
+
+
 def write_records(path, items, rng):
     with open(path, "w", encoding="utf-8") as f:
         first = True
@@ -551,6 +635,16 @@ def main():
                         "-framework", "Security", "-lz", "-o", str(writer)], check=True)
     rng = random.Random(42)
     practical = practical_articles(rng)
+    if "--big" in sys.argv:
+        n = int(sys.argv[sys.argv.index("--big") + 1])
+        items = big_articles(rng, n, practical)
+        print(f"big: {len(items)} articles")
+        write_big(out / "big.records", items, rng)
+        del items
+        subprocess.run([str(writer), str(out / "big.records"), str(out / "big.zim"), "test_big_en",
+                        "Big encyclopedia (test)", "Synthetic stubs for answer-index scale tests", "noindex"], check=True)
+        (out / "big.records").unlink()
+        return
     print(f"practical: {len(practical)} articles")
     write_records(out / "practical.records", practical, rng)
     subprocess.run([str(writer), str(out / "practical.records"), str(out / "practical.zim"), "test_practical_en",

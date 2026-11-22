@@ -1,9 +1,15 @@
 import Foundation
 import Network
 import CryptoKit
+import zlib
 
-/// A small HTTP/1.1 server on Network.framework. One request per connection (Connection: close),
-/// which keeps it simple and is plenty for a household of phones and tablets.
+/// A small HTTP/1.1 server on Network.framework, plenty for a household of phones and tablets.
+///
+/// Connections stay open between requests (HTTP/1.1 keep-alive), so a phone loading forty covers doesn't open forty
+/// connections. The next request is read only once the response before it has been written in full; every request
+/// passes the same checks (Host, Connected Devices, sign-in) in ShareController, whatever connection it came on.
+/// A connection closes after `maxRequests`, after `idleTimeout` with no new request, when the device asks, and after
+/// any response that can't be framed by its length (server-sent events, WebSocket, a file that stopped mid-way).
 final class WebServer: @unchecked Sendable {
     struct Request: Sendable {
         var method: String
@@ -14,6 +20,8 @@ final class WebServer: @unchecked Sendable {
         var headers: [String: String]    // lowercased names
         var body: Data
         var remoteHost: String
+        /// HTTP/1.1 without "Connection: close" (and nothing this server can't frame): another request may follow.
+        var keepAlive = false
 
         var cookies: [String: String] {
             var out: [String: String] = [:]
@@ -29,7 +37,31 @@ final class WebServer: @unchecked Sendable {
     final class Responder: @unchecked Sendable {
         private let connection: NWConnection
         private var finished = false
-        init(_ connection: NWConnection) { self.connection = connection }
+        /// Whether the connection carries another request after this response. Starts as the server allows (the device
+        /// asked to keep it, and it hasn't reached `maxRequests`) and turns false for any response that has to close.
+        private(set) var keepAlive: Bool
+        /// Requests this connection may still carry after this one, for the Keep-Alive header.
+        private let remaining: Int
+        /// The device sent "Accept-Encoding: gzip": text responses over 1 KB go compressed (see `send`).
+        let acceptsGzip: Bool
+        /// Called once this response has been written in full, on a connection that stays open: reads the next request.
+        fileprivate var onReuse: (@Sendable () -> Void)?
+
+        init(_ connection: NWConnection, keepAlive: Bool = false, remaining: Int = 0, acceptsGzip: Bool = false) {
+            self.connection = connection
+            self.keepAlive = keepAlive
+            self.remaining = remaining
+            self.acceptsGzip = acceptsGzip
+        }
+
+        /// This response ends the connection (a refusal, a stream with no length). Call before anything is written.
+        func closeAfterResponse() { keepAlive = false }
+
+        /// The Connection header lines for a response head, closing the connection when `close` (or when it can't stay open).
+        func connectionHeaders(close: Bool = false) -> String {
+            if close { keepAlive = false }
+            return keepAlive ? "Connection: keep-alive\r\nKeep-Alive: timeout=\(Int(WebServer.idleTimeout)), max=\(remaining)\r\n" : "Connection: close\r\n"
+        }
 
         // Connected Devices (ShareDevices): headers added to every response (the device cookie), and the bytes written
         // and the end of the response reported back. Set before the first write.
@@ -40,18 +72,35 @@ final class WebServer: @unchecked Sendable {
         private var extraHeaderLines: String {
             extraHeaders.map { "\($0.0): \($0.1.filter { $0 != "\r" && $0 != "\n" })\r\n" }.joined()
         }
-        deinit { if !finished { onFinish?() } }
+        deinit {
+            // Answered nothing (or stopped part-way without finishing): the connection can't carry another request.
+            if !finished { onFinish?(); connection.cancel() }
+        }
 
+        /// Sends a whole response. Text over 1 KB goes gzip-compressed when the device accepts it (see `Gzip`); a strong
+        /// ETag then becomes weak, since the bytes differ from the uncompressed copy's.
         func send(status: Int, contentType: String, body: Data, headers: [String: String] = [:]) async {
             // A type can come from inside an archive: a line break in it must not start a header of its own.
             let contentType = contentType.filter { $0 != "\r" && $0 != "\n" }
-            var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.count)\r\n"
-            head += "Connection: close\r\nX-Content-Type-Options: nosniff\r\n"
+            var body = body, headers = headers
+            if Gzip.isCompressible(contentType), headers["Content-Range"] == nil, headers["Content-Encoding"] == nil {
+                headers["Vary"] = "Accept-Encoding"
+                if acceptsGzip, status == 200, body.count > Gzip.minimumSize, let packed = Gzip.compress(body, key: headers["ETag"].map { $0 + contentType }) {
+                    body = packed
+                    headers["Content-Encoding"] = "gzip"
+                    headers["Accept-Ranges"] = nil   // ranges would count compressed bytes; ranged requests get the plain bytes
+                }
+                if acceptsGzip, status == 200 || status == 304, let etag = headers["ETag"], !etag.hasPrefix("W/") { headers["ETag"] = "W/" + etag }
+            }
+            var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\nContent-Type: \(contentType)\r\n"
+            // A 304 has no body; its length would describe the copy the device already has.
+            if status != 304 { head += "Content-Length: \(body.count)\r\n" }
+            head += connectionHeaders() + "X-Content-Type-Options: nosniff\r\n"
             if headers["Cache-Control"] == nil { head += "Cache-Control: no-store\r\n" }
             for (k, v) in headers { head += "\(k): \(v.filter { $0 != "\r" && $0 != "\n" })\r\n" }
             head += extraHeaderLines + "\r\n"
-            await write(Data(head.utf8) + body)
-            finish()
+            let sent = await write(Data(head.utf8) + body)
+            finish(complete: sent)
         }
 
         func send(status: Int = 200, json: Any, headers: [String: String] = [:]) async {
@@ -96,15 +145,15 @@ final class WebServer: @unchecked Sendable {
                 if openEnded { upper = min(upper, lower + 16 * 1024 * 1024 - 1) }
             }
             var head = "HTTP/1.1 \(status) \(Self.reason(status))\r\nContent-Type: \(contentType)\r\nContent-Length: \(upper - lower + 1)\r\n"
-            head += "Accept-Ranges: bytes\r\nConnection: close\r\n"
+            head += "Accept-Ranges: bytes\r\n" + connectionHeaders()
             if validators.isEmpty { head += "Cache-Control: no-store\r\n" }
             for (k, v) in validators { head += "\(k): \(v)\r\n" }
             if status == 206 { head += "Content-Range: bytes \(lower)-\(upper)/\(total)\r\n" }
             head += extraHeaderLines + "\r\n"
-            await write(Data(head.utf8))
+            guard await write(Data(head.utf8)) else { finish(complete: false); return }
+            var remaining = upper - lower + 1
             do {
                 try handle.seek(toOffset: UInt64(lower))
-                var remaining = upper - lower + 1
                 while remaining > 0 {
                     let chunk = try handle.read(upToCount: Int(min(remaining, 1 << 20))) ?? Data()
                     if chunk.isEmpty { break }
@@ -113,7 +162,8 @@ final class WebServer: @unchecked Sendable {
                     remaining -= Int64(chunk.count)
                 }
             } catch {}
-            finish()
+            // Fewer bytes than the Content-Length promised (the file shrank, a read failed): only closing can say so.
+            finish(complete: remaining == 0)
         }
 
         func redirect(to location: String) async {
@@ -122,7 +172,8 @@ final class WebServer: @unchecked Sendable {
 
         /// Server-sent events: the body stays open until `finish()`.
         func startEventStream() async {
-            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nX-Accel-Buffering: no\r\n" + extraHeaderLines + "\r\n"
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\n"
+                + connectionHeaders(close: true) + "X-Accel-Buffering: no\r\n" + extraHeaderLines + "\r\n"
             await write(Data(head.utf8))
         }
 
@@ -172,15 +223,25 @@ final class WebServer: @unchecked Sendable {
             let accept = Data(Insecure.SHA1.hash(data: Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8))).base64EncodedString()
             let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: \(accept)\r\n\r\n"
             finished = true   // the connection now belongs to the WebSocket
+            keepAlive = false
             guard await write(Data(head.utf8)) else { connection.cancel(); return nil }
             return WebSocket(connection)
         }
 
-        func finish() {
+        /// Ends the response. On a connection that stays open, the server then reads the device's next request; otherwise
+        /// the connection closes once everything written has gone out. `complete: false` when the body came up short
+        /// of its Content-Length, which forces a close.
+        func finish(complete: Bool = true) {
             guard !finished else { return }
             finished = true
+            if !complete { keepAlive = false }
             if unreported > 0 { onBytes?(unreported); unreported = 0 }
             onFinish?()
+            if keepAlive, let onReuse {
+                self.onReuse = nil
+                onReuse()
+                return
+            }
             connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [connection] _ in
                 connection.cancel()
             })
@@ -198,6 +259,9 @@ final class WebServer: @unchecked Sendable {
             case 403: "Forbidden"
             case 404: "Not Found"
             case 413: "Payload Too Large"
+            case 416: "Range Not Satisfiable"
+            case 421: "Misdirected Request"
+            case 422: "Unprocessable Content"
             case 429: "Too Many Requests"
             case 503: "Service Unavailable"
             default: "Error"
@@ -364,10 +428,7 @@ final class WebServer: @unchecked Sendable {
             }
         }
         connection.start(queue: queue)
-        // A device gets 30 seconds to send its request, so slow or stalled connections can't pile up.
-        let arrived = Arrived()
-        queue.asyncAfter(deadline: .now() + 30) { if !arrived.value { connection.cancel() } }
-        receive(connection, buffer: Data(), remote: remote, arrived: arrived)
+        nextRequest(connection, buffer: Data(), remote: remote, served: 0)
     }
 
     private final class Arrived: @unchecked Sendable { var value = false }
@@ -375,30 +436,59 @@ final class WebServer: @unchecked Sendable {
     private var openConnections = 0
     private var connectionsByDevice: [String: Int] = [:]
 
-    private func receive(_ connection: NWConnection, buffer: Data, remote: String, arrived: Arrived) {
+    /// Most requests one connection carries before it closes (a device then opens a fresh one).
+    static let maxRequests = 100
+    /// How long an open connection waits for the device's next request.
+    static let idleTimeout: TimeInterval = 8
+
+    /// Waits for the next request on a connection. A device gets 30 seconds to send each request in full, so slow or
+    /// stalled connections can't pile up; between requests, a connection with nothing new for `idleTimeout` closes.
+    /// `buffer` holds bytes that arrived after the last request (a device that sent its next request early).
+    private func nextRequest(_ connection: NWConnection, buffer: Data, remote: String, served: Int) {
+        let arrived = Arrived(), started = Arrived()
+        started.value = !buffer.isEmpty
+        queue.asyncAfter(deadline: .now() + 30) { if !arrived.value { connection.cancel() } }
+        if served > 0 {
+            queue.asyncAfter(deadline: .now() + Self.idleTimeout) { if !started.value { connection.cancel() } }
+        }
+        process(connection, buffer: buffer, remote: remote, served: served, arrived: arrived, started: started)
+    }
+
+    private func process(_ connection: NWConnection, buffer: Data, remote: String, served: Int, arrived: Arrived, started: Arrived) {
+        if let (request, used) = Self.parseRequest(buffer, remote: remote) {
+            arrived.value = true
+            started.value = true
+            let rest = buffer.count > used ? Data(buffer.suffix(from: buffer.startIndex + used)) : Data()
+            let keep = request.keepAlive && served + 1 < Self.maxRequests
+            let gzip = (request.headers["accept-encoding"] ?? "").lowercased().split(separator: ",")
+                .contains { $0.split(separator: ";").first?.trimmingCharacters(in: .whitespaces) == "gzip" && !$0.replacingOccurrences(of: " ", with: "").contains("q=0") }
+            let responder = Responder(connection, keepAlive: keep, remaining: Self.maxRequests - served - 1, acceptsGzip: gzip)
+            if keep {
+                responder.onReuse = { [weak self] in
+                    guard let self else { connection.cancel(); return }
+                    self.queue.async { self.nextRequest(connection, buffer: rest, remote: remote, served: served + 1) }
+                }
+            }
+            let handler = self.handler
+            Task { await handler(request, responder) }
+            return
+        }
+        if buffer.count > 256 * 1024 { connection.cancel(); return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+            guard let self else { connection.cancel(); return }
             var buffer = buffer
-            if let data { buffer.append(data) }
-            if buffer.count > 256 * 1024 || error != nil {
-                connection.cancel()
-                return
-            }
-            if let request = Self.parse(buffer, remote: remote) {
-                arrived.value = true
-                let responder = Responder(connection)
-                let handler = self.handler
-                Task { await handler(request, responder) }
-            } else if isComplete {
-                connection.cancel()
-            } else {
-                self.receive(connection, buffer: buffer, remote: remote, arrived: arrived)
-            }
+            if let data, !data.isEmpty { buffer.append(data); started.value = true }
+            if error != nil { connection.cancel(); return }
+            if isComplete && Self.parseRequest(buffer, remote: remote) == nil { connection.cancel(); return }
+            self.process(connection, buffer: buffer, remote: remote, served: served, arrived: arrived, started: started)
         }
     }
 
     /// Returns a request once headers and the full body have arrived.
-    static func parse(_ data: Data, remote: String) -> Request? {
+    static func parse(_ data: Data, remote: String) -> Request? { parseRequest(data, remote: remote)?.request }
+
+    /// A request once its headers and full body have arrived, and how many bytes of `data` it took up.
+    static func parseRequest(_ data: Data, remote: String) -> (request: Request, used: Int)? {
         guard let end = data.range(of: Data("\r\n\r\n".utf8)),
               let head = String(data: data[data.startIndex..<end.lowerBound], encoding: .utf8) else { return nil }
         var lines = head.components(separatedBy: "\r\n")
@@ -413,6 +503,7 @@ final class WebServer: @unchecked Sendable {
         let bodyStart = end.upperBound
         guard data.count - (bodyStart - data.startIndex) >= length else { return nil }
         let body = data[bodyStart..<(bodyStart + length)]
+        let used = bodyStart + length - data.startIndex
 
         let target = String(parts[1])
         let pieces = target.split(separator: "?", maxSplits: 1).map(String.init)
@@ -427,9 +518,15 @@ final class WebServer: @unchecked Sendable {
                 query[key] = kv.count > 1 ? kv[1] : ""
             }
         }
-        return Request(method: String(parts[0]), path: rawPath.removingPercentEncoding ?? rawPath, rawPath: rawPath,
-                       rawQuery: pieces.count > 1 ? pieces[1] : nil,
-                       query: query, headers: headers, body: Data(body), remoteHost: remote)
+        // Another request may follow only on HTTP/1.1 without "Connection: close", and only when this one's end is known:
+        // a chunked body (which this server doesn't read) or a HEAD request (answered with a body) closes the connection.
+        let tokens = (headers["connection"] ?? "").lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        let keepAlive = parts.count >= 3 && parts[2] == "HTTP/1.1" && !tokens.contains("close")
+            && headers["transfer-encoding"] == nil && parts[0] != "HEAD"
+        let request = Request(method: String(parts[0]), path: rawPath.removingPercentEncoding ?? rawPath, rawPath: rawPath,
+                              rawQuery: pieces.count > 1 ? pieces[1] : nil,
+                              query: query, headers: headers, body: Data(body), remoteHost: remote, keepAlive: keepAlive)
+        return (request, used)
     }
 
     static func isLocal(_ host: String) -> Bool {
@@ -449,5 +546,79 @@ enum ShareDeviceKey {
         let address = (host.split(separator: "%").first.map(String.init) ?? host).lowercased()
         if address.hasPrefix("::ffff:"), address.contains(".") { return String(address.dropFirst(7)) }   // IPv4 as IPv6
         return address
+    }
+}
+
+/// Gzip for text responses (the page, scripts, JSON). Responses with an ETag are compressed once and the result kept,
+/// so the page, play.js and an unchanged media list aren't compressed again for every device.
+enum Gzip {
+    /// Smaller bodies gain too little to be worth it.
+    static let minimumSize = 1024
+
+    /// Text types only: media, images (other than SVG), PDFs and archives are already compressed or are streamed by range.
+    static func isCompressible(_ contentType: String) -> Bool {
+        let type = contentType.lowercased().split(separator: ";").first?.trimmingCharacters(in: .whitespaces) ?? ""
+        if type == "text/event-stream" { return false }
+        return type.hasPrefix("text/") || type == "application/json" || type == "application/javascript"
+            || type == "application/manifest+json" || type == "image/svg+xml" || type == "application/xhtml+xml"
+            || type == "application/xml"
+    }
+
+    private final class Cache: @unchecked Sendable {
+        let lock = NSLock()
+        var entries: [String: (data: Data, used: UInt64)] = [:]
+        var bytes = 0
+        var clock: UInt64 = 0
+    }
+    private static let cache = Cache()
+    private static let cacheLimit = 16 << 20
+
+    /// The gzip form of `data`, or nil if it couldn't be made (or wouldn't be smaller). `key` (an ETag plus the type)
+    /// names content that never changes under that key: its compressed form is kept, least recently used dropped first.
+    static func compress(_ data: Data, key: String?) -> Data? {
+        let key = key.map { "\($0)|\(data.count)" }
+        if let key {
+            cache.lock.lock()
+            defer { cache.lock.unlock() }
+            if let hit = cache.entries[key] {
+                cache.clock += 1
+                cache.entries[key]?.used = cache.clock
+                return hit.data
+            }
+        }
+        guard let packed = deflate(data), packed.count < data.count else { return nil }
+        if let key, packed.count < cacheLimit / 4 {
+            cache.lock.lock()
+            defer { cache.lock.unlock() }
+            cache.clock += 1
+            if cache.entries[key] == nil { cache.bytes += packed.count }
+            cache.entries[key] = (packed, cache.clock)
+            while cache.bytes > cacheLimit, let oldest = cache.entries.min(by: { $0.value.used < $1.value.used }) {
+                cache.bytes -= oldest.value.data.count
+                cache.entries[oldest.key] = nil
+            }
+        }
+        return packed
+    }
+
+    /// zlib, with the gzip wrapper (window bits 15 + 16).
+    static func deflate(_ data: Data, level: Int32 = 6) -> Data? {
+        var stream = z_stream()
+        guard deflateInit2_(&stream, level, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else { return nil }
+        defer { deflateEnd(&stream) }
+        let bound = Int(deflateBound(&stream, uLong(data.count)))
+        var out = Data(count: bound)
+        let status = data.withUnsafeBytes { (input: UnsafeRawBufferPointer) -> Int32 in
+            out.withUnsafeMutableBytes { (output: UnsafeMutableRawBufferPointer) -> Int32 in
+                stream.next_in = UnsafeMutablePointer(mutating: input.bindMemory(to: Bytef.self).baseAddress)
+                stream.avail_in = uInt(input.count)
+                stream.next_out = output.bindMemory(to: Bytef.self).baseAddress
+                stream.avail_out = uInt(output.count)
+                return zlib.deflate(&stream, Z_FINISH)
+            }
+        }
+        guard status == Z_STREAM_END else { return nil }
+        out.count = Int(stream.total_out)
+        return out
     }
 }

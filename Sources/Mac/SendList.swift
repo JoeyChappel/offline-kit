@@ -42,7 +42,8 @@ final class SendList {
     var totalSize: Int64 { entries.reduce(0) { $0 + $1.size } }
     var waitingCount: Int { entries.filter { $0.receivedBy.isEmpty }.count }
 
-    func contains(_ source: SendSource) -> Bool { entries.contains { $0.sources.first == source.key } }
+    func contains(_ source: SendSource) -> Bool { contains(key: source.key) }
+    func contains(key: String) -> Bool { entries.contains { $0.sources.first == key } }
 
     /// A short confirmation after something is added or taken off ("Added to Send to iPhone").
     struct Notice: Equatable, Identifiable {
@@ -238,14 +239,14 @@ extension WebServer.Responder {
         let length = total == 0 ? 0 : upper - lower + 1
         var head = "HTTP/1.1 \(status) \(status == 206 ? "Partial Content" : "OK")\r\nContent-Type: application/octet-stream\r\n"
         head += "Content-Length: \(length)\r\nAccept-Ranges: bytes\r\nETag: \(etag)\r\nLast-Modified: \(lastModified)\r\n"
-        head += "Connection: close\r\nCache-Control: no-store\r\n"
+        head += connectionHeaders() + "Cache-Control: no-store\r\n"
         if status == 206 { head += "Content-Range: bytes \(lower)-\(upper)/\(total)\r\n" }
         head += "\r\n"
-        guard await write(Data(head.utf8)) else { finish(); return }
+        guard await write(Data(head.utf8)) else { finish(complete: false); return }
         let chunkSize = throttleKBps > 0 ? 64 * 1024 : 1 << 20
+        var remaining = length
         do {
             try handle.seek(toOffset: UInt64(lower))
-            var remaining = length
             while remaining > 0 {
                 let chunk = try handle.read(upToCount: Int(min(remaining, Int64(chunkSize)))) ?? Data()
                 if chunk.isEmpty { break }
@@ -255,7 +256,8 @@ extension WebServer.Responder {
                 if throttleKBps > 0 { try? await Task.sleep(for: .seconds(Double(chunk.count) / Double(throttleKBps * 1024))) }
             }
         } catch {}
-        finish()
+        // Short of the Content-Length (the phone went away, or the file changed): the connection has to close.
+        finish(complete: remaining == 0)
     }
 
     nonisolated static func httpDate(_ date: Date) -> String {

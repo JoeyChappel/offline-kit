@@ -362,7 +362,7 @@ final class ShareController {
         case ("POST", "/api/media/progress"):
             await mediaProgress(req, res)
         case ("GET", let path) where path.hasPrefix("/media/"):
-            await mediaFile(path: path, range: req.headers["range"], requestHeaders: req.headers, res)
+            await mediaFile(path: path, range: req.headers["range"], width: ShareArtwork.bucket(req.query["w"]), requestHeaders: req.headers, res)
         case ("GET", "/api/games"):
             await gameList(res)
         case ("GET", let path) where path.hasPrefix("/api/games/art/"):
@@ -420,6 +420,11 @@ final class ShareController {
                 && SharePolicy.Scope(libraries: folders).allows(url)
         }.value
         guard allowed else { await res.send(status: 404, text: "Not found"); return }
+        // ?w=: a copy sized for the tile (checked above, like the original).
+        if let width = ShareArtwork.bucket(req.query["w"]), let copy = await ShareArtwork.resized(url, width: width) {
+            await res.sendFile(copy.url, contentType: copy.contentType, rangeHeader: nil, cacheControl: "private, max-age=300", requestHeaders: req.headers)
+            return
+        }
         await res.sendFile(url, contentType: "image/png", rangeHeader: nil, cacheControl: "private, max-age=300", requestHeaders: req.headers)
     }
 
@@ -448,7 +453,7 @@ final class ShareController {
     }
 
     /// The sharing page, built once: it is the same for every device until the app is updated.
-    nonisolated private static let indexPage = versioned(WebApp.html)
+    nonisolated private static let indexPage = versioned(WebApp.slim(WebApp.html))
     /// What a phone or tablet reads when the page is added to its Home Screen.
     nonisolated private static let manifest = versioned(WebApp.manifest)
 
@@ -897,8 +902,8 @@ final class ShareController {
         await res.send(json: ["ok": true])
     }
 
-    /// /media/<id>/<track index> or /media/<id>/cover
-    private func mediaFile(path: String, range: String?, requestHeaders: [String: String], _ res: WebServer.Responder) async {
+    /// /media/<id>/<track index> or /media/<id>/cover. Artwork with `width` (from ?w=) is sent as a copy at most that wide.
+    private func mediaFile(path: String, range: String?, width: Int? = nil, requestHeaders: [String: String], _ res: WebServer.Responder) async {
         let parts = path.dropFirst("/media/".count).split(separator: "/").map(String.init)
         if media?.items.isEmpty ?? true, let media, let library { await media.reload(library: library) }
         guard parts.count == 2, let item = mediaItem(parts[0]) else { await res.send(status: 404, text: "Not found"); return }
@@ -913,6 +918,12 @@ final class ShareController {
         // Artwork is small and rarely changes: devices keep it for a few minutes, then check with a cheap 304.
         // Video and audio are never cached (they stream by range).
         let isArtwork = parts[1] == "cover" || parts[1] == "thumb"
+        // A phone-sized copy, made from the file just checked (see ShareArtwork).
+        if isArtwork, let width, let copy = await ShareArtwork.resized(url, width: width) {
+            await res.sendFile(copy.url, contentType: copy.contentType, rangeHeader: nil,
+                               cacheControl: "private, max-age=300", requestHeaders: requestHeaders)
+            return
+        }
         await res.sendFile(url, contentType: Self.mimeType(url), rangeHeader: range,
                            cacheControl: isArtwork ? "private, max-age=300" : nil, requestHeaders: requestHeaders)
     }

@@ -163,7 +163,8 @@ final class EPUBReaderModel {
 private struct EPUBReaderView: View {
     @Environment(MediaLibrary.self) private var media
     @State private var model: EPUBReaderModel
-    @State private var showingChapters = false
+    @State private var showingAppearance = false
+    @State private var compact = false
 
     init(item: MediaItem) { _model = State(initialValue: EPUBReaderModel(item: item)) }
 
@@ -181,6 +182,10 @@ private struct EPUBReaderView: View {
             }
         }
         .navigationTitle(model.book?.title ?? MediaCatalog.displayTitle(model.item.title))
+        #if os(macOS)
+        .navigationSubtitle(model.book?.author ?? "")
+        #endif
+        .onGeometryChange(for: Bool.self) { $0.size.width < 500 } action: { compact = $0 }
         .toolbar {
             ToolbarItemGroup {
                 if let book = model.book {
@@ -190,48 +195,89 @@ private struct EPUBReaderView: View {
                                 if index == model.chapter { Label(chapter.title, systemImage: "checkmark") } else { Text(chapter.title) }
                             }
                         }
-                    } label: { Label("Chapters", systemImage: "list.bullet") }
-                    .help("Chapters")
+                    } label: { Label("Contents", systemImage: "list.bullet").labelStyle(.titleAndIcon) }
+                    .help("Book contents")
                 }
-                Button { model.textScale = max(0.8, model.textScale - 0.1) } label: { Label("Smaller Text", systemImage: "textformat.size.smaller") }
-                    .keyboardShortcut("-", modifiers: .command)
-                    .help("Smaller text (⌘−)")
-                Button { model.textScale = min(2.2, model.textScale + 0.1) } label: { Label("Larger Text", systemImage: "textformat.size.larger") }
-                    .keyboardShortcut("+", modifiers: .command)
-                    .help("Larger text (⌘+)")
-                Picker("Theme", selection: $model.theme) {
-                    ForEach(ReaderTheme.allCases) { Text($0.label).tag($0) }
-                }
-                .pickerStyle(.menu)
-                .help("Page color")
+                Button { showingAppearance.toggle() } label: { Text("Aa").font(.system(.body, design: .serif, weight: .semibold)) }
+                    .accessibilityLabel("Reading appearance")
+                    .help("Text size and page color")
+                    .popover(isPresented: $showingAppearance, arrowEdge: .bottom) { appearance }
+
             }
         }
         .onAppear { model.start(media: media) }
         .onDisappear { model.saveNow() }
-        // ⌘= is the same key as ⌘+ without Shift; both make the text larger.
+        // Keep text-size shortcuts available while the appearance popover is closed.
         .background {
-            Button("Larger Text") { model.textScale = min(2.2, model.textScale + 0.1) }
-                .keyboardShortcut("=", modifiers: .command).opacity(0).allowsHitTesting(false).accessibilityHidden(true)
+            Group {
+                Button("Smaller Text", action: smallerText).keyboardShortcut("-", modifiers: .command)
+                Button("Larger Text", action: largerText).keyboardShortcut("+", modifiers: .command)
+                Button("Larger Text", action: largerText).keyboardShortcut("=", modifiers: .command)
+            }.opacity(0).allowsHitTesting(false).accessibilityHidden(true)
         }
+    }
+
+    private func smallerText() { model.textScale = max(0.8, model.textScale - 0.1) }
+    private func largerText() { model.textScale = min(2.2, model.textScale + 0.1) }
+
+    private var appearance: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Reading appearance").font(.headline)
+            Divider()
+            Text("Text size").font(.subheadline.weight(.semibold))
+            HStack(spacing: 16) {
+                Button("A−", action: smallerText).disabled(model.textScale <= 0.8).accessibilityLabel("Smaller text")
+                Spacer(minLength: 0)
+                Text("\(Int((model.textScale * 100).rounded()))%").font(.callout).monospacedDigit()
+                Spacer(minLength: 0)
+                Button("A+", action: largerText).disabled(model.textScale >= 2.2).accessibilityLabel("Larger text")
+            }.buttonStyle(.bordered)
+            Divider()
+            Text("Page color").font(.subheadline.weight(.semibold))
+            HStack(spacing: 14) {
+                ForEach(ReaderTheme.allCases) { theme in
+                    Button { model.theme = theme } label: {
+                        VStack(spacing: 7) {
+                            RoundedRectangle(cornerRadius: 10).fill(Color(hex: theme.background))
+                                .frame(height: 45)
+                                .overlay { RoundedRectangle(cornerRadius: 10).stroke(model.theme == theme ? Color.accentColor : Color.secondary.opacity(0.3), lineWidth: model.theme == theme ? 2 : 1) }
+                                .overlay { if model.theme == theme { Image(systemName: "checkmark").foregroundStyle(Color.accentColor).font(.headline) } }
+                            Text(theme.label).font(.callout)
+                        }.contentShape(Rectangle())
+                    }.buttonStyle(.plain)
+                        .accessibilityLabel("\(theme.label) page color")
+                        .accessibilityAddTraits(model.theme == theme ? .isSelected : [])
+                }
+            }
+        }.padding(18).frame(width: 280)
     }
 
     private func bottomBar(_ book: EPUBBook) -> some View {
         HStack(spacing: 14) {
-            Button { model.go(to: model.chapter - 1) } label: { Label("Previous", systemImage: "chevron.left") }
+            Button { model.go(to: model.chapter - 1) } label: {
+                if compact { Image(systemName: "chevron.left") } else { Label("Previous", systemImage: "chevron.left") }
+            }
+                .accessibilityLabel("Previous section")
                 .keyboardShortcut(.leftArrow, modifiers: [])
-                .help("Previous chapter (←)")
+                .help("Previous section (←)")
                 .disabled(model.chapter == 0)
             VStack(spacing: 4) {
                 Text(book.chapters[model.chapter].title).font(.callout.weight(.medium)).lineLimit(1)
                 ProgressView(value: (Double(model.chapter) + model.fraction) / Double(book.chapters.count))
-                    .frame(maxWidth: 360)
+                    .frame(maxWidth: 460)
+                    .accessibilityLabel("Section progress")
+                    .accessibilityValue("Section \(model.chapter + 1) of \(book.chapters.count)")
+                    .help("Progress treats each section equally; sections can have different lengths.")
                 Text("Section \(model.chapter + 1) of \(book.chapters.count)").font(.caption).foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity)
-            Button { model.go(to: model.chapter + 1) } label: { Label("Next", systemImage: "chevron.right") }
+            Button { model.go(to: model.chapter + 1) } label: {
+                if compact { Image(systemName: "chevron.right") } else { Label("Next", systemImage: "chevron.right") }
+            }
+                .accessibilityLabel("Next section")
                 .labelStyle(.titleAndIcon)
                 .keyboardShortcut(.rightArrow, modifiers: [])
-                .help("Next chapter (→)")
+                .help("Next section (→)")
                 .disabled(model.chapter + 1 >= book.chapters.count)
         }
         .buttonStyle(.bordered)

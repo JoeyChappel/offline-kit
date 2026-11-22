@@ -27,7 +27,20 @@ enum MediaCover {
         !MediaLibrary.holdsLooseTracks(item.tracks[0].deletingLastPathComponent(), root: item.root)
     }
 
-    static func hasCustom(_ item: MediaItem) -> Bool { FileManager.default.fileExists(atPath: customURL(for: item).path) }
+    /// Cards ask on every redraw (their menus), so the answer is kept until a cover changes or the library is rescanned.
+    private final class CustomAnswers: @unchecked Sendable {
+        let lock = NSLock()
+        var values: [String: Bool] = [:]
+    }
+    private static let customAnswers = CustomAnswers()
+    static func forgetCustomAnswers() { customAnswers.lock.withLock { customAnswers.values.removeAll() } }
+
+    static func hasCustom(_ item: MediaItem) -> Bool {
+        if let known = customAnswers.lock.withLock({ customAnswers.values[item.id] }) { return known }
+        let answer = FileManager.default.fileExists(atPath: customURL(for: item).path)
+        customAnswers.lock.withLock { customAnswers.values[item.id] = answer }
+        return answer
+    }
 
     /// The custom cover for a media file found by the scan, if one has been set.
     nonisolated static func sidecar(for file: URL) -> URL? {
@@ -51,12 +64,14 @@ enum MediaCover {
         CGImageDestinationAddImage(destination, picture, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
         guard CGImageDestinationFinalize(destination) else { throw CoverError.cantWrite }
         CoverStamp.shared.value += 1
+        forgetCustomAnswers()
     }
 
     /// Removes the custom cover; the original art (embedded, cover.jpg or video still) shows again.
     static func reset(for item: MediaItem) {
         try? FileManager.default.removeItem(at: customURL(for: item))
         CoverStamp.shared.value += 1
+        forgetCustomAnswers()
     }
 
     enum CoverError: LocalizedError {
@@ -109,17 +124,16 @@ struct MediaCardMenu: ViewModifier {
     let item: MediaItem
     @Environment(MediaLibrary.self) private var media
     @Environment(Library.self) private var library
-    @State private var picking = false
-    @State private var error: String?
 
     func body(content: Content) -> some View {
+        // The picture chooser and its error alert live once on the screen (see mediaCoverPicker), not on every card.
         content
             .contextMenu {
                 #if os(macOS)
                 ShowInFinderButton(url: item.tracks[0]).disabled(item.unavailable != nil)
                 SendToPhoneButton(media: item, info: media.info[item.progressKey]).disabled(item.unavailable != nil)
                 #endif
-                Button("Choose Cover Art…", systemImage: "photo") { picking = true }.disabled(item.unavailable != nil)
+                Button("Choose Cover Art…", systemImage: "photo") { CoverPicker.shared.choose(for: item) }.disabled(item.unavailable != nil)
                 if item.unavailable == nil, MediaCover.hasCustom(item) {
                     Button("Use Original Art", systemImage: "arrow.uturn.backward") {
                         MediaCover.reset(for: item)
@@ -127,8 +141,33 @@ struct MediaCardMenu: ViewModifier {
                     }
                 }
             }
+    }
+}
+
+/// Which item "Choose Cover Art…" was picked for. One chooser per screen reads it.
+@MainActor @Observable final class CoverPicker {
+    static let shared = CoverPicker()
+    private(set) var item: MediaItem?
+    /// Goes up with each request, so asking again for the same item opens the chooser again.
+    private(set) var ticket = 0
+    func choose(for item: MediaItem) { self.item = item; ticket += 1 }
+    func finish() { item = nil }
+}
+
+/// The one picture chooser and error alert for every card's "Choose Cover Art…". Put on the screen that shows the cards.
+private struct MediaCoverPickerHost: ViewModifier {
+    @Environment(MediaLibrary.self) private var media
+    @Environment(Library.self) private var library
+    @State private var picking = false
+    @State private var error: String?
+
+    func body(content: Content) -> some View {
+        content
+            .onChange(of: CoverPicker.shared.ticket) { picking = true }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.image]) { result in
-                guard case .success(let url) = result else { return }
+                let item = CoverPicker.shared.item
+                CoverPicker.shared.finish()
+                guard let item, case .success(let url) = result else { return }
                 do {
                     try MediaCover.set(url, for: item)
                     Task { await media.reload(library: library) }
@@ -144,6 +183,8 @@ struct MediaCardMenu: ViewModifier {
 
 extension View {
     func mediaCardMenu(_ item: MediaItem) -> some View { modifier(MediaCardMenu(item: item)) }
+    /// The chooser behind the cards' "Choose Cover Art…" (one for the whole screen).
+    func mediaCoverPicker() -> some View { modifier(MediaCoverPickerHost()) }
 }
 
 /// The frame a video was last stopped on. Until the video is finished, it stands in for the automatic still,

@@ -164,7 +164,6 @@ struct GetResourcesView: View {
                 FromMacCard()   // Send to iPhone: download what the Mac picked, over home Wi-Fi
                 #endif
                 if !downloads.jobs.isEmpty {
-                    DownloadProgressPanel(showsOpenButton: false)
                     DownloadsCard()
                 }
                 if let catalog {
@@ -744,44 +743,102 @@ private struct EncyclopediaRow: View {
     }
 }
 
-/// Live downloads with pause, resume and cancel.
+/// Live download queue. Finished rows are history; clearing them never removes installed files.
 struct DownloadsCard: View {
     @Environment(DownloadManager.self) private var downloads
     @State private var confirmCancel: DownloadJob?
+    @State private var showingFinished = false
+
+    private var active: [DownloadJob] { downloads.jobs.filter(\.isActive) }
+    private var waiting: [DownloadJob] { downloads.jobs.filter { $0.state == .queued } }
+    private var interrupted: [DownloadJob] { downloads.jobs.filter { $0.state == .paused || isFailed($0) } }
+    private var finished: [DownloadJob] { downloads.jobs.filter(\.isFinished) }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 18) {
             HStack {
-                Text("Downloads").font(.headline)
-                Spacer()
+                Text("Downloads").font(.title2.bold())
+                Spacer(minLength: 0)
                 if downloads.jobs.contains(where: { $0.state == .paused }) {
-                    Button("Resume All") { downloads.resumeAll() }.buttonStyle(.borderless)
-                }
-                if downloads.jobs.contains(where: \.isFinished) {
-                    Button("Clear Finished") { downloads.clearFinished() }.buttonStyle(.borderless)
+                    Button("Resume All") { downloads.resumeAll() }.buttonStyle(.bordered)
                 }
             }
-            ForEach(downloads.jobs) { job in
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text(job.title).lineLimit(1)
-                        Spacer()
-                        controls(job)
+            Text("Installed files are ready to use while the rest download.").font(.callout).foregroundStyle(.secondary)
+            if let summary = downloads.summary {
+                VStack(alignment: .leading, spacing: 10) {
+                    FlowLayout(spacing: 10) {
+                        Text("\(finished.count) installed").font(.callout.weight(.semibold))
+                        if !active.isEmpty { Text("\(active.count) active").font(.callout) }
+                        if !waiting.isEmpty { Text("\(waiting.count) waiting").font(.callout) }
+                        if !interrupted.isEmpty { Text("\(interrupted.count) paused or needing attention").font(.callout).foregroundStyle(.orange) }
                     }
-                    if !job.isFinished {
-                        ProgressView(value: job.fraction)
-                            .tint(job.state == .verifying ? .blue : .accentColor)
+                    HStack(spacing: 12) {
+                        ProgressView(value: summary.fraction)
+                        Text("\(Int(summary.fraction * 100))%").font(.callout.weight(.semibold)).monospacedDigit()
                     }
-                    Text(job.detail)
-                        .font(.caption).monospacedDigit()
-                        .foregroundStyle(isFailed(job) ? Color.orange : Color.secondary)
+                    Text(summary.detail).font(.caption).monospacedDigit().foregroundStyle(.secondary)
                 }
-                if job.id != downloads.jobs.last?.id { Divider() }
+                .card(padding: 16)
             }
-            Text("Downloads resume where they left off if the app quits, the Mac sleeps or the drive is unplugged.")
-                .font(.caption).foregroundStyle(.tertiary)
+            ForEach(active) { job in
+                VStack(alignment: .leading, spacing: 12) {
+                    Label(job.state == .verifying ? "Checking the file" : job.state == .preparing ? "Preparing download" : "Downloading now",
+                          systemImage: job.state == .verifying ? "checkmark.shield" : "arrow.down.circle.fill")
+                        .font(.headline)
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 18) { activeDetails(job).frame(minWidth: 240); Spacer(minLength: 0); controls(job) }
+                        VStack(alignment: .leading, spacing: 12) { activeDetails(job); controls(job) }
+                    }
+                }.card(padding: 18)
+            }
+            if !interrupted.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    Label("Paused & needs attention · \(interrupted.count)", systemImage: "pause.circle").font(.headline)
+                    ForEach(interrupted) { job in
+                        VStack(alignment: .leading, spacing: 7) {
+                            ViewThatFits(in: .horizontal) {
+                                HStack(alignment: .top, spacing: 16) { Text(job.title).frame(minWidth: 220, alignment: .leading); Spacer(); controls(job) }
+                                VStack(alignment: .leading, spacing: 8) { Text(job.title); controls(job) }
+                            }
+                            Text(job.detail).font(.caption).monospacedDigit().foregroundStyle(isFailed(job) ? Color.orange : Color.secondary)
+                        }
+                        if job.id != interrupted.last?.id { Divider() }
+                    }
+                }.card(padding: 18)
+            }
+            if !waiting.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Waiting · \(waiting.count)").font(.headline)
+                    ForEach(waiting) { job in
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(job.title)
+                                Text(job.detail).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 8)
+                            cancelMenu(job)
+                        }
+                        if job.id != waiting.last?.id { Divider() }
+                    }
+                }.card(padding: 18)
+            }
+            if !finished.isEmpty {
+                VStack(alignment: .leading, spacing: 12) {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .top, spacing: 12) { finishedDisclosure.frame(minWidth: 300); clearFinishedButton }
+                        VStack(alignment: .leading, spacing: 12) { finishedDisclosure; clearFinishedButton }
+                    }
+                    Text("Clearing finished entries keeps installed files in your library.").font(.caption).foregroundStyle(.secondary)
+                }.card(padding: 18)
+            }
+            #if os(macOS)
+            let device = "this Mac"
+            #else
+            let device = "this device"
+            #endif
+            Text("Keep \(device) online and awake. Interrupted downloads resume where they left off after the app quits, the device sleeps or a drive is reconnected.")
+                .font(.caption).foregroundStyle(.secondary)
         }
-        .card(padding: 18)
         .confirmationDialog("Cancel this download?", isPresented: Binding(get: { confirmCancel != nil }, set: { if !$0 { confirmCancel = nil } }), presenting: confirmCancel) { job in
             Button("Cancel Download and Delete Partial File", role: .destructive) { downloads.cancel(job); confirmCancel = nil }
             Button("Keep Downloading", role: .cancel) { confirmCancel = nil }
@@ -790,21 +847,57 @@ struct DownloadsCard: View {
         }
     }
 
+    private var clearFinishedButton: some View {
+        Button("Clear Finished") { downloads.clearFinished() }.buttonStyle(.bordered)
+    }
+
+    private var finishedDisclosure: some View {
+        DisclosureGroup("Installed · \(finished.count)", isExpanded: $showingFinished) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(finished) { job in
+                    HStack(alignment: .firstTextBaseline) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.tint)
+                        Text(job.title)
+                        Spacer(minLength: 8)
+                        Text(kitBytes(job.total)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                    if job.id != finished.last?.id { Divider() }
+                }
+            }.padding(.top, 10)
+        }.font(.callout.weight(.medium))
+    }
+
+    private func activeDetails(_ job: DownloadJob) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(job.title).font(.body.weight(.medium))
+            if job.state == .preparing {
+                ProgressView().controlSize(.small)
+            } else {
+                ProgressView(value: job.fraction).tint(job.state == .verifying ? .blue : .accentColor)
+                    .accessibilityLabel("\(job.title) progress")
+            }
+            Text(job.detail).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+        }
+    }
+
     @ViewBuilder private func controls(_ job: DownloadJob) -> some View {
         HStack(spacing: 10) {
-            if job.isFinished {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.tint)
-            } else {
-                if job.state == .paused || isFailed(job) {
-                    Button { downloads.resume(job) } label: { Image(systemName: isFailed(job) ? "arrow.clockwise" : "play.fill") }
-                        .help(isFailed(job) ? "Retry" : "Resume")
-                } else if job.isActive {
-                    Button { downloads.pause(job) } label: { Image(systemName: "pause.fill") }.help("Pause")
-                }
-                Button { confirmCancel = job } label: { Image(systemName: "xmark") }.help("Cancel")
+            if job.state == .paused || isFailed(job) {
+                Button(isFailed(job) ? "Retry" : "Resume", systemImage: isFailed(job) ? "arrow.clockwise" : "play.fill") { downloads.resume(job) }
+                    .buttonStyle(.bordered)
+            } else if job.isActive {
+                Button("Pause", systemImage: "pause.fill") { downloads.pause(job) }.buttonStyle(.bordered)
             }
+            cancelMenu(job)
         }
-        .buttonStyle(.borderless)
+    }
+
+    private func cancelMenu(_ job: DownloadJob) -> some View {
+        Menu {
+            Button("Cancel Download…", role: .destructive) { confirmCancel = job }
+        } label: { Label("More", systemImage: "ellipsis") }
+            .help("More actions for \(job.title)")
+            .accessibilityLabel("More actions for \(job.title)")
     }
 
     private func isFailed(_ job: DownloadJob) -> Bool {

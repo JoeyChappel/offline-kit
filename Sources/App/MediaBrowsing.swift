@@ -61,24 +61,30 @@ extension MediaCatalog {
                 && (query.isEmpty || [title(item, i), creator(i), i?.genre ?? "", i?.studio ?? "", i?.series ?? ""].contains { $0.localizedStandardContains(query) }
                     || (i?.tracks ?? []).contains { $0.title.localizedStandardContains(query) })
         }
-        return selected.sorted { a, b in
-            let ai = info[a.progressKey], bi = info[b.progressKey]
+        // Everything a comparison needs is looked up once per item, not once per comparison (a sort of a few thousand
+        // items makes tens of thousands of them, and the title and creator are regex and dictionary work).
+        struct Row { let item: MediaItem; let info: MediaInfo?; let title: String; let creator: String; let progress: MediaProgress? }
+        let rows = selected.map { item -> Row in
+            let i = info[item.progressKey]
+            return Row(item: item, info: i, title: title(item, i), creator: sort == .artist ? creator(i) : "", progress: sort == .played ? progress[item.progressKey] : nil)
+        }
+        return rows.sorted { a, b in
             switch sort {
-            case .added: if ai?.added != bi?.added { return (ai?.added ?? .distantPast) > (bi?.added ?? .distantPast) }
+            case .added: if a.info?.added != b.info?.added { return (a.info?.added ?? .distantPast) > (b.info?.added ?? .distantPast) }
             case .played:
-                let ap = progress[a.progressKey]?.updated ?? .distantPast, bp = progress[b.progressKey]?.updated ?? .distantPast
+                let ap = a.progress?.updated ?? .distantPast, bp = b.progress?.updated ?? .distantPast
                 if ap != bp { return ap > bp }
-            case .year: if ai?.year != bi?.year { return (ai?.year ?? 0) > (bi?.year ?? 0) }
-            case .duration: if ai?.duration != bi?.duration { return (ai?.duration ?? .infinity) < (bi?.duration ?? .infinity) }
+            case .year: if a.info?.year != b.info?.year { return (a.info?.year ?? 0) > (b.info?.year ?? 0) }
+            case .duration: if a.info?.duration != b.info?.duration { return (a.info?.duration ?? .infinity) < (b.info?.duration ?? .infinity) }
             case .artist:
-                let order = creator(ai).localizedStandardCompare(creator(bi))
+                let order = a.creator.localizedStandardCompare(b.creator)
                 if order != .orderedSame { return order == .orderedAscending }
             default: break
             }
-            let order = title(a, ai).localizedStandardCompare(title(b, bi))
-            if order == .orderedSame { return a.id < b.id }
+            let order = a.title.localizedStandardCompare(b.title)
+            if order == .orderedSame { return a.item.id < b.item.id }
             return sort == .titleDescending ? order == .orderedDescending : order == .orderedAscending
-        }
+        }.map(\.item)
     }
     /// The episode that follows this one: the next in its series (series order, then title), or the next file in the
     /// same folder in natural title order, skipping anything already finished. Only when nothing comes after it does

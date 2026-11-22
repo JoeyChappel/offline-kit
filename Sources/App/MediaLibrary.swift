@@ -172,6 +172,7 @@ final class MediaLibrary {
     @ObservationIgnored private var lastScan = Date.distantPast
 
     private func scan(library: Library) async {
+        MediaCover.forgetCustomAnswers()
         let roots = folders(from: library)
         #if os(macOS)
         let libraries = KitCatalog.folders(library)

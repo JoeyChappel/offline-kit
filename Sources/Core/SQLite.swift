@@ -32,6 +32,9 @@ final class SQLiteDB: @unchecked Sendable {
 
     var lastError: String { handle.map { String(cString: sqlite3_errmsg($0)) } ?? "closed" }
 
+    /// The rowid of the last row inserted on this connection.
+    var lastInsertRowID: Int64 { handle.map { sqlite3_last_insert_rowid($0) } ?? 0 }
+
     /// Runs one or more statements separated by semicolons, ignoring any rows.
     func script(_ sql: String) throws {
         try sql.withCString { start in
