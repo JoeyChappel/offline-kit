@@ -225,7 +225,34 @@ struct AskView: View {
                 voice.micTapped { words in Self.log("DICTATED: \(words)\n"); draft = words }
             }
         }
-        // Test hook: -autoAsk "first question || follow-up" asks each in turn once the library has loaded,
+        // Test hook (test home): -seedTurns N fills the conversation with N made-up finished answers, then -typeTest "text"
+        // types it into the box one letter every 60 ms and logs main-thread CPU per ten letters (keystroke cost with a
+        // long conversation on screen). Ends with "CYCLE done" like -cycleSections.
+        .task {
+            guard KitLocation.testHome != nil, let count = Int(UserDefaults.standard.string(forKey: "seedTurns") ?? "") else { return }
+            for _ in 0..<100 where library.books.isEmpty { try? await Task.sleep(for: .milliseconds(100)) }
+            let book = library.books.first?.id ?? "test"
+            model.turns = (0..<count).map { n in
+                var turn = Turn(question: "Question number \(n + 1): how do I keep water safe to drink when the power is out for a few days?")
+                turn.answer = (0..<6).map { p in "Paragraph \(p + 1) of answer \(n + 1). Boil clear water for one minute [1], or use unscented bleach, about eight drops per gallon, and let it stand for thirty minutes [2]. Store it in clean, covered containers away from sunlight." }.joined(separator: "\n\n")
+                turn.sources = (1...4).map { Source(id: $0, ref: ArticleRef(bookID: book, path: "A/Water_\($0)", title: "Water treatment \($0)"), bookTitle: "Test Archive", text: "Water can be made safe by boiling, chemical treatment or filtering.") }
+                turn.status = .done
+                turn.finished = Date()
+                turn.engine = "Answer model"
+                return turn
+            }
+            guard let text = UserDefaults.standard.string(forKey: "typeTest") else { return }
+            try? await Task.sleep(for: .seconds(4))
+            StallProbe.start()
+            StallProbe.report("before typing")
+            for (index, letter) in text.enumerated() {
+                draft.append(letter)
+                try? await Task.sleep(for: .milliseconds(60))
+                if index % 10 == 9 { StallProbe.report("typing10") }
+            }
+            NSLog("CYCLE done")
+        }
+
         // and prints every answer with its sources.
         .task(id: library.books.count) {
             if UserDefaults.standard.string(forKey: "autoAsk") != nil { Self.log("library: \(library.books.count) books, loading=\(library.isLoading)\n") }

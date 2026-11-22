@@ -94,7 +94,8 @@ struct SuppliesSection: View {
                     Button("Clear filters") { filter = .all; category = nil; search = "" }.buttonStyle(.borderless)
                 }.frame(maxWidth: .infinity, alignment: .leading).card(padding: 18)
             } else {
-                VStack(spacing: 0) {
+                // Lazy: a long inventory builds only the rows on screen, not all of them each time Supplies opens.
+                LazyVStack(spacing: 0) {
                     if wide { tableHeading; Divider() }
                     ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                         if index > 0 { Divider() }

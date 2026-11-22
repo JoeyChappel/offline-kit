@@ -11,7 +11,8 @@ import CryptoKit
 /// named by a hash of the source's path, size, modification date and the width, so a changed cover gets a new copy.
 enum ShareArtwork {
     /// The widths copies are made at; a request is rounded up to the next one, so a few copies serve every screen.
-    static let widths = [160, 320, 480, 640, 960, 1280]
+    /// 800 is a phone's full-width picture at 2x (the page caps tiles at 2x on 3x screens; see `setArt`).
+    static let widths = [160, 320, 480, 640, 800, 960, 1280]
 
     /// The width bucket for a `?w=` value, or nil when there's none (or it isn't a number).
     static func bucket(_ value: String?) -> Int? {
@@ -27,6 +28,25 @@ enum ShareArtwork {
     /// can't be read as an image): send the original then.
     nonisolated static func resized(_ source: URL, width: Int) async -> (url: URL, contentType: String)? {
         await Task.detached(priority: .userInitiated) { make(source, width: width) }.value
+    }
+
+    /// Makes copies ahead of time, one picture after another at background priority with a pause between, so a phone's
+    /// first visit finds its shelves' covers ready instead of waiting on a resize for each. Copies that already exist cost a
+    /// file check. Stops when the task is cancelled (the library changed, or sharing stopped). Returns how many copies are
+    /// ready (made now or already there; none for a picture already narrower than the width, which is sent as it is).
+    nonisolated static func prepare(_ jobs: [(source: URL, widths: [Int])]) async -> Int {
+        var ready = 0
+        for job in jobs {
+            for width in job.widths {
+                if Task.isCancelled { return ready }
+                let start = Date()
+                if make(job.source, width: width) != nil { ready += 1 }
+                // Only real work earns a pause: roughly half of one core at most, and none for copies already there.
+                let spent = -start.timeIntervalSinceNow
+                if spent > 0.002 { try? await Task.sleep(for: .seconds(min(0.25, spent))) }
+            }
+        }
+        return ready
     }
 
     nonisolated private static func make(_ link: URL, width: Int) -> (url: URL, contentType: String)? {

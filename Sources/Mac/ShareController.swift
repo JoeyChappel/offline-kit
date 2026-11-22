@@ -258,6 +258,7 @@ final class ShareController {
             KitSettings.shared.set(String(server.port), forKey: "shareLastPort")
             contentPort = articles.port
             isRunning = true
+            prepareArtworkSoon()
         } catch {
             // The main server may already be listening and advertising: take it down so it doesn't
             // hold its port and Bonjour name while pointing at nothing.
@@ -267,6 +268,9 @@ final class ShareController {
     }
 
     private func stop() {
+        prepareTask?.cancel()
+        prepareTask = nil
+        preparedFor = nil
         ShareAwake.shared.release()
         GameStreamHub.shared.shutDown()
         server?.stop()
@@ -293,7 +297,8 @@ final class ShareController {
             let sameOrigin = req.headers["origin"].map { $0.lowercased() == "http://" + (req.headers["host"] ?? "").lowercased() } ?? true
             guard json, sameOrigin else { await res.send(status: 403, json: ["error": "forbidden"]); return }
         }
-        recentDevices[req.remoteHost] = Date()
+        // Observed state: written at most every few seconds per device, not on every cover a page loads.
+        if let seen = recentDevices[req.remoteHost], -seen.timeIntervalSinceNow < 5 {} else { recentDevices[req.remoteHost] = Date() }
 
         // Pages that work before the PIN is entered. The Home Screen icon and manifest are among them:
         // iOS fetches those without the sign-in cookie.
@@ -397,6 +402,8 @@ final class ShareController {
         guard let games, let library else { await res.send(status: 503, json: ["error": "Not ready"]); return }
         await games.reloadIfChanged(library: library)   // a few stat calls when nothing changed
         let list = games.games, played = games.lastPlayed
+        gameIndex = Dictionary(list.map { (GameStreamHub.gameID($0), $0) }, uniquingKeysWith: { first, _ in first })
+        prepareArtworkSoon()   // the games may have arrived after the media did
         let entries: [[String: Any]] = await Task.detached(priority: .userInitiated) {
             list.filter { $0.system != .atari2600 }.map { game in
                 let id = GameStreamHub.gameID(game)
@@ -410,9 +417,12 @@ final class ShareController {
         await res.send(json: ["games": entries])
     }
 
+    @ObservationIgnored private var gameIndex: [String: Game] = [:]
+
     /// GET /api/games/art/<id>: the game's shelf picture (its last frame), cached like other artwork.
     private func gameArt(id: String, _ req: WebServer.Request, _ res: WebServer.Responder) async {
-        guard let game = games?.games.first(where: { GameStreamHub.gameID($0) == id }) else {
+        // The art addresses come from the list, which leaves an index of the games behind: no id encoding per picture.
+        guard let game = gameIndex[id] ?? games?.games.first(where: { GameStreamHub.gameID($0) == id }) else {
             await res.send(status: 404, text: "Not found"); return
         }
         let url = game.thumbnailURL
@@ -710,13 +720,42 @@ final class ShareController {
     // MARK: Watch & Listen (Apple TV)
 
     /// URL-safe id for a media item, from its progress key (stable across launches and drives).
-    nonisolated static func mediaID(_ item: MediaItem) -> String {
-        Data(item.progressKey.utf8).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    nonisolated static func mediaID(_ item: MediaItem) -> String { base64URL(Data(item.progressKey.utf8)) }
+
+    /// Base64 with "-" and "_" for "+" and "/" and no "=" padding, in one pass over the bytes (three string
+    /// replacements made encoding a 2,000-item list's ids several times slower).
+    nonisolated static func base64URL(_ data: Data) -> String {
+        let encoded = data.base64EncodedData()
+        var out = [UInt8]()
+        out.reserveCapacity(encoded.count)
+        for byte in encoded {
+            switch byte {
+            case UInt8(ascii: "+"): out.append(UInt8(ascii: "-"))
+            case UInt8(ascii: "/"): out.append(UInt8(ascii: "_"))
+            case UInt8(ascii: "="): continue
+            default: out.append(byte)
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
     }
 
-    private func mediaItem(_ id: String) -> MediaItem? {
-        media?.items.first { Self.mediaID($0) == id }
+    /// The item an id names. Looked up in an index made once per library revision: every artwork and video request
+    /// names its item, and encoding every item's id to compare (as before) held the main thread about a millisecond per
+    /// request with 2,000 videos, so a phone loading a screen of covers queued behind itself.
+    func mediaItem(_ id: String) -> MediaItem? {
+        guard let media else { return nil }
+        observeMedia()
+        let items = media.items
+        if let index = idIndex, index.revision == mediaRevision, index.count == items.count { return index.byID[id] }
+        let byID = Self.index(items)
+        idIndex = (mediaRevision, items.count, byID)
+        return byID[id]
+    }
+    @ObservationIgnored private var idIndex: (revision: Int, count: Int, byID: [String: MediaItem])?
+
+    /// Items by their id; the first wins if two share one (as the linear search did).
+    nonisolated static func index(_ items: [MediaItem]) -> [String: MediaItem] {
+        Dictionary(items.map { (mediaID($0), $0) }, uniquingKeysWith: { first, _ in first })
     }
 
     /// What the phones' search box and the Apple TV ask for. The item list is the heavy part and doesn't depend on the
@@ -737,6 +776,11 @@ final class ShareController {
                            headers: ["ETag": etag, "Cache-Control": "no-cache"])
             return
         }
+        let headers = ["ETag": etag, "Cache-Control": "no-cache"]
+        if let body = cachedBody(etag, revision: revision) {
+            await res.send(status: 200, contentType: "application/json; charset=utf-8", body: body, headers: headers)
+            return
+        }
         let snapshot = MediaSnapshot(items: media.items, info: media.info, progress: media.progress)
         let cachedItems = itemsCache.flatMap { $0.revision == revision ? $0.json : nil }
         let filter = MediaFilter(rawValue: req.query["filter"] ?? "all") ?? .all
@@ -750,18 +794,94 @@ final class ShareController {
             return (itemsJSON, rest)
         }.value
         if cachedItems == nil, revision == mediaRevision { itemsCache = (revision, built.items) }
-        let headers = ["ETag": etag, "Cache-Control": "no-cache"]
-        // ?items=0: just the shelves and results, for a page that already has the item list.
+        var body: Data
         if req.query["items"] == "0" {
-            await res.send(status: 200, contentType: "application/json; charset=utf-8", body: built.rest, headers: headers)
-            return
+            // ?items=0: just the shelves and results, for a page that already has the item list.
+            body = built.rest
+        } else {
+            // {"items": <cached array>, <the rest of the object>}
+            body = Data(#"{"items":"#.utf8)
+            body.append(built.items)
+            body.append(UInt8(ascii: ","))
+            body.append(built.rest.dropFirst())
         }
-        // {"items": <cached array>, <the rest of the object>}
-        var body = Data(#"{"items":"#.utf8)
-        body.append(built.items)
-        body.append(UInt8(ascii: ","))
-        body.append(built.rest.dropFirst())
+        keepBody(body, etag, revision: revision)
         await res.send(status: 200, contentType: "application/json; charset=utf-8", body: body, headers: headers)
+    }
+
+    /// Finished /api/media and /api/read answers for the current library revision, by ETag. Shelves and results cost a
+    /// catalog build each (about 100 ms for 2,000 videos); phones and the Apple TV ask for the same few again and again.
+    @ObservationIgnored private var bodies: (revision: Int, byTag: [String: Data]) = (-1, [:])
+
+    func cachedBody(_ etag: String, revision: Int) -> Data? {
+        bodies.revision == revision ? bodies.byTag[etag] : nil
+    }
+
+    func keepBody(_ body: Data, _ etag: String, revision: Int) {
+        guard revision == mediaRevision else { return }   // the library changed while it was being built
+        if bodies.revision != revision || bodies.byTag.count >= 24 { bodies = (revision, [:]) }   // searches vary: start over
+        bodies.byTag[etag] = body
+    }
+
+    // MARK: Artwork made ahead of time
+
+    @ObservationIgnored private var prepareTask: Task<Void, Never>?
+    @ObservationIgnored private var prepareScheduled = false
+    /// The library the last run was for (items and details counted): a play position saved every few seconds doesn't
+    /// start the run again.
+    @ObservationIgnored private var preparedFor: (items: Int, info: Int, games: Int)?
+
+    /// Phone-sized covers for the shelves a first visit shows, made in the background (ShareArtwork.prepare) a little
+    /// after sharing starts and after the library changes, so the first phone to open the page doesn't wait on resizing.
+    private func prepareArtworkSoon(after delay: Duration = .seconds(8)) {
+        guard !prepareScheduled else { return }
+        prepareScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self else { return }
+            // The library may not have been read yet this launch (the first device to visit would read it): read it now,
+            // so the first visit finds the list and its covers ready.
+            if self.isRunning, let media = self.media, let library = self.library, media.items.isEmpty { await media.reload(library: library) }
+            self.prepareScheduled = false
+            self.prepareArtwork()
+        }
+    }
+
+    /// The sizes the page asks for on a phone (2x tiles, see `setArt` in WebAppScript): video cards and the Continue row,
+    /// album squares and their grid, book covers, game pictures. Newest first, the first two dozen of each kind (what the
+    /// shelves show) before the rest, and at most 400 of each kind (the copies folder is kept under 150 MB).
+    private func prepareArtwork() {
+        guard isRunning, let media else { return }
+        observeMedia()   // a library read later (or changed) runs this again
+        guard !media.items.isEmpty else { return }
+        let info = media.info, gameList = games?.games ?? []
+        let signature = (items: media.items.count, info: info.count, games: gameList.count)
+        if let done = preparedFor, done == signature { return }
+        preparedFor = signature
+        let added = { (item: MediaItem) in info[item.progressKey]?.added ?? .distantPast }
+        var tiers: [[(source: URL, widths: [Int])]] = [[], []]
+        var counts: [MediaFilter: Int] = [:]
+        for item in media.items.filter({ $0.unavailable == nil }).sorted(by: { added($0) > added($1) }) {
+            guard let path = item.cover?.path ?? info[item.progressKey]?.thumb else { continue }
+            let category = MediaCatalog.category(item, info[item.progressKey])
+            let n = counts[category, default: 0]
+            guard n < 400 else { continue }
+            counts[category] = n + 1
+            let widths: [Int] = switch category {
+            case .video: [640, 320]
+            case .music, .audiobooks: [320, 480]
+            default: [320]
+            }
+            tiers[n < 24 ? 0 : 1].append((URL(fileURLWithPath: path), widths))
+        }
+        for (n, game) in gameList.prefix(400).enumerated() { tiers[n < 24 ? 0 : 1].append((game.thumbnailURL, [320])) }
+        let jobs = tiers[0] + tiers[1]
+        let folders = library?.folders ?? []
+        prepareTask?.cancel()
+        prepareTask = Task.detached(priority: .background) {
+            let scope = SharePolicy.Scope(libraries: folders)   // only files in the library, as for every request
+            _ = await ShareArtwork.prepare(jobs.filter { scope.allows($0.source) })
+        }
     }
 
     /// Copies of what the media list is made from, handed to a background task.
@@ -790,6 +910,7 @@ final class ShareController {
                 self.observingMedia = false
                 self.mediaRevision += 1   // anything that changed before watching resumed
                 self.observeMedia()
+                self.prepareArtworkSoon(after: .seconds(15))
             }
         }
     }
@@ -931,11 +1052,13 @@ final class ShareController {
     }
 
     /// Only real files that stay where the library is: a link on a drive can't hand out this Mac's files.
+    /// The file checks run off the main thread, which every other request is waiting on.
     private func shareable(_ url: URL) async -> Bool {
-        let isFile = (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
-        guard isFile else { return false }
         let folders = library?.folders ?? []
-        return await Task.detached(priority: .userInitiated) { SharePolicy.Scope(libraries: folders).allows(url) }.value
+        return await Task.detached(priority: .userInitiated) {
+            (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+                && SharePolicy.Scope(libraries: folders).allows(url)
+        }.value
     }
 
     nonisolated private static func mimeType(_ url: URL) -> String {
@@ -967,8 +1090,13 @@ final class ShareController {
             await res.send(status: 304, contentType: "application/json; charset=utf-8", body: Data(), headers: headers)
             return
         }
+        if let body = cachedBody(etag, revision: revision) {
+            await res.send(status: 200, contentType: "application/json; charset=utf-8", body: body, headers: headers)
+            return
+        }
         let snapshot = MediaSnapshot(items: media.items, info: media.info, progress: media.progress)
         let body = await Task.detached(priority: .userInitiated) { Self.encodeBooks(snapshot) }.value
+        keepBody(body, etag, revision: revision)
         await res.send(status: 200, contentType: "application/json; charset=utf-8", body: body, headers: headers)
     }
 

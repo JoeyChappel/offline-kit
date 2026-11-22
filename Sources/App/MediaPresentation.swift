@@ -30,6 +30,7 @@ struct MediaArtwork: View {
     @State private var decoding = false
     @State private var shownPath: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.displayScale) private var displayScale
     /// A chosen or folder cover wins over the automatic video still or embedded art.
     private var path: String? { item.cover?.path ?? info?.thumb }
     /// Changes when a cover file is replaced in place, so the new picture loads.
@@ -39,9 +40,13 @@ struct MediaArtwork: View {
     }
     var body: some View {
         GeometryReader { geo in
+            let pixels = ImageCache.pixels(forPoints: max(geo.size.width, geo.size.height), scale: displayScale)
+            // A picture already in the cache shows in the very first frame. Waiting for the task drew the title
+            // placeholder first and the picture a frame later, so every card scrolled back into view drew its text twice.
+            let image = image ?? (geo.size.width > 0 ? path.flatMap { ImageCache.shared.cached($0, pixels: pixels) } : nil)
             ZStack {
                 let poster = LinearGradient(colors: MediaTheme.posterColors(item.title), startPoint: .topLeading, endPoint: .bottomTrailing)
-                if decoding { poster.shimmer() } else { poster }
+                if decoding && image == nil { poster.shimmer() } else { poster }
                 if let image {
                     Image(decorative: image, scale: 1).resizable().scaledToFill().frame(width: geo.size.width, height: geo.size.height).clipped()
                         .contentShape(Rectangle())
@@ -53,7 +58,7 @@ struct MediaArtwork: View {
                         Spacer(minLength: 0)
                         Text(MediaCatalog.title(item, info)).font(.system(.title3, design: .serif, weight: .semibold)).lineLimit(4)
                         if let artist = info?.artist { Text(artist).font(.caption).lineLimit(1) }
-                    }.padding(max(8, min(20, geo.size.width * 0.1))).foregroundStyle(.white)
+                    }.padding(max(8, min(20, geo.size.width * 0.1))).foregroundStyle(.white).flattenedText()
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 }
             }.frame(width: geo.size.width, height: geo.size.height).clipped()
@@ -61,8 +66,8 @@ struct MediaArtwork: View {
             // takes clicks far outside its frame, which made the Books genre tiles above the banner unclickable.
             .contentShape(Rectangle())
             // Reloads when the file or the size bucket changes; the shared cache makes a repeat a lookup, not a decode.
-            .task(id: "\(reloadKey)|\(ImageCache.pixels(forPoints: max(geo.size.width, geo.size.height)))|\(geo.size.width > 0)") {
-                await load(pixels: ImageCache.pixels(forPoints: max(geo.size.width, geo.size.height)), laidOut: geo.size.width > 0)
+            .task(id: "\(reloadKey)|\(pixels)|\(geo.size.width > 0)") {
+                await load(pixels: pixels, laidOut: geo.size.width > 0)
             }
         }
         .accessibilityHidden(true)
@@ -114,11 +119,9 @@ struct MediaCard: View {
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(hovering ? MediaTheme.accent : .white.opacity(0.12), lineWidth: hovering ? 2 : 0.5))
-            Text(MediaCatalog.title(item, info)).font(.callout.weight(.semibold)).lineLimit(2)
-            if category == .music || category == .audiobooks {
-                Text(MediaCatalog.creator(info)).font(.caption).foregroundStyle(MediaTheme.muted).lineLimit(1)
-            }
-            Text(MediaCatalog.meta(item, info)).font(.caption).foregroundStyle(MediaTheme.muted).lineLimit(2)
+            // Drawn as one GPU group: plain Text layers are each drawn by Core Graphics on the main thread, which was
+            // half the main thread's time when a grid of cards came into view. Looks the same.
+            VStack(alignment: .leading, spacing: 8) { texts }.flattenedText()
         }
         .foregroundStyle(MediaTheme.ink)
         .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -128,6 +131,13 @@ struct MediaCard: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityText)
         .accessibilityHint("Open details and playback options")
+    }
+    @ViewBuilder private var texts: some View {
+        Text(MediaCatalog.title(item, info)).font(.callout.weight(.semibold)).lineLimit(2)
+        if category == .music || category == .audiobooks {
+            Text(MediaCatalog.creator(info)).font(.caption).foregroundStyle(MediaTheme.muted).lineLimit(1)
+        }
+        Text(MediaCatalog.meta(item, info)).font(.caption).foregroundStyle(MediaTheme.muted).lineLimit(2)
     }
     private var accessibilityText: String {
         var text = "\(MediaCatalog.title(item, info)), \(MediaCatalog.meta(item, info))"

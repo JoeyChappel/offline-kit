@@ -124,6 +124,7 @@ struct PhoneTabs: View {
             }
         }
         .modifier(FirstRunPresentation())
+        .prewarmWatchListen([.all])
         #if DEBUG
         // Test hook: -startSection prepare opens the Prepare tab.
         .onAppear { LaunchTiming.firstAppear(); if UserDefaults.standard.string(forKey: "startSection") == "prepare" { navigation.selection = .prepare } }

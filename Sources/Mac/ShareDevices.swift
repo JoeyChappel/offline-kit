@@ -230,7 +230,8 @@ final class ShareDevices {
         }
         device.thisMac = thisMac
         if now.timeIntervalSince(device.lastSeen) > 2 || device.lastSeen == device.firstSeen { device.lastSeen = now }
-        devices[id] = device
+        // Observed by the Connected Devices window: written only when something changed, not for every cover a page loads.
+        if devices[id] != device { devices[id] = device }
         if now.timeIntervalSince(savedAt) > 60 { scheduleSave() }   // last-seen times, at most about once a minute
 
         // Blocked: everything that names this device now counts, so clearing cookies or a new address doesn't get it back in.
@@ -601,7 +602,7 @@ final class ShareDevices {
     }
 
     private func mediaActivity(_ id: String) -> (symbol: String, text: String)? {
-        guard let item = media?.items.first(where: { ShareController.mediaID($0) == id }) else { return nil }
+        guard let item = share?.mediaItem(id) ?? media?.items.first(where: { ShareController.mediaID($0) == id }) else { return nil }
         let title = MediaCatalog.title(item, media?.info[item.progressKey])
         switch item.kind {
         case .video: return ("play.tv", "Watching \(title)")

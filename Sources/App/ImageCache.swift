@@ -20,15 +20,22 @@ final class ImageCache: @unchecked Sendable {
     private var stamps: [String: (date: TimeInterval, checked: Date)] = [:]
 
     private init() {
-        cache.totalCostLimit = 128 * 1024 * 1024
+        var megabytes = 128
+        #if DEBUG
+        // Test hook: -imageCacheMB N sets the cap, for comparing memory and scrolling.
+        if let value = Int(UserDefaults.standard.string(forKey: "imageCacheMB") ?? ""), value > 0 { megabytes = value }
+        #endif
+        cache.totalCostLimit = megabytes * 1024 * 1024
         cache.countLimit = 800
     }
 
-    /// The decode size for a view this many points across: about 2x, rounded up to a few sizes so a window that is
-    /// being resized doesn't decode a new picture for every pixel it grows.
-    static func pixels(forPoints points: CGFloat) -> Int {
-        let wanted = Int((points * 2).rounded(.up))
-        return [256, 384, 512, 768, 1024, 1600].first { $0 >= wanted } ?? 1600
+    /// The decode size for a view this many points across on a screen of this scale, rounded up to a few sizes so a
+    /// window that is being resized doesn't decode a new picture for every pixel it grows. The steps are close enough
+    /// that a picture is never decoded at much more than it shows (a 276-point album cover was 768 pixels, 2.4 MB;
+    /// now 640, 1.6 MB), and a 1x display gets half the pixels of a Retina one.
+    static func pixels(forPoints points: CGFloat, scale: CGFloat = 2) -> Int {
+        let wanted = Int((points * max(1, scale)).rounded(.up))
+        return [128, 256, 384, 512, 640, 768, 1024, 1280, 1600].first { $0 >= wanted } ?? 1600
     }
 
     /// When the file last changed (0 if it can't be read). Part of the cache key, so a replaced cover loads again.

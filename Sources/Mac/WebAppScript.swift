@@ -133,30 +133,45 @@ function bookPlace(b){
 // ---- Pieces ----
 // Artwork from the Mac comes in phone-sized copies (?w=, see ShareArtwork): `sizes` is the tile's width on screen, so the
 // browser picks the copy that fills it at this screen's pixel density instead of the full-size cover.
-const ART_WIDTHS = [160, 320, 480, 640, 960, 1280];
+const ART_WIDTHS = [160, 320, 480, 640, 800, 960, 1280];
 const SZ = {card:'(min-width:768px) 280px, 248px', square:'(min-width:768px) 190px, 160px', cover:'(min-width:768px) 156px, 136px',
   game:'150px', round:'(min-width:768px) 190px, 160px', wide:'112px', tall:'60px', thumb:'72px', upnext:'120px',
   pcover:'min(70vw, 300px)', coverhead:'min(52vw, 220px)', coversq:'min(64vw, 280px)', hero:'calc(100vw - 40px)', back:'100vw'};
+// Pictures are drawn at no more than 2x: on a 3x phone a 3x copy is more than twice the bytes (and decoding) of the 2x one,
+// for a difference nobody sees at tile size. `sizes` is scaled down so the browser's own pick by density lands on 2x.
+const DENSITY = Math.min(1, 2 / (window.devicePixelRatio || 1));
+const scaledSizes = new Map();
+function capSizes(sizes){
+  if (DENSITY === 1) return sizes;
+  let out = scaledSizes.get(sizes);
+  if (!out) {
+    out = sizes.split(/,(?![^(]*\))/).map(part => { const m = part.trim().match(/^(\([^)]*\)\s+)?(.+)$/); return (m[1] || '') + `calc(${m[2]} * ${DENSITY.toFixed(4)})`; }).join(', ');
+    scaledSizes.set(sizes, out);
+  }
+  return out;
+}
 function setArt(img, url, sizes){
   const u = safeURL(url);
   if (sizes && /^\/(media\/[^?#]+\/(thumb|cover)|api\/games\/art\/)/.test(u)) {
     const join = u.includes('?') ? '&' : '?';
-    img.sizes = sizes;
+    img.sizes = capSizes(sizes);
     img.srcset = ART_WIDTHS.map(w => `${u}${join}w=${w} ${w}w`).join(', ');
   }
   img.src = u;
   return img;
 }
+// Set while a long grid builds its cards: the width of its columns, for the cards' `sizes`.
+let gridSizes = null;
 function art(item, url, extra, sizes){
   const box = el('div', {className:'art' + (extra ? ' ' + extra : '')});
   box.style.background = poster(item.title);
-  const ph = el('span', {className:'ph'}, item.title || '');
-  box.append(ph);
+  box.append(el('span', {className:'ph'}, item.title || ''));
   if (url && safeURL(url) !== '#') {
     const img = el('img', {alt:'', loading:'lazy', decoding:'async'});
-    img.onload = () => ph.remove();
+    // The title underneath fades out: a class (opacity) instead of removing it, which relaid a whole grid per cover.
+    img.onload = () => box.classList.add('ok');
     img.onerror = () => img.remove();
-    setArt(img, url, sizes || SZ[extra] || SZ.card);
+    setArt(img, url, gridSizes || sizes || SZ[extra] || SZ.card);
     box.append(img);
   }
   return box;
@@ -222,7 +237,7 @@ function continueCard(entry){
 function shelf(title, cards, more, cls){
   cards = cards.filter(Boolean);
   if (!cards.length) return null;
-  return el('section', {className:'section'},
+  return el('section', {className:'section cv'},
     el('div', {className:'shead'}, el('h2', {}, title), more ? el('button', {onclick:more}, 'See All') : null),
     el('div', {className:'shelf' + (cls ? ' ' + cls : '')}, cards));
 }
@@ -256,6 +271,71 @@ function toast(text){
   setTimeout(() => t.remove(), 3000);
 }
 const searchButton = () => el('button', {className:'navbtn round', 'aria-label':'Search everything', onclick:() => openSearch()}, icon('search'));
+
+// ---- Long grids: only the rows near the screen are built ----
+// "See All" on 2,000 videos used to build 2,000 cards (16,000 elements): a second of work on a phone before the page moved,
+// and every cover that arrived relaid the whole grid. A vgrid builds the rows within a screen of what's showing, placed
+// in a box as tall as the whole grid, and swaps rows as the page scrolls; covers in rows that leave stop downloading.
+const gridWatch = typeof ResizeObserver === 'function' ? new ResizeObserver(entries => { for (const e of entries) e.target.vgrid?.(); }) : null;
+function vgrid(list, card, cls){
+  const covers = cls === 'covers', minW = covers ? 112 : 160, gapX = 14, gapY = 18, pad = 20;
+  const box = el('div', {className:'vgrid' + (covers ? ' covers' : '')});
+  if (!list.length) return box;
+  const rows = new Map();
+  let scroller = null, cols = 0, colW = 0, rowH = 0, raf = 0;
+  const build = r => {
+    gridSizes = colW + 'px';
+    try {
+      const row = el('div', {className:'vrow'}, list.slice(r * cols, r * cols + cols).map(it => card(it)));
+      row.style.gridTemplateColumns = `repeat(${cols},minmax(0,1fr))`;
+      row.style.transform = `translateY(${r * rowH}px)`;
+      return row;
+    } finally { gridSizes = null; }
+  };
+  const drop = r => { const row = rows.get(r); rows.delete(r); cancelImages(row); row.remove(); };
+  const retire = () => { gridWatch?.unobserve(box); scroller?.removeEventListener('scroll', schedule); for (const r of [...rows.keys()]) drop(r); };
+  // Columns from the width (as the CSS grid did: auto-fill, at least minW wide); the row height from one built row
+  // (titles always take two lines here, so every row is as tall as the first).
+  const measure = () => {
+    const width = box.clientWidth - pad * 2;
+    if (width <= 0) return false;
+    const c = Math.max(1, Math.floor((width + gapX) / (minW + gapX))), w = Math.floor((width - gapX * (c - 1)) / c);
+    if (c === cols && w === colW && rowH) return true;
+    for (const r of [...rows.keys()]) drop(r);
+    cols = c; colW = w; rowH = 0;
+    const first = build(0);
+    box.append(first); rows.set(0, first);
+    rowH = first.offsetHeight + gapY;
+    box.style.height = `${Math.ceil(list.length / cols) * rowH - gapY + 8}px`;
+    return true;
+  };
+  // Reads first (where the box is), then writes (rows in, rows out): one layout per frame at most.
+  const update = () => {
+    raf = 0;
+    if (!box.isConnected) { retire(); return; }
+    if (!scroller || !rowH) return;
+    const view = scroller.clientHeight, top = box.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    const last = Math.ceil(list.length / cols) - 1;
+    const from = Math.max(0, Math.floor((-top - view) / rowH)), to = Math.min(last, Math.floor((view * 2 - top) / rowH));
+    for (const r of [...rows.keys()]) if (r < from || r > to) drop(r);
+    const frag = document.createDocumentFragment();
+    for (let r = from; r <= to; r++) if (!rows.has(r)) { const row = build(r); rows.set(r, row); frag.append(row); }
+    box.append(frag);
+  };
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(update); };
+  box.vgrid = () => {
+    if (!box.isConnected) { retire(); return; }
+    if (!scroller) { scroller = box.closest('.scroll'); scroller?.addEventListener('scroll', schedule, {passive:true}); }
+    if (measure()) update();
+  };
+  if (gridWatch) gridWatch.observe(box);
+  else { cols = 1; box.replaceChildren(...list.map(it => card(it))); box.className = 'grid' + (covers ? ' covers' : ''); }
+  return box;
+}
+// Pictures still downloading stop: a page or row that's gone shouldn't hold up the next one's covers and API calls.
+function cancelImages(node){
+  for (const img of node.querySelectorAll('img')) if (!img.complete) { img.onerror = null; img.removeAttribute('srcset'); img.removeAttribute('src'); }
+}
 
 // ---- Pages and navigation: a stack of pages per tab, pushed and popped like a native app ----
 const TABS = [['home', 'Home'], ['watch', 'Watch'], ['listen', 'Listen'], ['read', 'Read'], ['play', 'Play'], ['ask', 'Ask']];
@@ -326,7 +406,7 @@ function popTop(animate){
   if (!stack || stack.length < 2) return;
   const top = stack.pop(), under = stack[stack.length - 1];
   top.onLeave?.();
-  slide(top, under, false, animate === false, () => top.el.remove());
+  slide(top, under, false, animate === false, () => { top.el.remove(); cancelImages(top.el); });
   showPage(under);
 }
 function showPage(P){ if (P?.dirty && P.render) { P.dirty = false; P.render(); } }
@@ -339,10 +419,13 @@ function slide(from, to, forward, instant, done){
   const top = forward ? to.el : from.el, under = forward ? from.el : to.el, w = innerWidth;
   under.classList.remove('gone');
   const timing = {duration:400, easing:'cubic-bezier(.32,.72,0,1)'};
-  const a = top.animate([{transform:`translateX(${forward ? w : 0}px)`, boxShadow:'0 0 30px rgba(0,0,0,.2)'}, {transform:`translateX(${forward ? 0 : w}px)`, boxShadow:'0 0 30px rgba(0,0,0,.2)'}], timing);
+  // Transform and opacity only, so the slide runs on the compositor even while the new page is still busy. The shadow is
+  // a class (a shadow in the keyframes would put the whole animation back on the main thread).
+  top.classList.add('sliding');
+  const a = top.animate([{transform:`translateX(${forward ? w : 0}px)`}, {transform:`translateX(${forward ? 0 : w}px)`}], timing);
   under.animate([{transform:`translateX(${forward ? 0 : -w * .28}px)`}, {transform:`translateX(${forward ? -w * .28 : 0}px)`}], timing);
   under.querySelector(':scope > .shade').animate([{opacity:forward ? 0 : .14}, {opacity:forward ? .14 : 0}], timing);
-  a.onfinish = () => { if (forward) under.classList.add('gone'); done?.(); };
+  a.onfinish = () => { top.classList.remove('sliding'); if (forward) under.classList.add('gone'); done?.(); };
 }
 window.addEventListener('popstate', e => {
   if (readerOpen() && e.state?.overlay !== 'reader') closeReaderNow();
@@ -394,7 +477,7 @@ function selectTab(id){
   if (current === id) {
     // Tapping the open tab again goes back to its first page, or to the top of it.
     const st = stacks[id];
-    if (st.length > 1) { while (st.length > 1) st.pop().el.remove(); st[0].el.classList.remove('gone'); showPage(st[0]); history.replaceState({tab:id, depth:1}, ''); }
+    if (st.length > 1) { while (st.length > 1) { const gone = st.pop(); gone.el.remove(); cancelImages(gone.el); } st[0].el.classList.remove('gone'); showPage(st[0]); history.replaceState({tab:id, depth:1}, ''); }
     else st[0].scroll.scrollTo({top:0, behavior:reduceMotion() ? 'auto' : 'smooth'});
     return;
   }
@@ -411,6 +494,29 @@ function selectTab(id){
   $('#composer').classList.toggle('hidden', id !== 'ask');
   history.replaceState({tab:id, depth:stacks[id].length}, '', id === 'home' ? location.pathname : '#' + id);
   showPage(topPage());
+}
+// A tab's first page can hold a dozen shelves of twenty cards: building them all before the first paint held a phone's tap
+// for 100 ms or more. show() builds the first few entries now (functions in `items` are built when their turn comes) and
+// the rest a few at a time in idle moments right after, before anyone can scroll to them. Only from the top: a page
+// redrawn while scrolled down is built whole, so it keeps its place.
+const idle = window.requestIdleCallback ? f => requestIdleCallback(f, {timeout:100}) : f => setTimeout(f, 1);
+function show(P, items, now = 3){
+  const token = P.showing = {};
+  const make = x => typeof x === 'function' ? x() : x;
+  const whole = P.scroll.scrollTop > 0 || items.length <= now;
+  P.body.replaceChildren(...(whole ? items : items.slice(0, now)).map(make).filter(Boolean));
+  if (whole) return;
+  // Stops if the page was redrawn meanwhile (by show() again, or with a skeleton or a message).
+  const head = P.body.firstChild;
+  let i = now;
+  const step = () => {
+    if (P.showing !== token || P.body.firstChild !== head) return;
+    const frag = document.createDocumentFragment(), t0 = performance.now();
+    do { const node = make(items[i++]); if (node) frag.append(node); } while (i < items.length && performance.now() - t0 < 6);
+    P.body.append(frag);
+    if (i < items.length) idle(step);
+  };
+  idle(step);
 }
 // Data changed: the open page redraws now, the others when they are next shown.
 function rerender(){
@@ -458,17 +564,19 @@ function homePage(){
       nodes.push(shelf('Watch', videos.slice(0, 16).map(mediaCard), () => selectTab('watch')));
       nodes.push(shelf('Listen', audio.slice(0, 16).map(mediaCard), () => selectTab('listen')));
     }
-    if (ready.read === true) nodes.push(shelf('Read', books.sort(byAdded).slice(0, 16).map(bookCard), () => selectTab('read')));
-    if (games.length) nodes.push(shelf('Play', games.slice(0, 16).map(g => gameCard(g)), () => selectTab('play')));
-    const genres = allGenres();
-    if (genres.length) nodes.push(el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, 'Browse by Genre'),
-      genres.length > 8 ? el('button', {onclick:() => push(genresPage(genres))}, 'See All') : null), genreTiles(genres.slice(0, 8), name => push(genrePage(name)))));
-    if (archives.length) nodes.push(el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, 'Reference Library'),
+    if (ready.read === true) nodes.push(() => shelf('Read', books.sort(byAdded).slice(0, 16).map(bookCard), () => selectTab('read')));
+    if (games.length) nodes.push(() => shelf('Play', games.slice(0, 16).map(g => gameCard(g)), () => selectTab('play')));
+    nodes.push(() => {
+      const genres = allGenres();
+      return genres.length ? el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, 'Browse by Genre'),
+        genres.length > 8 ? el('button', {onclick:() => push(genresPage(genres))}, 'See All') : null), genreTiles(genres.slice(0, 8), name => push(genrePage(name)))) : null;
+    });
+    if (archives.length) nodes.push(() => el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, 'Reference Library'),
       archives.length > 4 ? el('button', {onclick:() => push(archivesPage())}, 'See All') : null), el('div', {className:'list'}, sortArchives(archives).slice(0, 4).map(archiveRow))));
     if (ready.media === 'error' && ready.read === 'error') nodes.push(empty('📡', 'Can’t reach the Mac', 'Check that this device is on the same Wi-Fi as the Mac and that Share on Wi-Fi is on.', el('button', {className:'btn primary', onclick:reloadAll}, 'Try Again')));
     else if (ready.media === true && ready.read === true && !items.length && !books.length && !games.length && !archives.length)
       nodes.push(empty('🌲', 'Nothing here yet', 'Add movies, music, audiobooks, books and archives in Offline Kit on the Mac. They show up here.'));
-    P.body.replaceChildren(...nodes.filter(Boolean));
+    show(P, nodes, 5);
   };
   P.render();
   return P;
@@ -497,7 +605,7 @@ function genrePage(name){
   P.render = () => {
     const items = (S.media?.items || []).filter(i => i.genre === name);
     const books = [...S.books.values()].filter(b => b.genre === name);
-    const sec = (title, list, card, cls) => list.length ? el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, title)), el('div', {className:'grid' + (cls ? ' ' + cls : '')}, list.map(card))) : null;
+    const sec = (title, list, card, cls) => list.length ? el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, title)), vgrid(list, card, cls)) : null;
     P.body.replaceChildren(...[
       sec('Watch', items.filter(i => i.category === 'video'), mediaCard),
       sec('Listen', items.filter(i => i.category !== 'video'), mediaCard),
@@ -509,16 +617,15 @@ function genrePage(name){
 }
 function gridPage(title, list, card, cls){
   const P = makePage({title, back:topPage()?.title});
-  P.body.append(el('div', {className:'grid' + (cls ? ' ' + cls : '')}, list.map(card)));
+  P.body.append(vgrid(list, card, cls));
   return P;
 }
 
 // ---- Watch and Listen ----
+// One builder per shelf that has something in it (see show()).
 function mediaShelves(d, cardsFor){
-  return (d.shelves || []).map(s => {
-    const list = s.items.map(id => S.byId.get(id)).filter(Boolean);
-    return shelf(s.title, list.slice(0, 20).map(cardsFor), list.length > 20 ? () => push(gridPage(s.title, list, mediaCard)) : null);
-  });
+  return (d.shelves || []).map(s => [s.title, s.items.map(id => S.byId.get(id)).filter(Boolean)]).filter(([, list]) => list.length)
+    .map(([title, list]) => () => shelf(title, list.slice(0, 20).map(cardsFor), list.length > 20 ? () => push(gridPage(title, list, mediaCard)) : null));
 }
 function hero(it){
   const f = fraction(it), resuming = f != null;
@@ -561,10 +668,10 @@ function watchPage(){
     fill(head, P.large, featured ? hero(featured) : null);
     nodes.push(genreChips(genres, all?.genreIcons || d.genreIcons, P.genre, g => { P.genre = g; P.render(); }));
     const results = (d.results || []).map(id => S.byId.get(id)).filter(Boolean);
-    if (P.genre) nodes.push(el('div', {className:'shead'}, el('h2', {}, P.genre), el('small', {className:'note'}, count(results.length, 'video'))), el('div', {className:'grid'}, results.map(mediaCard)));
+    if (P.genre) nodes.push(el('div', {className:'shead'}, el('h2', {}, P.genre), el('small', {className:'note'}, count(results.length, 'video'))), vgrid(results, mediaCard));
     else nodes.push(...mediaShelves(d, mediaCard));
     if (!results.length) nodes.push(empty('🎬', 'Your next favorite belongs here', 'On the Mac, open Watch and use Add, or drag video files onto the window.'));
-    P.body.replaceChildren(...nodes.filter(Boolean));
+    show(P, nodes);
   };
   P.render();
   return P;
@@ -590,14 +697,14 @@ function listenPage(){
       const kind = kinds[i];
       const results = (d.results || []).map(id => S.byId.get(id)).filter(Boolean);
       if (P.kind === 'all' && results.length) nodes.push(el('h2', {className:'group'}, kind === 'music' ? 'Music' : 'Audiobooks'));
-      if (P.genre) nodes.push(el('div', {className:'grid'}, results.map(mediaCard)));
+      if (P.genre) nodes.push(vgrid(results, mediaCard));
       else {
         nodes.push(...mediaShelves(d, mediaCard).slice(0, P.kind === 'all' ? 4 : 99));
-        if (kind === 'music' && (d.artists || []).length > 1) nodes.push(shelf('Artists', d.artists.slice(0, 30).map(artistCard)));
+        if (kind === 'music' && (d.artists || []).length > 1) nodes.push(() => shelf('Artists', d.artists.slice(0, 30).map(artistCard)));
       }
     });
     if (nodes.every(n => !n)) nodes.push(empty('🎧', 'Nothing to listen to yet', 'On the Mac, open Audiobooks or Music and use Add. Free LibriVox audiobooks can be added there too.'));
-    P.body.replaceChildren(...nodes.filter(Boolean));
+    show(P, nodes, 4);
   };
   P.render();
   return P;
@@ -677,18 +784,18 @@ function readPage(){
         nodes.push(genreChips(S.read.genres, S.read.genreIcons, P.genre, g => { P.genre = g; P.render(); }));
         if (P.genre) {
           const list = books.filter(b => b.genre === P.genre).sort((a, b) => a.title.localeCompare(b.title));
-          nodes.push(el('div', {className:'grid covers'}, list.map(bookCard)));
+          nodes.push(vgrid(list, bookCard, 'covers'));
         } else {
           for (const s of S.read.shelves || []) {
             const list = s.items.map(id => S.books.get(id)).filter(Boolean);
-            nodes.push(shelf(s.title, list.slice(0, 20).map(bookCard), list.length > 20 ? () => push(gridPage(s.title, list, bookCard, 'covers')) : null));
+            if (list.length) nodes.push(() => shelf(s.title, list.slice(0, 20).map(bookCard), list.length > 20 ? () => push(gridPage(s.title, list, bookCard, 'covers')) : null));
           }
         }
       }
     }
-    if (ready.archives === true && (S.archives || []).length) nodes.push(el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, 'Reference Library')),
+    if (ready.archives === true && (S.archives || []).length) nodes.push(() => el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, 'Reference Library')),
       el('div', {className:'list'}, sortArchives(S.archives).map(archiveRow))));
-    P.body.replaceChildren(...nodes.filter(Boolean));
+    show(P, nodes);
   };
   P.render();
   return P;
@@ -934,8 +1041,9 @@ function playPage(){
     for (const g of [...S.games].sort((a, b) => String(a.title).localeCompare(String(b.title)))) {
       const s = systemName(g) || 'Games'; if (!systems.has(s)) systems.set(s, []); systems.get(s).push(g);
     }
-    P.body.replaceChildren(...[shelf('Continue Playing', recent.map(g => gameCard(g, true))),
-      ...[...systems].sort((a, b) => a[0].localeCompare(b[0])).map(([s, list]) => shelf(s, list.map(g => gameCard(g))))].filter(Boolean));
+    // Twenty to a shelf, like the other tabs, with the rest under See All (300 games built 300 cards at once).
+    show(P, [shelf('Continue Playing', recent.slice(0, 20).map(g => gameCard(g, true)), recent.length > 20 ? () => push(gridPage('Continue Playing', recent, g => gameCard(g, true))) : null),
+      ...[...systems].sort((a, b) => a[0].localeCompare(b[0])).map(([s, list]) => () => shelf(s, list.slice(0, 20).map(g => gameCard(g)), list.length > 20 ? () => push(gridPage(s, list, g => gameCard(g))) : null))]);
   };
   P.render();
   window.addEventListener('load', () => P.render());
@@ -947,6 +1055,13 @@ function openSearch(){
   const P = push(searchPage());
   P.input.focus();
 }
+// What search matches against, lowercased once per item (items are new objects after each reload, so this empties itself).
+const searchTexts = new WeakMap();
+function searchText(item, values){
+  let text = searchTexts.get(item);
+  if (text == null) { text = values.filter(v => v != null).join('\n').toLowerCase(); searchTexts.set(item, text); }
+  return text;
+}
 function searchPage(){
   const P = makePage({title:'Search', large:false, back:topPage()?.title, solidAt:-1});
   P.el.classList.add('scrolled');
@@ -955,14 +1070,14 @@ function searchPage(){
   P.input = input;
   P.body.append(el('label', {className:'searchbox'}, icon('search'), input), results);
   let timer, request = 0;
-  const has = (q, ...values) => values.some(v => v != null && String(v).toLowerCase().includes(q));
+  const has = (q, item, ...values) => searchText(item, values).includes(q);
   const run = () => {
     const raw = input.value.trim(), q = raw.toLowerCase(), mine = ++request;
     if (!q) { results.replaceChildren(el('p', {className:'note'}, 'Search titles, artists, authors and genres on the Mac, plus article titles in every archive.')); return; }
-    const media = (S.media?.items || []).filter(i => has(q, i.title, i.artist, i.genre, i.series, i.studio));
-    const books = [...S.books.values()].filter(b => has(q, b.title, b.author, b.genre, b.series));
-    const games = (S.games || []).filter(g => has(q, g.title, g.system, g.systemName));
-    const archives = (S.archives || []).filter(a => has(q, a.title, a.fullTitle, a.kind));
+    const media = (S.media?.items || []).filter(i => has(q, i, i.title, i.artist, i.genre, i.series, i.studio));
+    const books = [...S.books.values()].filter(b => has(q, b, b.title, b.author, b.genre, b.series));
+    const games = (S.games || []).filter(g => has(q, g, g.title, g.system, g.systemName));
+    const archives = (S.archives || []).filter(a => has(q, a, a.title, a.fullTitle, a.kind));
     const articles = el('div', {}, skShelf());
     const sec = (title, node) => el('section', {className:'section'}, el('div', {className:'shead'}, el('h2', {}, title)), node);
     const videos = media.filter(i => i.category === 'video'), audio = media.filter(i => i.category !== 'video');
@@ -1102,6 +1217,7 @@ function setMini(small){
   const player = $('#player');
   player.classList.toggle('mini', small);
   document.body.classList.toggle('mini', small && !!playing);
+  document.body.classList.toggle('fullplayer', !small && !!playing);
   const b = playing?.miniButton;
   if (b) { b.replaceChildren(icon(small ? 'up' : 'down')); b.setAttribute('aria-label', small ? 'Expand player' : 'Minimize player'); }
 }
@@ -1120,7 +1236,7 @@ function saveProgress(finished){
 async function closePlayer(){
   if (playing) { const p = playing; await saveProgress(p.completed); p.el.onpause = null; p.el.onended = null; p.el.pause(); p.el.removeAttribute('src'); p.el.load(); }
   clearInterval(saveTimer); clearTimeout(sleepTimer); playing = null;
-  $('#player').className = 'hidden'; $('#player').replaceChildren(); document.body.classList.remove('mini');
+  $('#player').className = 'hidden'; $('#player').replaceChildren(); document.body.classList.remove('mini', 'fullplayer');
   // Places changed: the shelves and Continue row come back fresh from the Mac.
   S.shelves = {}; detailCache.clear();
   loadMedia().then(rerender).catch(() => {});
@@ -1176,6 +1292,7 @@ async function openPlayer(it, fromStart, chosen){
   player.replaceChildren(top, body, progress);
   if (!isVideo) player.append(m);
   player.className = '';
+  document.body.classList.add('fullplayer');
   // The video that plays next is looked up while this one starts; the card appears once it is known.
   detailFor(it).then(d => {
     const n = S.byId.get(d.upNext);

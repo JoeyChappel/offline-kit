@@ -135,3 +135,32 @@ extension View {
     /// Fade and rise into place on first appearance.
     func appearFade(delay: Double = 0, enabled: Bool = true) -> some View { modifier(AppearFade(delay: delay, enabled: enabled)) }
 }
+
+// MARK: - Text drawing
+
+/// Static text drawn as one GPU-rendered group instead of a Core Graphics layer per Text. Each plain Text is drawn on
+/// the main thread when it first comes on screen, which made a grid of cards scrolling into view mostly text drawing;
+/// inside a drawing group the glyphs come from a shared, cached atlas. For small blocks of plain text only: nothing
+/// inside should need its own hover, focus or selection.
+private struct FlattenedText: ViewModifier {
+    #if DEBUG
+    /// -plainText YES draws text the old way, for before/after comparisons in one build.
+    static let off = UserDefaults.standard.bool(forKey: "plainText")
+    #else
+    static let off = false
+    #endif
+    func body(content: Content) -> some View {
+        // Mac only: the GPU surfaces add a couple of hundred MB while scrolling (released soon after), which is
+        // fine on a Mac but risky on an iPhone or Apple TV, where memory spikes can end the app.
+        #if os(macOS)
+        if Self.off { content } else { content.drawingGroup() }
+        #else
+        content
+        #endif
+    }
+}
+
+extension View {
+    /// Draws this block of static text as one GPU group (see FlattenedText).
+    func flattenedText() -> some View { modifier(FlattenedText()) }
+}

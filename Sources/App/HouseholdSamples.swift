@@ -77,6 +77,14 @@ enum HouseholdSamples {
         extra.barcodeNames = ["0123456789012": "Canned black beans"]
         // -seedNoSupplies YES: an empty Supplies list. -tickChecklist water,food: those checklist items are ticked.
         if UserDefaults.standard.bool(forKey: "seedNoSupplies") { extra.supplies = [] }
+        // -seedSupplies N: N made-up supplies instead (for timing a long list).
+        if let count = Int(UserDefaults.standard.string(forKey: "seedSupplies") ?? "") {
+            let categories: [SupplyCategory] = [.water, .food, .medicine, .batteries, .fuel, .firstAid]
+            extra.supplies = (0..<count).map { n in
+                item("Sample supply \(n + 1)", categories[n % categories.count], Double(n % 12 + 1), n % 2 == 0 ? "cans" : "boxes",
+                     ["Pantry", "Basement shelf", "Go-bag", "Garage"][n % 4], n % 7 == 0 ? nil : (n * 37) % 700 - 30)
+            }
+        }
         let ticked = (UserDefaults.standard.string(forKey: "tickChecklist") ?? "").split(separator: ",").map(String.init)
         for index in data.checklist.indices where ticked.contains(data.checklist[index].id) { data.checklist[index].have = true }
         data.records = extra

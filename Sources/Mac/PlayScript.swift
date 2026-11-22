@@ -28,6 +28,7 @@ var B = { B: 0, Y: 1, SELECT: 2, START: 3, UP: 4, DOWN: 5, LEFT: 6, RIGHT: 7, A:
 var DIRS = [B.UP, B.DOWN, B.LEFT, B.RIGHT];
 
 var CSS = [
+'html.okp-open body>:not(.okplay-root){content-visibility:hidden}' +
 '.okplay-root{position:fixed;inset:0;z-index:2147483000;background:#0b0d0c;color:#f2f5f3;font:15px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,system-ui,sans-serif;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:none;overflow:hidden;display:flex;flex-direction:column;padding:env(safe-area-inset-top,0) env(safe-area-inset-right,0) env(safe-area-inset-bottom,0) env(safe-area-inset-left,0);-webkit-tap-highlight-color:transparent}',
 '.okplay-root *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}',
 '.okplay-root button{font:inherit;color:inherit;border:0;background:none;cursor:pointer;touch-action:none}',
@@ -297,6 +298,9 @@ Player.prototype.build = function () {
   root.appendChild(this.pad);
   this.saved = { overflow: document.documentElement.style.overflow };
   document.documentElement.style.overflow = 'hidden';
+  // The page underneath isn't drawn while the player covers it: its lazy pictures' visibility checks otherwise ran on
+  // every frame the game drew (over half the player's main-thread time on a slow phone). Scroll places are kept.
+  document.documentElement.classList.add('okp-open');
   document.body.appendChild(root);
   this.on(window, 'resize', function () { self.layout(); });
   this.on(window, 'orientationchange', function () { setTimeout(function () { self.layout(); }, 250); });
@@ -933,6 +937,7 @@ Player.prototype.close = function () {
   if (this.root) this.root.remove();
   this.root = null;
   document.documentElement.style.overflow = this.saved.overflow;
+  document.documentElement.classList.remove('okp-open');
   if (current === this) current = null;
   if (typeof this.opts.onClose === 'function') { try { this.opts.onClose(); } catch (e) {} }
 };

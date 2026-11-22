@@ -50,6 +50,13 @@ struct WatchListenView: View {
     init(section: MediaFilter? = nil) {
         self.section = section
         _filter = State(initialValue: section ?? .all)
+        #if DEBUG
+        // Test hook: -musicBrowse songs|artists|genres opens Music on that tab (for profiling the long lists).
+        if section == .music, let value = UserDefaults.standard.string(forKey: "musicBrowse"),
+           let browse = MusicBrowse.allCases.first(where: { $0.rawValue.lowercased() == value.lowercased() }) {
+            _musicBrowse = State(initialValue: browse)
+        }
+        #endif
     }
 
     private var title: String {
@@ -554,7 +561,7 @@ struct WatchListenView: View {
                 Button { artist = name } label: {
                     HStack(spacing: 16) {
                         if let item = group.albums.first { MediaArtwork(item: item, info: media.info[item.progressKey]).frame(width: 64, height: 64).clipShape(Circle()) }
-                        VStack(alignment: .leading) { Text(name).font(.headline); Text("\(group.albums.count) albums · \(group.songCount) songs").font(.caption).foregroundStyle(MediaTheme.muted) }
+                        VStack(alignment: .leading) { Text(name).font(.headline); Text("\(group.albums.count) albums · \(group.songCount) songs").font(.caption).foregroundStyle(MediaTheme.muted) }.flattenedText()
                         Spacer(); Image(systemName: "chevron.right")
                     }.padding(14).background(MediaTheme.surface, in: RoundedRectangle(cornerRadius: 14))
                 }.buttonStyle(.plain)
@@ -569,9 +576,13 @@ struct WatchListenView: View {
                 Button { start(item, false, index) } label: {
                     HStack(spacing: 14) {
                         MediaArtwork(item: item, info: media.info[item.progressKey]).frame(width: 48, height: 48).clipShape(RoundedRectangle(cornerRadius: 7))
-                        VStack(alignment: .leading, spacing: 4) { Text(MediaCatalog.trackTitle(item, media.info[item.progressKey], index)); Text("\(MediaCatalog.creator(media.info[item.progressKey])) · \(MediaCatalog.title(item, media.info[item.progressKey]))").font(.caption).foregroundStyle(MediaTheme.muted) }
-                        Spacer()
-                        if let details = media.info[item.progressKey]?.tracks, details.indices.contains(index), let duration = details[index].duration { Text(MediaTheme.time(duration)).font(.caption).foregroundStyle(MediaTheme.muted) }
+                        let info = media.info[item.progressKey]
+                        // The row's text in one drawing group (one GPU surface per row, not one per Text).
+                        HStack(spacing: 14) {
+                            VStack(alignment: .leading, spacing: 4) { Text(MediaCatalog.trackTitle(item, info, index)); Text("\(MediaCatalog.creator(info)) · \(MediaCatalog.title(item, info))").font(.caption).foregroundStyle(MediaTheme.muted) }
+                            Spacer()
+                            if let details = info?.tracks, details.indices.contains(index), let duration = details[index].duration { Text(MediaTheme.time(duration)).font(.caption).foregroundStyle(MediaTheme.muted) }
+                        }.flattenedText()
                         Image(systemName: "play.fill").foregroundStyle(MediaTheme.accent)
                     }.padding(.vertical, 10).contentShape(Rectangle())
                 }.buttonStyle(.plain)
@@ -734,7 +745,7 @@ struct WatchListenView: View {
 /// Remembers the last result of the library work for the current inputs, so a redraw that changes none of them
 /// (hovering, scrolling, a progress tick elsewhere) costs a comparison, not a filter and sort of every item.
 @MainActor
-private final class WatchListenCache {
+final class WatchListenCache {
     struct Key: Hashable {
         let revision: Int
         let filter: MediaFilter
@@ -758,6 +769,67 @@ private final class WatchListenCache {
         values[key] = made
         return made
     }
+
+    /// The key a section's opening screen asks for (no genre, search, artist or shelf; sorted by title).
+    static func openingKey(revision: Int, filter: MediaFilter) -> Key {
+        Key(revision: revision, filter: filter, genre: nil, query: "", sort: .title, unfinished: false, artist: nil, collectionID: nil)
+    }
+
+    /// Works out each section's opening lists off the main thread once the library has settled, so the first visit to
+    /// Watch, Audiobooks, Music or Books finds them ready instead of filtering, grouping and sorting while it opens.
+    func prewarm(_ media: MediaLibrary, filters: [MediaFilter]) async {
+        let revision = media.revision, items = media.items, info = media.info, progress = media.progress
+        guard !items.isEmpty else { return }
+        let wanted = filters.filter { values[Self.openingKey(revision: revision, filter: $0)] == nil }
+        guard !wanted.isEmpty else { return }
+        let started = Date()
+        let seeds = await Task.detached(priority: .utility) {
+            wanted.map { (filter: $0, seed: WatchListenDerived.seed(items: items, info: info, progress: progress, filter: $0)) }
+        }.value
+        #if DEBUG
+        NSLog("PREWARM %d sections, revision %d, %.0f ms in the background", seeds.count, revision, Date().timeIntervalSince(started) * 1000)
+        #endif
+        // A newer library arrived meanwhile: these are already out of date.
+        guard !Task.isCancelled, media.revision == revision else { return }
+        if revision != self.revision { values.removeAll(); self.revision = revision }
+        for (filter, seed) in seeds {
+            let key = Self.openingKey(revision: revision, filter: filter)
+            guard values[key] == nil else { continue }
+            if values.count >= 24 { values.removeAll() }
+            values[key] = WatchListenDerived(items: items, info: info, progress: progress, filter: filter, genre: nil, query: "",
+                                             sort: .title, unfinished: false, artist: nil, collection: nil, seed: seed)
+        }
+    }
+}
+
+/// Fills WatchListenCache in the background a moment after the media library changes (see `prewarm`). Lives in the
+/// window's root view, beside the sections, and reads only the library's revision.
+struct WatchListenPrewarm: ViewModifier {
+    let filters: [MediaFilter]
+    @Environment(MediaLibrary.self) private var media
+    func body(content: Content) -> some View {
+        content.task(id: media.revision) {
+            // Waits for the library to settle (a first scan hands details over in batches) and for launch to finish.
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled, media.hasScanned else { return }
+            await WatchListenCache.shared.prewarm(media, filters: filters)
+        }
+    }
+}
+
+extension View {
+    /// Works out the Watch & Listen sections' opening lists in the background (see WatchListenPrewarm).
+    /// `filters`: the sections this window shows (the sidebar's four, or the phone's single Watch tab).
+    func prewarmWatchListen(_ filters: [MediaFilter]) -> some View { modifier(WatchListenPrewarm(filters: filters)) }
+}
+
+/// A section's opening lists, worked out off the main thread (see WatchListenCache.prewarm).
+struct WatchListenSeed: Sendable {
+    var filtered: [MediaItem]?
+    var catalog: (featured: MediaItem?, shelves: [MediaShelf])?
+    var genreNames: [String]
+    var genreCounts: [String: Int]
+    var sectionIsEmpty: Bool
 }
 
 struct ArtistGroup: Identifiable {
@@ -769,7 +841,7 @@ struct ArtistGroup: Identifiable {
 
 /// The lists Watch & Listen shows, each worked out the first time a screen asks for it and then kept.
 @MainActor
-private final class WatchListenDerived {
+final class WatchListenDerived {
     private let items: [MediaItem]
     private let info: [String: MediaInfo]
     private let progress: [String: MediaProgress]
@@ -782,9 +854,28 @@ private final class WatchListenDerived {
     private let collection: MediaShelf?
 
     init(items: [MediaItem], info: [String: MediaInfo], progress: [String: MediaProgress], filter: MediaFilter, genre: String?,
-         query: String, sort: MediaSort, unfinished: Bool, artist: String?, collection: MediaShelf?) {
+         query: String, sort: MediaSort, unfinished: Bool, artist: String?, collection: MediaShelf?, seed: WatchListenSeed? = nil) {
         self.items = items; self.info = info; self.progress = progress; self.filter = filter; self.genre = genre
         self.query = query; self.sort = sort; self.unfinished = unfinished; self.artist = artist; self.collection = collection
+        if let seed {
+            if let filtered = seed.filtered { self.filtered = filtered }
+            if let catalog = seed.catalog { self.catalog = catalog }
+            genreNames = seed.genreNames
+            genreCounts = seed.genreCounts
+            sectionIsEmpty = seed.sectionIsEmpty
+        }
+    }
+
+    /// What the opening screen of `filter` reads, worked out the same way as the lazy values below. Music opens on
+    /// its album grid (the filtered list); the others on shelves.
+    nonisolated static func seed(items: [MediaItem], info: [String: MediaInfo], progress: [String: MediaProgress], filter: MediaFilter) -> WatchListenSeed {
+        let grid = filter == .music
+        return WatchListenSeed(
+            filtered: grid ? MediaCatalog.select(items, info: info, progress: progress, filter: filter, genre: nil, query: "", sort: .title, unfinished: false) : nil,
+            catalog: grid ? nil : MediaCatalog.build(items: items, progress: progress, info: info, filter: filter),
+            genreNames: MediaCatalog.genres(items, info: info, filter: filter),
+            genreCounts: MediaCatalog.genreCounts(items, info: info, filter: filter),
+            sectionIsEmpty: filter == .all ? items.isEmpty : !items.contains { MediaCatalog.category($0, info[$0.progressKey]) == filter })
     }
 
     /// The filtered and sorted library.
@@ -844,6 +935,7 @@ private struct GenreTile: View {
                     Text(countText).font(.caption).opacity(0.85)
                 }.padding(12)
             }
+            .flattenedText()
             .frame(minWidth: width, maxWidth: width ?? .infinity, minHeight: 96, maxHeight: 96)
             .foregroundStyle(.white)
             .background(LinearGradient(colors: MediaTheme.posterColors(name), startPoint: .topLeading, endPoint: .bottomTrailing), in: shape)

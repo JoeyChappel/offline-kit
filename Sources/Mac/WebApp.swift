@@ -99,6 +99,7 @@ svg.i{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.8;stro
 .tab.on{display:block}
 .page{position:absolute;inset:0;background:var(--bg);color:var(--text);overflow:hidden;contain:strict}
 .page.under{pointer-events:none}
+.page.sliding{box-shadow:0 0 30px rgba(0,0,0,.2)}
 .page .shade{position:absolute;inset:0;background:#000;opacity:0;pointer-events:none;z-index:20}
 .scroll{position:absolute;inset:0;overflow-x:hidden;overflow-y:auto;-webkit-overflow-scrolling:touch;overscroll-behavior-y:contain;padding:calc(var(--st) + 44px) var(--sr) calc(var(--tabh) + var(--sb) + 40px) var(--sl)}
 .nav{position:absolute;z-index:10;top:0;left:0;right:0;height:calc(var(--st) + 44px);padding:var(--st) calc(var(--sr) + 8px) 0 calc(var(--sl) + 8px);display:grid;grid-template-columns:minmax(0,1fr) auto minmax(0,1fr);align-items:center;border-bottom:.5px solid transparent;transition:background-color .2s,border-color .2s}
@@ -127,6 +128,8 @@ svg.i{width:24px;height:24px;fill:none;stroke:currentColor;stroke-width:1.8;stro
 @media (max-width:359px){#tabbar{left:6px;right:6px;padding:4px}#tabbar button span{display:none}#tabbar button svg{width:24px;height:24px}}
 body.signedout #tabbar,body.reading #tabbar,body.signedout #composer,body.reading #composer,body.signedout #app{display:none}
 body.mini #composer{bottom:calc(max(10px,var(--sb)) + var(--tabh) + 78px)}
+/* Covered by the reader or the full-size player: the pages underneath aren't drawn (their scroll places are kept). */
+body.reading #app,body.fullplayer #app{content-visibility:hidden}
 
 /* Content blocks */
 .section{margin:20px 0 4px}
@@ -137,22 +140,29 @@ body.mini #composer{bottom:calc(max(10px,var(--sb)) + var(--tabh) + 78px)}
 .shelf::-webkit-scrollbar{display:none}
 .card{flex:none;width:248px;scroll-snap-align:start;border:0;background:none;padding:0;text-align:left;color:inherit;display:block;text-decoration:none}
 .card.cover{width:136px}.card.square{width:160px}.card.game{width:150px}
-.art{position:relative;border-radius:12px;overflow:hidden;aspect-ratio:16/9;background:var(--surface2);box-shadow:0 1px 0 var(--line) inset}
+.art{position:relative;border-radius:12px;overflow:hidden;aspect-ratio:16/9;background:var(--surface2);box-shadow:0 1px 0 var(--line) inset;contain:strict}
 .cover .art{aspect-ratio:2/3;border-radius:8px;box-shadow:var(--shadow)}
 .square .art,.game .art{aspect-ratio:1}
 .art img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
 .art .ph{position:absolute;inset:0;display:flex;align-items:flex-end;padding:12px;font:600 17px/1.2 Georgia,"New York",serif;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.5)}
+.art.ok .ph{opacity:0}
 .cover .art .ph{font-size:15px;align-items:center;text-align:center;justify-content:center}
 .art .bar{position:absolute;left:8px;right:8px;bottom:8px;height:4px;border-radius:2px;background:rgba(255,255,255,.35);overflow:hidden}
 .art .bar i{display:block;height:100%;background:#fff;border-radius:2px}
-.art .tag{position:absolute;top:8px;left:8px;padding:2px 8px;border-radius:10px;background:rgba(0,0,0,.6);color:#fff;font-size:11px;font-weight:650;letter-spacing:.02em;-webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px)}
+.art .tag{position:absolute;top:8px;left:8px;padding:2px 8px;border-radius:10px;background:rgba(0,0,0,.66);color:#fff;font-size:11px;font-weight:650;letter-spacing:.02em}
 .art .tag.r{left:auto;right:8px}
 .card b{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-top:8px;font-size:15px;font-weight:600;line-height:1.3}
 .card small{display:block;color:var(--muted);font-size:13px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .card:active .art{transform:scale(.97)}.art{transition:transform .15s}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:18px 14px;padding:4px 20px}
 .grid.covers{grid-template-columns:repeat(auto-fill,minmax(112px,1fr))}
-.grid .card{width:auto}
+.grid .card,.vrow .card{width:auto}
+/* Long grids build only the rows near the screen (vgrid in the script): rows sit at their place in a box as tall as the grid. */
+.vgrid{position:relative;margin-top:4px}
+.vrow{position:absolute;top:0;left:20px;right:20px;display:grid;column-gap:14px}
+.vrow .card b{min-height:2.6em}.vrow .card small{min-height:1.35em}
+/* Shelves off the screen are neither laid out nor painted until they come near it. */
+.section.cv{content-visibility:auto;contain-intrinsic-size:auto 300px}
 .genres{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;padding:0 20px}
 .gtile{position:relative;min-height:84px;border:0;border-radius:14px;padding:12px 14px;text-align:left;color:#fff;overflow:hidden;display:flex;flex-direction:column;justify-content:space-between}
 .gtile .e{font-size:26px;line-height:1;filter:saturate(.85)}
@@ -199,8 +209,8 @@ button.searchbox{width:calc(100% - 40px);border:0;text-align:left;font-size:17px
 .note{color:var(--muted);font-size:13px;padding:0 20px}
 
 /* Skeletons */
-.sk{background:linear-gradient(100deg,var(--surface2) 30%,var(--surface) 50%,var(--surface2) 70%);background-size:300% 100%;animation:sk 1.3s ease-in-out infinite;border-radius:10px}
-@keyframes sk{from{background-position:100% 0}to{background-position:0 0}}
+.sk{background:var(--surface2);animation:sk 1.3s ease-in-out infinite;border-radius:10px}
+@keyframes sk{50%{opacity:.5}}
 .skline{height:14px;margin-top:8px;width:70%}
 .sktitle{height:22px;width:40%;margin:0 20px 12px}
 

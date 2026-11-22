@@ -109,6 +109,8 @@ struct GetResourcesView: View {
     @State private var reviewing = false
     @State private var format: ContentFormat?
     @State private var query = ""
+    /// `query` once the typing pauses: the results are worked out from this one, not on every keystroke.
+    @State private var appliedQuery = ""
 
     // Ticked choices live in KitNavigation, so they survive a look at another section.
     private var selected: Set<String> {
@@ -156,12 +158,46 @@ struct GetResourcesView: View {
         }
         .onChange(of: navigation.resourceArea) { area = navigation.resourceArea; showingEncyclopedia = false }
         .navigationTitle("Get Resources")
-        .task { await load() }
+        .task {
+            await load()
+            #if DEBUG
+            // Test hook: -resourcesType "text" types it into the search one letter every 80 ms (-resourcesTypeMs) once the
+            // list has loaded ("<" deletes one), logging main-thread CPU per five letters, then scrolls (macOS) and ends with "CYCLE done".
+            guard let text = UserDefaults.standard.string(forKey: "resourcesType") else { return }
+            for _ in 0..<100 where catalog == nil { try? await Task.sleep(for: .milliseconds(100)) }
+            try? await Task.sleep(for: .seconds(3))
+            StallProbe.start()
+            StallProbe.report("before typing")
+            for (index, letter) in text.enumerated() {
+                if letter == "<" { if !query.isEmpty { query.removeLast() } } else { query.append(letter) }
+                try? await Task.sleep(for: .milliseconds(Int(UserDefaults.standard.string(forKey: "resourcesTypeMs") ?? "") ?? 80))
+                if index % 5 == 4 { StallProbe.report("search5") }
+            }
+            query = ""
+            try? await Task.sleep(for: .milliseconds(300))
+            StallProbe.report("cleared")
+            #if os(macOS)
+            await ProfileScroller.scrollMainContent()
+            StallProbe.report("scroll")
+            #endif
+            NSLog("CYCLE done")
+            #endif
+        }
         .onChange(of: pictures) { KitSettings.shared.set(pictures.rawValue, forKey: "pictures") }
+        // Search waits for a pause in the typing (each search rebuilds every matching row); clearing it shows all at once.
+        .task(id: query) {
+            guard query != appliedQuery else { return }
+            if !query.isEmpty {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard !Task.isCancelled else { return }
+            }
+            appliedQuery = query
+        }
     }
 
     private var resourceContent: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        // Lazy: a search can match a hundred packs in a dozen cards, and only the cards on screen need building.
+        LazyVStack(alignment: .leading, spacing: 22) {
                 #if os(iOS)
                 FromMacCard()   // Send to iPhone: download what the Mac picked, over home Wi-Fi
                 #endif
@@ -178,8 +214,9 @@ struct GetResourcesView: View {
                             if interest.packs.contains(where: matches) { interestCard(interest, catalog: catalog) }
                         }
                         if searchText.isEmpty && format == .maps { mapRegions(catalog) }
-                        if !searchText.isEmpty && !matchingMaps(catalog).isEmpty { mapSearchResults(catalog) }
-                        if !searchText.isEmpty && matchingMaps(catalog).isEmpty && !Interests.all.contains(where: { $0.packs.contains(where: matches) }) && !Interests.encyclopedia.contains(where: matches) {
+                        let maps = matchingMaps(catalog)
+                        if !searchText.isEmpty && !maps.isEmpty { mapSearchResults(maps) }
+                        if !searchText.isEmpty && maps.isEmpty && !Interests.all.contains(where: { $0.packs.contains(where: matches) }) && !Interests.encyclopedia.contains(where: matches) {
                             ContentUnavailableView.search(text: searchText)
                         }
                     } else if showingEncyclopedia {
@@ -439,11 +476,11 @@ struct GetResourcesView: View {
         }
     }
 
-    private func mapSearchResults(_ catalog: Catalog) -> some View {
+    private func mapSearchResults(_ maps: [CatalogEntry]) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             CardHeader(symbol: "map", title: "Maps", subtitle: "Street maps to browse offline.")
             Divider()
-            ForEach(matchingMaps(catalog)) { entry in
+            ForEach(maps) { entry in
                 PackRow(pack: Pack(name: entry.name, label: entry.title), entry: entry,
                         isOn: selected.contains(entry.name), installed: isInstalled(entry.name)) {
                     if selected.contains(entry.name) { selected.remove(entry.name) } else { selected.insert(entry.name) }
@@ -527,7 +564,7 @@ struct GetResourcesView: View {
             .sorted { $0.size < $1.size }   // small ones finish first
     }
 
-    private var searchText: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+    private var searchText: String { appliedQuery.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     private func matches(_ pack: Pack) -> Bool {
         let matchesFormat = format.map { ContentFormat(archiveName: pack.name) == $0 } ?? true

@@ -321,6 +321,8 @@ struct RootView: View {
             }
         }
         #endif
+        // First visits to Watch, Audiobooks, Music and Books find their lists already worked out.
+        .prewarmWatchListen([.video, .music, .books, .audiobooks])
         #if os(macOS)
         #if DEBUG
         .onAppear {
